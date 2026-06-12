@@ -99,6 +99,10 @@ class OrchestratorConfig:
     min_minutes_to_close: int = 15    # don't enter new positions within 15 min of close
     max_positions_total: int = 5      # max concurrent open positions
 
+    # --- Regime filters ---
+    vix_max: float = 25.0             # suppress all new trades when VIX >= this level
+    min_iv_rank: float = 0.0          # minimum IV rank 0-100 for strangle entry (0 = disabled)
+
     # --- Broker ---
     paper: bool = True                # always default to paper
 
@@ -439,6 +443,19 @@ class TradingPipeline:
             logger.info("[Pipeline] %s: no enriched rows after delta filter", ticker)
             return None
 
+        # --- Step 3: IV rank gate (strangles only) ---
+        if (self.config.strategy_name == "short_strangle"
+                and self.config.min_iv_rank > 0):
+            iv_rank = _get_iv_rank(ticker)
+            if iv_rank is not None and iv_rank < self.config.min_iv_rank:
+                logger.info(
+                    "[Pipeline] %s IV rank=%.1f < min=%.1f — skipping strangle",
+                    ticker, iv_rank, self.config.min_iv_rank
+                )
+                return None
+            elif iv_rank is not None:
+                logger.info("[Pipeline] %s IV rank=%.1f — qualifies", ticker, iv_rank)
+
         # --- Step 3: Strategy evaluation ---
         try:
             signal = self.strategy.evaluate(enriched)
@@ -591,70 +608,150 @@ class PositionMonitor:
             self.state.daily_unrealized_pnl = total_unreal
 
     def _check_trade(self, trade: dict, quotes: dict) -> None:
-        """Check one trade against its stop. Submit close order if stop is hit."""
+        """
+        Check one trade against its stop-loss and profit target.
+        Closes the position if either level is hit.
+        """
         try:
             legs = json.loads(trade.get("legs_json", "[]"))
             hard_stop = float(trade.get("hard_stop", 0))
+            entry_credit = abs(float(trade.get("net_credit") or 0))
+            # Profit target = 50% of credit received (close when we keep half)
+            profit_target = entry_credit * 0.50 if entry_credit > 0 else None
+
             if hard_stop <= 0:
                 return
 
-            # For single-leg: check the short leg's ask price
-            # For multi-leg: check the net value of the spread
+            # Use the first short leg as the primary price signal
             short_legs = [l for l in legs if "sell" in l.get("side", "")]
             if not short_legs:
                 return
 
-            # Use the first short leg as the primary price signal
             short_symbol = short_legs[0]["symbol"]
             quote = quotes.get(short_symbol, {})
-            ask_price = quote.get("ask")
+            ask_price = quote.get("ask")   # cost to close the short leg
 
             if ask_price is None:
-                logger.debug("[Monitor] No ask for %s — skipping stop check", short_symbol)
+                logger.debug("[Monitor] No ask for %s — skipping", short_symbol)
                 return
 
+            # --- Stop loss ---
             if ask_price >= hard_stop:
                 logger.warning(
                     "[Monitor] STOP HIT: %s %s — ask=%.2f >= stop=%.2f",
-                    trade["underlying"], trade["strategy"], ask_price, hard_stop
+                    trade.get("underlying",""), trade.get("strategy",""),
+                    ask_price, hard_stop
                 )
-                self._close_trade(trade, ask_price)
+                self._close_trade(trade, ask_price, reason="stop_hit")
+                return
+
+            # --- Profit target: bid price has fallen to <= 50% of entry credit ---
+            if profit_target is not None:
+                bid_price = quote.get("bid")
+                if bid_price is not None and bid_price <= profit_target:
+                    logger.info(
+                        "[Monitor] PROFIT TARGET: %s %s — bid=%.2f <= target=%.2f (50%% of %.2f credit)",
+                        trade.get("underlying",""), trade.get("strategy",""),
+                        bid_price, profit_target, entry_credit
+                    )
+                    self._close_trade(trade, bid_price, reason="profit_target")
 
         except Exception as exc:
             logger.error("[Monitor] Error checking trade %s: %s", trade.get("id"), exc)
 
-    def _close_trade(self, trade: dict, current_price: float) -> None:
-        """Submit closing orders for a stopped-out trade."""
+    def _close_trade(self, trade: dict, current_price: float, reason: str = "stop_hit") -> None:
+        """Submit closing orders for a stopped-out or profit-target trade."""
         try:
             legs = json.loads(trade.get("legs_json", "[]"))
             for leg in legs:
                 symbol = leg["symbol"]
-                # Reverse the position intent: sell_to_open → buy_to_close, etc.
                 close_side = _reverse_side(leg.get("side", ""))
                 if close_side:
                     self.broker.close_position(symbol)
-                    logger.info("[Monitor] Closed: %s", symbol)
+                    logger.info("[Monitor] Closed %s: %s", reason, symbol)
 
-            # Update DB
             entry_price = float(trade.get("fill_price", 0) or 0)
-            realized_pnl = (entry_price - current_price) * float(trade.get("contracts", 1)) * 100
+            contracts = float(trade.get("contracts", 1) or 1)
+
+            if reason == "profit_target":
+                # We bought back at current_price, kept (entry - current) per contract
+                realized_pnl = (entry_price - current_price) * contracts * 100
+                new_status = "closed_profit_target"
+            else:
+                realized_pnl = (entry_price - current_price) * contracts * 100
+                new_status = "stopped_out"
+
             self.db.update_status(
                 trade["id"],
-                status="stopped_out",
+                status=new_status,
                 close_price=current_price,
                 realized_pnl=realized_pnl,
             )
             with self.state._lock:
                 self.state.daily_realized_pnl += realized_pnl
 
-            msg = _format_stop_message(trade, current_price)
+            if reason == "stop_hit":
+                msg = _format_stop_message(trade, current_price)
+            else:
+                msg = (
+                    f"✅ **PROFIT TARGET — {trade.get('underlying','')} {trade.get('strategy','')}**\n"
+                    f"Order ID: `{trade['id']}`\n"
+                    f"Closed at: ${current_price:.2f}  Entry: ${entry_price:.2f}\n"
+                    f"P&L: ${realized_pnl:+.2f}"
+                )
             send_discord(self.discord_webhook_url, msg)
 
         except Exception as exc:
             logger.error("[Monitor] Close failed for %s: %s", trade.get("id"), exc)
 
 
-def _reverse_side(side: str) -> Optional[str]:
+def _get_vix() -> Optional[float]:
+    """
+    Fetch current VIX level from yfinance.
+    Returns None on failure — caller decides whether to block or allow.
+    """
+    try:
+        import yfinance as yf
+        vix = yf.Ticker("^VIX")
+        price = vix.fast_info.get("lastPrice")
+        if price and float(price) > 0:
+            return float(price)
+    except Exception as exc:
+        logger.warning("[VIX] Fetch failed: %s", exc)
+    return None
+
+
+def _get_iv_rank(ticker: str, lookback_days: int = 252) -> Optional[float]:
+    """
+    Compute a simple IV rank for a ticker using 1-year ATM IV history.
+    IV rank = (current IV - 52w low) / (52w high - 52w low) * 100
+
+    Returns 0-100 float, or None on failure.
+    """
+    try:
+        import yfinance as yf
+        import numpy as np
+        t = yf.Ticker(ticker)
+        # Use historical close prices to estimate realized vol as IV proxy
+        hist = t.history(period="1y")
+        if hist.empty or len(hist) < 20:
+            return None
+        returns = hist["Close"].pct_change().dropna()
+        # Rolling 30-day realized vol annualized
+        roll_vol = returns.rolling(30).std() * np.sqrt(252) * 100
+        roll_vol = roll_vol.dropna()
+        if len(roll_vol) < 2:
+            return None
+        current = roll_vol.iloc[-1]
+        low_52w = roll_vol.min()
+        high_52w = roll_vol.max()
+        if high_52w == low_52w:
+            return 50.0
+        iv_rank = (current - low_52w) / (high_52w - low_52w) * 100
+        return round(float(iv_rank), 1)
+    except Exception as exc:
+        logger.warning("[IVRank] Fetch failed for %s: %s", ticker, exc)
+    return None
     mapping = {
         "sell_to_open":  "buy_to_close",
         "buy_to_open":   "sell_to_close",
@@ -818,6 +915,23 @@ class Orchestrator:
         except PipelineConnectionError as exc:
             self.state.record_error(f"Account not ready: {exc}")
             return []
+
+        # VIX regime filter — suppress all new trades in high-vol environments
+        vix = _get_vix()
+        if vix is not None:
+            if vix >= self.config.vix_max:
+                msg = (
+                    f"⚠️ **VIX GATE: No new trades** — VIX={vix:.1f} >= "
+                    f"max={self.config.vix_max:.1f}"
+                )
+                logger.warning("[Orchestrator] %s", msg)
+                send_discord(self.config.discord_webhook_url, msg)
+                return []
+            else:
+                logger.info("[Orchestrator] VIX=%.1f — below threshold %.1f, proceeding", 
+                           vix, self.config.vix_max)
+        else:
+            logger.warning("[Orchestrator] VIX unavailable — proceeding without regime filter")
 
         # Check position count
         positions = self.broker.get_positions()
