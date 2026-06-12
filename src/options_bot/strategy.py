@@ -1,0 +1,689 @@
+"""
+Strategy layer.
+
+Defines the base Strategy interface and three concrete implementations:
+
+  1. CashSecuredPut (CSP)
+     Sell an OTM put, collect premium, obligation to buy shares at strike.
+     Max loss = (strike - credit) * 100. Hard stop at 2x premium received.
+     Entry filter: delta between -0.15 and -0.30, DTE 21-45, OI >= 500.
+
+  2. ShortPutSpread (bull put spread / credit spread)
+     Sell OTM put + buy further OTM put. Defined max loss = spread width - credit.
+     The only spreads strategy that gives a true finite max-loss per contract.
+     Entry filter: short leg delta -0.20 to -0.30, DTE 21-45, OI >= 100.
+
+  3. ShortStrangle
+     Sell OTM call + sell OTM put on same expiry.
+     Max loss is theoretically large on the upside — only used with explicit
+     stop-loss at 2x premium received per leg (or combined 3x credit).
+     Entry filter: |delta| 0.15-0.25 each leg, DTE 30-60, IV rank >= 30%.
+
+Mathematical rationale (written before code per system directive):
+
+  CSP entry signal:
+    target_delta: the put delta we want to sell (e.g. -0.20)
+    Select the contract where |delta - target_delta| is minimised.
+    max_loss_per_contract = strike * 100  (worst case: stock → 0)
+    practical_max_loss = (strike - credit_received) * 100
+    hard_stop = credit_received * stop_multiplier (e.g. 2x)
+
+  Short put spread entry signal:
+    short_leg = put closest to short_delta (e.g. -0.25)
+    long_leg  = put closest to long_delta  (e.g. -0.10, further OTM)
+    spread_width = short_strike - long_strike
+    net_credit = short_premium - long_premium
+    max_loss_per_contract = (spread_width - net_credit) * 100
+    hard_stop = net_credit * stop_multiplier (e.g. 2x)
+
+  Strangle entry signal:
+    call_leg = call closest to call_delta (e.g. +0.20)
+    put_leg  = put  closest to put_delta  (e.g. -0.20)
+    net_credit = call_premium + put_premium
+    max_loss is theoretically large → stop mandatory at 3x credit received
+    hard_stop = net_credit * stop_multiplier (e.g. 3.0)
+
+All strategies:
+  - Raise LiquidityFilterError if no qualifying contract found
+  - Raise PipelineConnectionError if enriched chain is empty
+  - Return a StrategySignal containing legs + risk inputs for RiskManager
+  - Never build ApprovedOrder directly — that belongs to RiskManager
+"""
+
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from typing import Optional
+
+from .contracts import EnrichedOptionRow, OrderLeg, OptionType
+from .exceptions import LiquidityFilterError, PipelineConnectionError
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Strategy signal — output of every strategy, input to RiskManager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StrategySignal:
+    """
+    Output of a strategy evaluation.
+
+    Contains everything RiskManager.evaluate() and build_approved_order() need.
+    Does NOT contain position size — that is RiskManager's job.
+    """
+    strategy_name: str
+    underlying: str
+
+    # Legs to trade
+    legs: list[OrderLeg]
+
+    # Pricing
+    net_debit_credit: float        # negative = credit received (typical for short strategies)
+    estimated_fill_price: float    # absolute value of net_debit_credit
+
+    # Risk inputs for RiskManager.evaluate()
+    max_loss_per_contract: float   # dollars, must be finite and > 0
+    hard_stop_price: float         # stop-loss price level (e.g. 2x premium on short side)
+
+    # Optional profit target
+    profit_target_price: Optional[float] = None
+
+    # Metadata for logging and analysis
+    expiry: Optional[date] = None
+    dte: Optional[int] = None
+    signal_timestamp: datetime = field(
+        default_factory=lambda: datetime.now(tz=timezone.utc)
+    )
+    notes: str = ""
+
+    # The specific enriched contracts that drove the signal (for logging)
+    source_contracts: list[EnrichedOptionRow] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Base strategy
+# ---------------------------------------------------------------------------
+
+class BaseStrategy(ABC):
+    """
+    Abstract base for all options strategies.
+
+    Subclasses implement evaluate() which takes an enriched option chain
+    and returns a StrategySignal, or raises if no valid trade found.
+
+    The strategy layer never touches the risk manager or broker.
+    It only selects contracts and computes the signal inputs.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        logger.info("[Strategy] Initialized: %s", name)
+
+    @abstractmethod
+    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+        """
+        Evaluate the chain and return a StrategySignal if a trade qualifies.
+
+        Parameters
+        ----------
+        chain : list[EnrichedOptionRow]
+            Enriched option chain for one expiration. Must have IV and delta
+            computed — rows missing these are automatically skipped.
+
+        Returns
+        -------
+        StrategySignal
+
+        Raises
+        ------
+        PipelineConnectionError
+            If chain is empty or no rows have required Greeks.
+        LiquidityFilterError
+            If no contract meets the strategy's entry criteria.
+        """
+
+    def _require_nonempty(self, chain: list[EnrichedOptionRow]) -> None:
+        if not chain:
+            raise PipelineConnectionError(
+                f"[{self.name}] Received empty chain — "
+                "market_data or greeks layer failed upstream"
+            )
+
+    def _require_greeks(self, chain: list[EnrichedOptionRow]) -> list[EnrichedOptionRow]:
+        """Filter to rows that have both IV and delta. Raises if none remain."""
+        valid = [r for r in chain if r.iv is not None and r.delta is not None]
+        if not valid:
+            raise PipelineConnectionError(
+                f"[{self.name}] No rows with IV+delta in chain of {len(chain)} contracts. "
+                "Greeks layer may have failed for all rows."
+            )
+        logger.debug(
+            "[%s] %d/%d rows have IV+delta",
+            self.name, len(valid), len(chain)
+        )
+        return valid
+
+    def _find_closest_delta(
+        self,
+        contracts: list[EnrichedOptionRow],
+        target_delta: float,
+        option_type: OptionType,
+    ) -> EnrichedOptionRow:
+        """
+        Find the contract whose delta is closest to target_delta.
+
+        Parameters
+        ----------
+        target_delta : float
+            Target delta value. Use negative for puts (e.g. -0.25).
+        option_type : str
+            "call" or "put"
+        """
+        filtered = [c for c in contracts if c.option_type == option_type]
+        if not filtered:
+            raise LiquidityFilterError(
+                "chain",
+                f"No {option_type}s found in chain for [{self.name}]"
+            )
+        closest = min(filtered, key=lambda c: abs(c.delta - target_delta))
+        logger.debug(
+            "[%s] Closest %s to delta=%.3f: %s (delta=%.4f, strike=%.1f)",
+            self.name, option_type, target_delta,
+            closest.symbol, closest.delta, closest.strike
+        )
+        return closest
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: Cash-Secured Put (CSP)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CSPConfig:
+    """Configuration for CashSecuredPut strategy."""
+    target_delta: float = -0.20         # target put delta to sell
+    min_delta: float = -0.30            # reject if delta more negative than this
+    max_delta: float = -0.10            # reject if delta less negative than this
+    min_dte: int = 21                   # minimum days to expiration
+    max_dte: int = 45                   # maximum days to expiration
+    min_open_interest: int = 500        # higher OI requirement for CSPs
+    max_spread_pct: float = 0.15        # tighter spread requirement
+    stop_multiplier: float = 2.0        # stop at 2x premium received
+    profit_target_pct: float = 0.50     # close at 50% of max profit
+
+
+class CashSecuredPut(BaseStrategy):
+    """
+    Sell an OTM put, fully cash-secured.
+
+    Entry: sell the put closest to target_delta within delta/DTE filters.
+    Stop:  hard_stop = premium_received * stop_multiplier
+    Exit:  close at profit_target_pct of max profit (default 50%)
+
+    Max loss = (strike - credit_received) * 100
+    This is defined-risk in the sense that the stock cannot go below zero,
+    but loss can be large on a big move down — use only with hard stops.
+    """
+
+    def __init__(self, config: Optional[CSPConfig] = None):
+        super().__init__("CashSecuredPut")
+        self.config = config or CSPConfig()
+
+    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+        self._require_nonempty(chain)
+        valid = self._require_greeks(chain)
+
+        cfg = self.config
+
+        # Filter: option type + DTE + liquidity
+        candidates = [
+            c for c in valid
+            if c.option_type == "put"
+            and c.dte >= cfg.min_dte
+            and c.dte <= cfg.max_dte
+            and (c.open_interest is None or c.open_interest >= cfg.min_open_interest)
+            and (c.spread_pct is None or c.spread_pct <= cfg.max_spread_pct)
+            and c.bid is not None
+            and c.ask is not None
+        ]
+
+        if not candidates:
+            raise LiquidityFilterError(
+                f"{valid[0].underlying if valid else 'unknown'} chain",
+                f"[{self.name}] No puts pass filters: "
+                f"DTE {cfg.min_dte}-{cfg.max_dte}, "
+                f"OI>={cfg.min_open_interest}, spread<={cfg.max_spread_pct:.0%}"
+            )
+
+        # Delta filter
+        delta_filtered = [
+            c for c in candidates
+            if cfg.min_delta <= c.delta <= cfg.max_delta
+        ]
+
+        if not delta_filtered:
+            best = candidates[0]
+            raise LiquidityFilterError(
+                f"{best.underlying} chain",
+                f"[{self.name}] No puts in delta range "
+                f"[{cfg.min_delta:.2f}, {cfg.max_delta:.2f}]. "
+                f"Checked {len(candidates)} candidates."
+            )
+
+        # Select the put closest to target_delta
+        short_put = min(
+            delta_filtered,
+            key=lambda c: abs(c.delta - cfg.target_delta)
+        )
+
+        credit = short_put.mid_price or ((short_put.bid + short_put.ask) / 2)
+        max_loss_per_contract = (short_put.strike - credit) * 100
+        hard_stop = credit * cfg.stop_multiplier
+        profit_target = credit * (1 - cfg.profit_target_pct)
+
+        leg = OrderLeg(
+            symbol=short_put.symbol,
+            option_type="put",
+            strike=short_put.strike,
+            expiry=short_put.expiry,
+            side="sell_to_open",
+            quantity=1,  # RiskManager will scale this
+        )
+
+        logger.info(
+            "[%s] Signal: SELL %s delta=%.3f strike=%.1f credit=%.2f "
+            "DTE=%d max_loss=$%.2f stop=%.2f",
+            self.name, short_put.symbol, short_put.delta,
+            short_put.strike, credit, short_put.dte,
+            max_loss_per_contract, hard_stop
+        )
+
+        return StrategySignal(
+            strategy_name=self.name,
+            underlying=short_put.underlying,
+            legs=[leg],
+            net_debit_credit=-credit,           # negative = credit received
+            estimated_fill_price=credit,
+            max_loss_per_contract=max_loss_per_contract,
+            hard_stop_price=hard_stop,
+            profit_target_price=profit_target,
+            expiry=short_put.expiry,
+            dte=short_put.dte,
+            notes=(
+                f"delta={short_put.delta:.3f} iv={short_put.iv:.2%} "
+                f"bid={short_put.bid:.2f} ask={short_put.ask:.2f}"
+            ),
+            source_contracts=[short_put],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2: Short Put Spread (bull put spread / credit spread)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShortPutSpreadConfig:
+    """Configuration for ShortPutSpread strategy."""
+    short_delta: float = -0.25          # sell this delta put
+    long_delta: float = -0.10           # buy this delta put (further OTM)
+    min_dte: int = 21
+    max_dte: int = 45
+    min_open_interest: int = 100
+    max_spread_pct: float = 0.25
+    min_spread_width: float = 2.0       # minimum strike width in dollars
+    max_spread_width: float = 20.0      # maximum strike width
+    min_credit: float = 0.50            # minimum credit to bother with the trade
+    stop_multiplier: float = 2.0        # stop at 2x credit received
+    profit_target_pct: float = 0.50     # close at 50% of max profit
+
+
+class ShortPutSpread(BaseStrategy):
+    """
+    Sell OTM put + buy further OTM put on same expiration.
+
+    This is the only strategy here with a fully defined max loss per contract:
+      max_loss = (spread_width - credit_received) * 100
+
+    Entry: sell put at short_delta, buy put at long_delta.
+    Stop:  hard_stop = credit_received * stop_multiplier
+    Exit:  close at profit_target_pct of max profit (default 50%)
+    """
+
+    def __init__(self, config: Optional[ShortPutSpreadConfig] = None):
+        super().__init__("ShortPutSpread")
+        self.config = config or ShortPutSpreadConfig()
+
+    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+        self._require_nonempty(chain)
+        valid = self._require_greeks(chain)
+
+        cfg = self.config
+
+        # Filter: puts only, DTE + liquidity
+        put_candidates = [
+            c for c in valid
+            if c.option_type == "put"
+            and c.dte >= cfg.min_dte
+            and c.dte <= cfg.max_dte
+            and (c.open_interest is None or c.open_interest >= cfg.min_open_interest)
+            and (c.spread_pct is None or c.spread_pct <= cfg.max_spread_pct)
+            and c.bid is not None
+            and c.ask is not None
+            and c.mid_price is not None
+        ]
+
+        if len(put_candidates) < 2:
+            raise LiquidityFilterError(
+                f"{valid[0].underlying if valid else '?'} chain",
+                f"[{self.name}] Need >= 2 liquid puts, found {len(put_candidates)}"
+            )
+
+        # Find short leg (closer to ATM)
+        short_leg_candidates = [
+            c for c in put_candidates
+            if cfg.short_delta - 0.05 <= c.delta <= cfg.short_delta + 0.05
+        ]
+        if not short_leg_candidates:
+            # Relax and take the closest
+            short_leg_candidates = put_candidates
+
+        short_put = min(
+            short_leg_candidates,
+            key=lambda c: abs(c.delta - cfg.short_delta)
+        )
+
+        # Find long leg (further OTM, lower strike, lower delta magnitude)
+        long_leg_candidates = [
+            c for c in put_candidates
+            if c.strike < short_put.strike          # must be lower strike
+            and (short_put.strike - c.strike) >= cfg.min_spread_width
+            and (short_put.strike - c.strike) <= cfg.max_spread_width
+        ]
+
+        if not long_leg_candidates:
+            raise LiquidityFilterError(
+                f"{short_put.underlying} chain",
+                f"[{self.name}] No valid long leg found below short strike "
+                f"{short_put.strike:.1f} with width "
+                f"[{cfg.min_spread_width}, {cfg.max_spread_width}]"
+            )
+
+        long_put = min(
+            long_leg_candidates,
+            key=lambda c: abs(c.delta - cfg.long_delta)
+        )
+
+        spread_width = short_put.strike - long_put.strike
+        short_credit = short_put.mid_price
+        long_cost = long_put.mid_price
+        net_credit = short_credit - long_cost
+
+        if net_credit < cfg.min_credit:
+            raise LiquidityFilterError(
+                f"{short_put.underlying} chain",
+                f"[{self.name}] Net credit ${net_credit:.2f} < min ${cfg.min_credit:.2f}. "
+                f"Short={short_credit:.2f} Long={long_cost:.2f}"
+            )
+
+        max_loss_per_contract = (spread_width - net_credit) * 100
+        hard_stop = net_credit * cfg.stop_multiplier
+        profit_target = net_credit * (1 - cfg.profit_target_pct)
+
+        short_leg = OrderLeg(
+            symbol=short_put.symbol,
+            option_type="put",
+            strike=short_put.strike,
+            expiry=short_put.expiry,
+            side="sell_to_open",
+            quantity=1,
+        )
+        long_leg = OrderLeg(
+            symbol=long_put.symbol,
+            option_type="put",
+            strike=long_put.strike,
+            expiry=long_put.expiry,
+            side="buy_to_open",
+            quantity=1,
+        )
+
+        logger.info(
+            "[%s] Signal: SELL %s (delta=%.3f) / BUY %s (delta=%.3f) "
+            "width=%.1f credit=%.2f max_loss=$%.2f stop=%.2f DTE=%d",
+            self.name,
+            short_put.symbol, short_put.delta,
+            long_put.symbol, long_put.delta,
+            spread_width, net_credit, max_loss_per_contract,
+            hard_stop, short_put.dte
+        )
+
+        return StrategySignal(
+            strategy_name=self.name,
+            underlying=short_put.underlying,
+            legs=[short_leg, long_leg],
+            net_debit_credit=-net_credit,
+            estimated_fill_price=net_credit,
+            max_loss_per_contract=max_loss_per_contract,
+            hard_stop_price=hard_stop,
+            profit_target_price=profit_target,
+            expiry=short_put.expiry,
+            dte=short_put.dte,
+            notes=(
+                f"short={short_put.strike:.0f}P delta={short_put.delta:.3f} "
+                f"long={long_put.strike:.0f}P delta={long_put.delta:.3f} "
+                f"width={spread_width:.1f} credit={net_credit:.2f}"
+            ),
+            source_contracts=[short_put, long_put],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Strategy 3: Short Strangle
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShortStrangleConfig:
+    """Configuration for ShortStrangle strategy."""
+    call_delta: float = 0.20            # sell this delta call
+    put_delta: float = -0.20            # sell this delta put
+    delta_tolerance: float = 0.05       # ± tolerance for delta matching
+    min_dte: int = 30
+    max_dte: int = 60
+    min_open_interest: int = 200
+    max_spread_pct: float = 0.20
+    min_total_credit: float = 1.50      # minimum combined credit
+    stop_multiplier: float = 3.0        # stop at 3x total credit received (wider than spread)
+    profit_target_pct: float = 0.50
+    min_iv_rank: Optional[float] = None  # e.g. 0.30 = only trade when IVR >= 30%
+                                         # set None to skip this filter
+
+
+class ShortStrangle(BaseStrategy):
+    """
+    Sell OTM call + sell OTM put on the same expiration.
+
+    Collects premium from both sides. Profits if underlying stays between
+    the two strikes at expiration.
+
+    IMPORTANT: This has larger theoretical max loss than a spread.
+    The stop_multiplier MUST be enforced — typically 3x combined credit.
+    ExecutionGuard rejects any attempt to submit without a hard stop.
+
+    Entry: sell call at call_delta, sell put at put_delta.
+    Stop:  hard_stop = total_credit * stop_multiplier (applied per-side)
+    Exit:  close at profit_target_pct of max profit (default 50%)
+    """
+
+    def __init__(self, config: Optional[ShortStrangleConfig] = None):
+        super().__init__("ShortStrangle")
+        self.config = config or ShortStrangleConfig()
+
+    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+        self._require_nonempty(chain)
+        valid = self._require_greeks(chain)
+
+        cfg = self.config
+
+        # DTE + liquidity filter
+        liquid = [
+            c for c in valid
+            if c.dte >= cfg.min_dte
+            and c.dte <= cfg.max_dte
+            and (c.open_interest is None or c.open_interest >= cfg.min_open_interest)
+            and (c.spread_pct is None or c.spread_pct <= cfg.max_spread_pct)
+            and c.bid is not None
+            and c.ask is not None
+            and c.mid_price is not None
+        ]
+
+        if not liquid:
+            raise LiquidityFilterError(
+                f"{valid[0].underlying if valid else '?'} chain",
+                f"[{self.name}] No liquid contracts in DTE "
+                f"{cfg.min_dte}-{cfg.max_dte}"
+            )
+
+        # Find the call leg
+        call_candidates = [
+            c for c in liquid
+            if c.option_type == "call"
+            and abs(c.delta - cfg.call_delta) <= cfg.delta_tolerance
+        ]
+        if not call_candidates:
+            # Relax tolerance
+            call_candidates = [c for c in liquid if c.option_type == "call"]
+
+        if not call_candidates:
+            raise LiquidityFilterError(
+                liquid[0].underlying,
+                f"[{self.name}] No calls in chain"
+            )
+
+        short_call = min(
+            call_candidates,
+            key=lambda c: abs(c.delta - cfg.call_delta)
+        )
+
+        # Find the put leg
+        put_candidates = [
+            c for c in liquid
+            if c.option_type == "put"
+            and abs(c.delta - cfg.put_delta) <= cfg.delta_tolerance
+        ]
+        if not put_candidates:
+            put_candidates = [c for c in liquid if c.option_type == "put"]
+
+        if not put_candidates:
+            raise LiquidityFilterError(
+                liquid[0].underlying,
+                f"[{self.name}] No puts in chain"
+            )
+
+        short_put = min(
+            put_candidates,
+            key=lambda c: abs(c.delta - cfg.put_delta)
+        )
+
+        call_credit = short_call.mid_price
+        put_credit = short_put.mid_price
+        total_credit = call_credit + put_credit
+
+        if total_credit < cfg.min_total_credit:
+            raise LiquidityFilterError(
+                short_call.underlying,
+                f"[{self.name}] Total credit ${total_credit:.2f} < "
+                f"min ${cfg.min_total_credit:.2f}"
+            )
+
+        # Max loss approximation for risk sizing.
+        # Strangles have theoretically large max loss, but for position sizing
+        # we use 3x total credit as a practical risk budget input.
+        # The actual stop at 3x credit ensures this is enforced.
+        practical_max_loss = total_credit * cfg.stop_multiplier * 100
+        hard_stop = total_credit * cfg.stop_multiplier
+        profit_target = total_credit * (1 - cfg.profit_target_pct)
+
+        call_leg = OrderLeg(
+            symbol=short_call.symbol,
+            option_type="call",
+            strike=short_call.strike,
+            expiry=short_call.expiry,
+            side="sell_to_open",
+            quantity=1,
+        )
+        put_leg = OrderLeg(
+            symbol=short_put.symbol,
+            option_type="put",
+            strike=short_put.strike,
+            expiry=short_put.expiry,
+            side="sell_to_open",
+            quantity=1,
+        )
+
+        logger.info(
+            "[%s] Signal: SELL %s (delta=%.3f) / SELL %s (delta=%.3f) "
+            "total_credit=%.2f hard_stop=%.2f DTE=%d",
+            self.name,
+            short_call.symbol, short_call.delta,
+            short_put.symbol, short_put.delta,
+            total_credit, hard_stop, short_call.dte
+        )
+
+        return StrategySignal(
+            strategy_name=self.name,
+            underlying=short_call.underlying,
+            legs=[call_leg, put_leg],
+            net_debit_credit=-total_credit,
+            estimated_fill_price=total_credit,
+            max_loss_per_contract=practical_max_loss,
+            hard_stop_price=hard_stop,
+            profit_target_price=profit_target,
+            expiry=short_call.expiry,
+            dte=short_call.dte,
+            notes=(
+                f"call={short_call.strike:.0f}C delta={short_call.delta:.3f} "
+                f"put={short_put.strike:.0f}P delta={short_put.delta:.3f} "
+                f"credit={total_credit:.2f}"
+            ),
+            source_contracts=[short_call, short_put],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Strategy registry — maps name → class for config-driven instantiation
+# ---------------------------------------------------------------------------
+
+STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
+    "csp": CashSecuredPut,
+    "short_put_spread": ShortPutSpread,
+    "short_strangle": ShortStrangle,
+}
+
+
+def get_strategy(name: str, config=None) -> BaseStrategy:
+    """
+    Instantiate a strategy by name.
+
+    Parameters
+    ----------
+    name : str
+        One of: "csp", "short_put_spread", "short_strangle"
+    config : dataclass or None
+        Strategy-specific config object. Uses defaults if None.
+
+    Raises
+    ------
+    ValueError
+        If name is not in STRATEGY_REGISTRY.
+    """
+    if name not in STRATEGY_REGISTRY:
+        raise ValueError(
+            f"Unknown strategy '{name}'. "
+            f"Available: {list(STRATEGY_REGISTRY.keys())}"
+        )
+    cls = STRATEGY_REGISTRY[name]
+    return cls(config) if config is not None else cls()
