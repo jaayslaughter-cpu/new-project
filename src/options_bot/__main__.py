@@ -33,12 +33,10 @@ import logging
 import os
 import sys
 
-# Configure logging before any imports
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# Configure structured JSON logging before any other imports
+# This ensures Railway captures all logs correctly
+from options_bot.logging_config import setup_logging
+setup_logging()
 
 
 def main() -> None:
