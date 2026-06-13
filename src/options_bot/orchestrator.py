@@ -57,6 +57,7 @@ from .exceptions import (
 from .greeks import GreeksEnricher
 from .market_data import YFinanceDataLoader
 from .risk import ExecutionGuard, RiskConfig, RiskManager
+from .regime import RegimeDetector
 from .strategy import BaseStrategy, StrategySignal, get_strategy
 
 logger = logging.getLogger(__name__)
@@ -100,8 +101,10 @@ class OrchestratorConfig:
     max_positions_total: int = 5      # max concurrent open positions
 
     # --- Regime filters ---
-    vix_max: float = 25.0             # suppress all new trades when VIX >= this level
+    vix_max: float = 25.0             # suppress all new trades when VIX >= this (legacy fallback)
     min_iv_rank: float = 0.0          # minimum IV rank 0-100 for strangle entry (0 = disabled)
+    regime_min_options_weight: float = 0.10  # minimum options weight to allow trading
+    regime_cache_ttl: int = 900       # regime cache TTL in seconds (default 15 min)
 
     # --- Broker ---
     paper: bool = True                # always default to paper
@@ -295,13 +298,21 @@ def send_discord(webhook_url: str, message: str) -> None:
         logger.warning("[Discord] Send failed (non-fatal): %s", exc)
 
 
-def _format_signal_message(signal: StrategySignal, filled: FilledOrder) -> str:
+def _format_signal_message(
+    signal: StrategySignal,
+    filled: FilledOrder,
+    regime: str = "",
+    options_weight: float = 0.0,
+) -> str:
     """Format a Discord dispatch message for a new trade."""
     order = filled.approved_order
     legs_str = " / ".join(
         f"{l.side.replace('_', ' ').upper()} {l.strike:.0f}{l.option_type[0].upper()}"
         for l in signal.legs
     )
+    regime_line = ""
+    if regime:
+        regime_line = f"Regime: {regime.upper()} (options_weight={options_weight:.0%})\n"
     return (
         f"**{signal.strategy_name.upper()} — {signal.underlying}**\n"
         f"Legs: {legs_str}\n"
@@ -311,6 +322,7 @@ def _format_signal_message(signal: StrategySignal, filled: FilledOrder) -> str:
         f"Contracts: {order.position_size_contracts}  "
         f"DTE: {signal.dte}  "
         f"Expiry: {signal.expiry}\n"
+        f"{regime_line}"
         f"Order ID: `{filled.order_id}`\n"
         f"{signal.notes}"
     )
@@ -400,7 +412,12 @@ class TradingPipeline:
             config.strategy_name, config.strategy_config
         )
 
-    def run_for_ticker(self, ticker: str) -> Optional[FilledOrder]:
+    def run_for_ticker(
+        self,
+        ticker: str,
+        regime_name: str = "",
+        regime_options_weight: float = 0.0,
+    ) -> Optional[FilledOrder]:
         """
         Run the full pipeline for one ticker.
         Returns FilledOrder if a trade was entered, None otherwise.
@@ -528,7 +545,7 @@ class TradingPipeline:
         with self.state._lock:
             self.state.filled_today.append(filled)
 
-        msg = _format_signal_message(signal, filled)
+        msg = _format_signal_message(signal, filled, regime_name, regime_options_weight)
         logger.info("[Pipeline] Trade entered: %s", msg.replace("\n", " | "))
         send_discord(self.config.discord_webhook_url, msg)
 
@@ -831,6 +848,11 @@ class Orchestrator:
             discord_webhook_url=config.discord_webhook_url,
         )
 
+        # Regime detector — replaces simple VIX threshold
+        self.regime_detector = RegimeDetector(
+            cache_ttl_seconds=config.regime_cache_ttl
+        )
+
         logger.info(
             "[Orchestrator] Ready: tickers=%s strategy=%s paper=%s",
             config.tickers, config.strategy_name, config.paper
@@ -971,22 +993,44 @@ class Orchestrator:
             self.state.record_error(f"Account not ready: {exc}")
             return []
 
-        # VIX regime filter — suppress all new trades in high-vol environments
-        vix = _get_vix()
-        if vix is not None:
-            if vix >= self.config.vix_max:
-                msg = (
-                    f"⚠️ **VIX GATE: No new trades** — VIX={vix:.1f} >= "
-                    f"max={self.config.vix_max:.1f}"
-                )
-                logger.warning("[Orchestrator] %s", msg)
-                send_discord(self.config.discord_webhook_url, msg)
-                return []
-            else:
-                logger.info("[Orchestrator] VIX=%.1f — below threshold %.1f, proceeding", 
-                           vix, self.config.vix_max)
-        else:
-            logger.warning("[Orchestrator] VIX unavailable — proceeding without regime filter")
+        # Regime detection — replaces simple VIX threshold
+        regime = self.regime_detector.detect()
+        options_weight = regime.get("options_weight", 0.15)
+        regime_name    = regime.get("regime", "unknown")
+        confidence     = regime.get("confidence", 0.33)
+        indicators     = regime.get("indicators", {})
+
+        logger.info(
+            "[Orchestrator] Regime: %s (confidence=%.2f, options_weight=%.2f) "
+            "VIX=%.1f trend=%s strength=%.2f curve=%.2f",
+            regime_name, confidence, options_weight,
+            indicators.get("vix_level", 0),
+            indicators.get("vix_trend", "?"),
+            indicators.get("trend_strength", 0),
+            indicators.get("yield_curve_slope", 0),
+        )
+
+        if options_weight < self.config.regime_min_options_weight:
+            msg = (
+                f"⚠️ **REGIME GATE: No new trades** — "
+                f"regime={regime_name} options_weight={options_weight:.0%} "
+                f"(min={self.config.regime_min_options_weight:.0%}) "
+                f"VIX={indicators.get('vix_level', 0):.1f}"
+            )
+            logger.warning("[Orchestrator] %s", msg)
+            send_discord(self.config.discord_webhook_url, msg)
+            return []
+
+        # Legacy VIX hard-stop (defense in depth, independent of regime score)
+        vix_level = indicators.get("vix_level")
+        if vix_level and vix_level >= self.config.vix_max:
+            msg = (
+                f"⚠️ **VIX HARD STOP: No new trades** — "
+                f"VIX={vix_level:.1f} >= {self.config.vix_max:.1f}"
+            )
+            logger.warning("[Orchestrator] %s", msg)
+            send_discord(self.config.discord_webhook_url, msg)
+            return []
 
         # Check position count
         positions = self.broker.get_positions()
@@ -1007,7 +1051,11 @@ class Orchestrator:
                 logger.info("[Orchestrator] Max positions reached — stopping scan")
                 break
 
-            filled = self.pipeline.run_for_ticker(ticker)
+            filled = self.pipeline.run_for_ticker(
+                ticker,
+                regime_name=regime_name,
+                regime_options_weight=options_weight,
+            )
             if filled:
                 filled_orders.append(filled)
 
