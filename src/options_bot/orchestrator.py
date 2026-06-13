@@ -59,6 +59,7 @@ from .market_data import YFinanceDataLoader
 from .risk import ExecutionGuard, RiskConfig, RiskManager
 from .regime import RegimeDetector
 from .sentiment import SentimentAnalyzer, SentimentConfig
+from .metrics import summary as perf_summary
 from .strategy import BaseStrategy, StrategySignal, get_strategy
 
 logger = logging.getLogger(__name__)
@@ -1124,7 +1125,6 @@ class Orchestrator:
         for trade in open_trades:
             try:
                 legs = json.loads(trade.get("legs_json", "[]"))
-                # Check if any leg expires today
                 expiring = [l for l in legs if l.get("expiry", "") == today]
                 if expiring:
                     logger.warning(
@@ -1138,13 +1138,10 @@ class Orchestrator:
                             logger.error("[EOD] Failed to close expiring leg %s: %s",
                                         leg["symbol"], exc)
                     self.db.update_status(trade["id"], status="closed_expiry")
-                    underlying = trade.get('underlying', '')
-                    strategy = trade.get('strategy', '')
-                    trade_id = trade['id']
                     send_discord(
                         self.config.discord_webhook_url,
-                        f"⏰ **EXPIRY CLOSE — {underlying} {strategy}**\n"
-                        f"Order ID: `{trade_id}` — closed at expiry"
+                        f"⏰ **EXPIRY CLOSE — {trade.get('underlying','')} {trade.get('strategy','')}**\n"
+                        f"Order ID: `{trade['id']}` — closed at expiry"
                     )
             except Exception as exc:
                 logger.error("[EOD] Expiry check failed for %s: %s", trade.get("id"), exc)
@@ -1153,7 +1150,41 @@ class Orchestrator:
         if cancelled:
             logger.info("[Orchestrator] Cancelled %d unfilled orders", cancelled)
 
+        # Build performance summary from today's closed trades
         open_trades = self.db.get_open_trades()
+        today_fills = self.state.filled_today
+        today_pnls = [
+            f.fill_price * f.approved_order.position_size_contracts * 100 * -1
+            for f in today_fills
+            if hasattr(f, 'fill_price') and f.fill_price
+        ]
+
+        # Pull all realized P&L from closed trades in DB for full metrics
+        try:
+            with self.db._get_conn() as conn:
+                cur = conn.execute(
+                    "SELECT realized_pnl FROM trades WHERE trade_date=? AND realized_pnl IS NOT NULL",
+                    (today,)
+                )
+                all_pnls = [row[0] for row in cur.fetchall()]
+        except Exception:
+            all_pnls = []
+
+        # Compute metrics if we have any closed trades
+        metrics_line = ""
+        if all_pnls:
+            import numpy as np
+            stats = perf_summary(all_pnls)
+            metrics_line = (
+                f"Win rate: {stats['win_rate']:.0%}  "
+                f"Profit factor: {stats['profit_factor']:.2f}  "
+                f"Avg W/L: {stats['avg_win_loss_ratio']:.2f}\n"
+            )
+
+        regime = self.regime_detector.detect()
+        hurst_val  = regime.get("indicators", {}).get("hurst", 0.5)
+        hurst_reg  = regime.get("indicators", {}).get("hurst_regime", "unknown")
+
         summary = (
             f"📊 **Daily Summary — {date.today()}**\n"
             f"Strategy: {self.config.strategy_name.upper()}  "
@@ -1162,6 +1193,11 @@ class Orchestrator:
             f"Open positions: {len(open_trades)}\n"
             f"Realized P&L: ${self.state.daily_realized_pnl:+.2f}\n"
             f"Unrealized P&L: ${self.state.daily_unrealized_pnl:+.2f}\n"
+            f"{metrics_line}"
+            f"Regime: {regime['regime'].upper()} "
+            f"(conf={regime['confidence']:.0%}, "
+            f"VIX={regime['indicators'].get('vix_level',0):.1f}, "
+            f"Hurst={hurst_val:.3f} [{hurst_reg}])\n"
             f"Errors: {len(self.state.errors_today)}"
         )
         logger.info("[Orchestrator] %s", summary.replace("\n", " | "))
