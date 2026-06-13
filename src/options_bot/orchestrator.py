@@ -60,6 +60,7 @@ from .risk import ExecutionGuard, RiskConfig, RiskManager
 from .regime import RegimeDetector
 from .sentiment import SentimentAnalyzer, SentimentConfig
 from .metrics import summary as perf_summary
+from .adaptive import AdaptiveTuner
 from .strategy import BaseStrategy, StrategySignal, get_strategy
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,11 @@ class OrchestratorConfig:
     # --- Sentiment filter ---
     sentiment_enabled: bool = True    # enable FinBERT news sentiment gate
     sentiment_config: SentimentConfig = field(default_factory=SentimentConfig)
+
+    # --- Adaptive tuning ---
+    adaptive_enabled: bool = True     # enable self-tuning of strategy parameters
+    adaptive_eval_window: int = 20    # number of recent closed trades to analyze
+    adaptive_tune_interval: int = 10  # min closed trades between tune cycles
 
     # --- Broker ---
     paper: bool = True                # always default to paper
@@ -864,6 +870,14 @@ class Orchestrator:
             config=config.sentiment_config
         ) if config.sentiment_enabled else None
 
+        # Adaptive tuner — self-tunes strategy parameters from closed trade history
+        self.tuner = AdaptiveTuner(
+            db=self.db,
+            discord_webhook=config.discord_webhook_url,
+            eval_window=config.adaptive_eval_window,
+            tune_interval=config.adaptive_tune_interval,
+        ) if config.adaptive_enabled else None
+
         logger.info(
             "[Orchestrator] Ready: tickers=%s strategy=%s paper=%s",
             config.tickers, config.strategy_name, config.paper
@@ -1106,6 +1120,25 @@ class Orchestrator:
             "[Orchestrator] === SCAN END: %d trades entered ===",
             len(filled_orders)
         )
+
+        # Adaptive tuning — run after scan, update strategy config for next cycle
+        if self.tuner and self.tuner.should_evaluate(self.config.strategy_name):
+            logger.info("[Orchestrator] Running adaptive tuning cycle...")
+            new_cfg, snap, adjustments = self.tuner.evaluate_and_tune(
+                self.config.strategy_name,
+                self.config.strategy_config,
+            )
+            if adjustments:
+                # Update live config and rebuild the pipeline's strategy instance
+                self.config.strategy_config = new_cfg
+                self.pipeline.strategy = get_strategy(
+                    self.config.strategy_name, new_cfg
+                )
+                logger.info(
+                    "[Orchestrator] Strategy config updated with %d adjustments",
+                    len(adjustments)
+                )
+
         return filled_orders
 
     def run_monitor(self) -> None:
@@ -1185,6 +1218,16 @@ class Orchestrator:
         hurst_val  = regime.get("indicators", {}).get("hurst", 0.5)
         hurst_reg  = regime.get("indicators", {}).get("hurst_regime", "unknown")
 
+        # Show today's adaptive tuning activity if any
+        tuning_line = ""
+        if self.tuner and self.tuner.adjustment_history():
+            today_adj = [
+                a for a in self.tuner.adjustment_history()
+                if a["applied_at"][:10] == today
+            ]
+            if today_adj:
+                tuning_line = f"Tuning adjustments today: {len(today_adj)}\n"
+
         summary = (
             f"📊 **Daily Summary — {date.today()}**\n"
             f"Strategy: {self.config.strategy_name.upper()}  "
@@ -1194,6 +1237,7 @@ class Orchestrator:
             f"Realized P&L: ${self.state.daily_realized_pnl:+.2f}\n"
             f"Unrealized P&L: ${self.state.daily_unrealized_pnl:+.2f}\n"
             f"{metrics_line}"
+            f"{tuning_line}"
             f"Regime: {regime['regime'].upper()} "
             f"(conf={regime['confidence']:.0%}, "
             f"VIX={regime['indicators'].get('vix_level',0):.1f}, "
