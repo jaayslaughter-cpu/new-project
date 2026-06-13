@@ -60,6 +60,14 @@ from typing import Optional
 
 from .contracts import EnrichedOptionRow, OrderLeg, OptionType
 from .exceptions import LiquidityFilterError, PipelineConnectionError
+from .spread_math import (
+    bull_put_entry,
+    bull_put_exit,
+    strangle_entry,
+    profit_target_price as calc_profit_target,
+    stop_price as calc_stop_price,
+    validate_spread_inputs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -282,9 +290,13 @@ class CashSecuredPut(BaseStrategy):
         )
 
         credit = short_put.mid_price or ((short_put.bid + short_put.ask) / 2)
+        # CSP max loss: stock drops to zero, we buy at strike, keep credit
+        # Practical max loss = (strike - credit) * 100 per contract
         max_loss_per_contract = (short_put.strike - credit) * 100
-        hard_stop = credit * cfg.stop_multiplier
-        profit_target = credit * (1 - cfg.profit_target_pct)
+        # Use spread_math helpers for stop and profit target
+        # (ensures consistent math across all strategies)
+        hard_stop = calc_stop_price(credit, cfg.stop_multiplier)
+        profit_target = calc_profit_target(credit, cfg.profit_target_pct)
 
         leg = OrderLeg(
             symbol=short_put.symbol,
@@ -430,9 +442,32 @@ class ShortPutSpread(BaseStrategy):
                 f"Short={short_credit:.2f} Long={long_cost:.2f}"
             )
 
-        max_loss_per_contract = (spread_width - net_credit) * 100
-        hard_stop = net_credit * cfg.stop_multiplier
-        profit_target = net_credit * (1 - cfg.profit_target_pct)
+        # Use spread_math for all P&L calculations — single source of truth
+        errors = validate_spread_inputs(
+            low_bid=long_put.bid, low_ask=long_put.ask,
+            high_bid=short_put.bid, high_ask=short_put.ask,
+            low_strike=long_put.strike, high_strike=short_put.strike,
+        )
+        if errors:
+            raise LiquidityFilterError(
+                f"{short_put.underlying} chain",
+                f"[{self.name}] Spread input validation failed: {'; '.join(errors)}"
+            )
+
+        spread_math = bull_put_entry(
+            low_strike=long_put.strike,
+            low_bid=long_put.bid,
+            low_ask=long_put.ask,
+            high_strike=short_put.strike,
+            high_bid=short_put.bid,
+            high_ask=short_put.ask,
+            num_contracts=1,
+            underlying_price=short_put.underlying_price,
+        )
+
+        max_loss_per_contract = spread_math["max_loss"]       # already per-contract dollars
+        hard_stop             = calc_stop_price(net_credit, cfg.stop_multiplier)
+        profit_target         = calc_profit_target(net_credit, cfg.profit_target_pct)
 
         short_leg = OrderLeg(
             symbol=short_put.symbol,
@@ -599,13 +634,21 @@ class ShortStrangle(BaseStrategy):
                 f"min ${cfg.min_total_credit:.2f}"
             )
 
-        # Max loss approximation for risk sizing.
-        # Strangles have theoretically large max loss, but for position sizing
-        # we use 3x total credit as a practical risk budget input.
-        # The actual stop at 3x credit ensures this is enforced.
-        practical_max_loss = total_credit * cfg.stop_multiplier * 100
-        hard_stop = total_credit * cfg.stop_multiplier
-        profit_target = total_credit * (1 - cfg.profit_target_pct)
+        # Use spread_math for strangle P&L and break-even calculations
+        strangle_math = strangle_entry(
+            put_strike=short_put.strike,
+            put_bid=short_put.bid,
+            put_ask=short_put.ask,
+            call_strike=short_call.strike,
+            call_bid=short_call.bid,
+            call_ask=short_call.ask,
+            num_contracts=1,
+            underlying_price=short_call.underlying_price,
+        )
+
+        practical_max_loss = strangle_math["practical_max_loss"]
+        hard_stop          = calc_stop_price(total_credit, cfg.stop_multiplier)
+        profit_target      = calc_profit_target(total_credit, cfg.profit_target_pct)
 
         call_leg = OrderLeg(
             symbol=short_call.symbol,
