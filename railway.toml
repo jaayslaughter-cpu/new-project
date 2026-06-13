@@ -1,7 +1,6 @@
 [build]
-builder = "RAILPACK"
+builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "python -m options_bot"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
