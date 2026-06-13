@@ -234,6 +234,54 @@ except Exception as e:
     fail("Hurst exponent", str(e))
     failures.append("hurst")
 
+# ── 8. Circuit breaker ───────────────────────────────────────────────────────
+print(f"\n{BOLD}8. Circuit breaker{RESET}")
+try:
+    from options_bot.circuit_breaker import CircuitBreaker
+    import time as _time
+    cb = CircuitBreaker(failure_threshold=2, cooldown_seconds=5.0)
+    assert cb.is_available("test"), "should start CLOSED"
+    cb.record_failure("test", "err1")
+    assert cb.is_available("test"), "should survive 1 failure"
+    cb.record_failure("test", "err2")
+    assert not cb.is_available("test"), "should be OPEN after 2 failures"
+    _time.sleep(6)
+    assert cb.is_available("test"), "should be HALF_OPEN after cooldown"
+    cb.record_success("test")
+    assert cb.is_available("test"), "should be CLOSED after success"
+    ok("Circuit breaker", "CLOSED->OPEN->HALF_OPEN->CLOSED verified")
+except Exception as e:
+    fail("Circuit breaker", str(e))
+    failures.append("circuit_breaker")
+
+# ── 9. VIX percentile ────────────────────────────────────────────────────────
+print(f"\n{BOLD}9. VIX percentile{RESET}")
+try:
+    vix_pct = result["indicators"].get("vix_percentile") if "result" in dir() else None
+    if vix_pct is not None:
+        ok("VIX percentile", f"{vix_pct:.1f}th percentile of 1-year history")
+    else:
+        fail("VIX percentile", "not in regime indicators (regime check may have failed)")
+        failures.append("vix_percentile")
+except Exception as e:
+    fail("VIX percentile", str(e))
+    failures.append("vix_percentile")
+
+# ── 10. Metrics module ───────────────────────────────────────────────────────
+print(f"\n{BOLD}10. Metrics module{RESET}")
+try:
+    from options_bot.metrics import summary, drawdown_duration
+    import numpy as np
+    pnls  = [120, -80, 200, -50, 150, -30, 90, -110, 175, -60]
+    stats = summary(pnls)
+    equity = np.array([100000.0, 100120, 100040, 100240, 100190, 100340, 100310, 100400, 100290, 100465, 100405])
+    dd    = drawdown_duration(equity)
+    ok("metrics.summary()", f"trades={stats['trade_count']} win={stats['win_rate']:.0%} PF={stats['profit_factor']:.2f}")
+    ok("metrics.drawdown_duration()", f"max_dd={dd['max_drawdown_pct']:.2%} max_dur={dd['max_duration_bars']}bars")
+except Exception as e:
+    fail("Metrics module", str(e))
+    failures.append("metrics")
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*50}")
 if not failures:
