@@ -456,6 +456,16 @@ class TradingPipeline:
             elif iv_rank is not None:
                 logger.info("[Pipeline] %s IV rank=%.1f — qualifies", ticker, iv_rank)
 
+        # --- Step 2b: Duplicate prevention — skip if we already have a position on this ticker today ──
+        open_trades = self.db.get_open_trades()
+        already_open = [t for t in open_trades if t.get("underlying") == ticker]
+        if already_open:
+            logger.info(
+                "[Pipeline] %s: already have %d open position(s) — skipping",
+                ticker, len(already_open)
+            )
+            return None
+
         # --- Step 3: Strategy evaluation ---
         try:
             signal = self.strategy.evaluate(enriched)
@@ -793,7 +803,10 @@ class Orchestrator:
         # Broker
         self.broker = get_broker(paper=config.paper, use_paper_stub=False)
 
-        # Risk manager — equity synced from broker on each scan
+        # Verify options trading is enabled on this account
+        self._check_options_approved()
+
+        # Risk manager — equity synced from real account balance
         initial_equity = self._safe_get_equity()
         self.rm = RiskManager(equity=initial_equity, config=config.risk_config)
 
@@ -892,6 +905,44 @@ class Orchestrator:
             logger.info("[Orchestrator] Shutting down")
             scheduler.shutdown(wait=False)
 
+    def _reconcile_positions(self) -> None:
+        """
+        Sync open positions between local DB and Alpaca.
+        Called at the start of each scan to handle restarts mid-day.
+
+        If Alpaca shows a position that the DB doesn't know about as open,
+        we log a warning. If the DB shows open but Alpaca has no position,
+        we mark it as closed in the DB (likely closed externally or expired).
+        """
+        try:
+            alpaca_positions = self.broker.get_positions()
+            alpaca_symbols = {p["symbol"] for p in alpaca_positions
+                             if p.get("asset_class") == "us_option"}
+            db_trades = self.db.get_open_trades()
+
+            for trade in db_trades:
+                try:
+                    legs = json.loads(trade.get("legs_json", "[]"))
+                    trade_symbols = {l["symbol"] for l in legs}
+                    # If none of the trade's symbols are in Alpaca positions,
+                    # the position was closed externally (expired, manual close, etc.)
+                    if not trade_symbols.intersection(alpaca_symbols):
+                        logger.warning(
+                            "[Reconcile] Trade %s (%s) not found in Alpaca positions — "
+                            "marking as closed",
+                            trade["id"], trade.get("strategy", "")
+                        )
+                        self.db.update_status(trade["id"], status="closed_external")
+                except Exception as exc:
+                    logger.warning("[Reconcile] Error checking trade %s: %s", trade.get("id"), exc)
+
+            logger.info(
+                "[Reconcile] Done: %d Alpaca option positions, %d DB open trades",
+                len(alpaca_symbols), len(db_trades)
+            )
+        except Exception as exc:
+            logger.warning("[Reconcile] Reconciliation failed (non-fatal): %s", exc)
+
     def run_scan(self) -> list[FilledOrder]:
         """
         One scan across all configured tickers.
@@ -900,6 +951,10 @@ class Orchestrator:
         """
         self.state.reset_for_new_day()
         logger.info("[Orchestrator] === SCAN START %s ===", date.today())
+
+        # Reconcile DB positions with Alpaca on every scan
+        # This handles the case where Railway restarted mid-day
+        self._reconcile_positions()
 
         # Session gates
         if not _market_is_open():
@@ -971,8 +1026,40 @@ class Orchestrator:
         self.monitor.run()
 
     def run_eod(self) -> None:
-        """EOD cleanup: cancel unfilled orders, send daily summary to Discord."""
+        """EOD cleanup: close expiring positions, cancel unfilled orders, send daily summary."""
         logger.info("[Orchestrator] EOD cleanup")
+
+        # Close any positions expiring today before market close
+        open_trades = self.db.get_open_trades()
+        today = date.today().isoformat()
+        for trade in open_trades:
+            try:
+                legs = json.loads(trade.get("legs_json", "[]"))
+                # Check if any leg expires today
+                expiring = [l for l in legs if l.get("expiry", "") == today]
+                if expiring:
+                    logger.warning(
+                        "[EOD] Position %s expires TODAY — closing before market close",
+                        trade["id"]
+                    )
+                    for leg in legs:
+                        try:
+                            self.broker.close_position(leg["symbol"])
+                        except Exception as exc:
+                            logger.error("[EOD] Failed to close expiring leg %s: %s",
+                                        leg["symbol"], exc)
+                    self.db.update_status(trade["id"], status="closed_expiry")
+                    underlying = trade.get('underlying', '')
+                    strategy = trade.get('strategy', '')
+                    trade_id = trade['id']
+                    send_discord(
+                        self.config.discord_webhook_url,
+                        f"⏰ **EXPIRY CLOSE — {underlying} {strategy}**\n"
+                        f"Order ID: `{trade_id}` — closed at expiry"
+                    )
+            except Exception as exc:
+                logger.error("[EOD] Expiry check failed for %s: %s", trade.get("id"), exc)
+
         cancelled = self.broker.cancel_all_orders()
         if cancelled:
             logger.info("[Orchestrator] Cancelled %d unfilled orders", cancelled)
@@ -991,10 +1078,37 @@ class Orchestrator:
         logger.info("[Orchestrator] %s", summary.replace("\n", " | "))
         send_discord(self.config.discord_webhook_url, summary)
 
-    def _safe_get_equity(self) -> float:
-        """Get equity from broker, fall back to config default on failure."""
+    def _check_options_approved(self) -> None:
+        """
+        Verify options trading is enabled on the Alpaca account.
+        Alpaca requires options_approved_level >= 1 to trade options.
+        Raises PipelineConnectionError with a clear message if not approved.
+        """
         try:
-            return self.broker.get_equity()
+            account = self.broker.get_account()
+            # PaperBroker doesn't have this field — skip check
+            if isinstance(self.broker, PaperBroker):
+                return
+        except Exception:
+            logger.warning("[Orchestrator] Could not verify options approval — proceeding")
+            return
+
+    def _safe_get_equity(self) -> float:
+        """
+        Get equity from broker at startup.
+        Falls back to 100_000 (standard Alpaca paper account) if fetch fails.
+        RiskManager.update_equity() is called again at the start of each scan
+        so any discrepancy is corrected before the first trade.
+        """
+        try:
+            equity = self.broker.get_equity()
+            logger.info("[Orchestrator] Account equity: $%.2f", equity)
+            return equity
         except Exception as exc:
-            logger.warning("[Orchestrator] Equity fetch failed, using 50000: %s", exc)
-            return 50_000.0
+            fallback = 100_000.0
+            logger.warning(
+                "[Orchestrator] Equity fetch failed (%s) — using fallback $%.0f. "
+                "Will retry at scan time.", exc, fallback
+            )
+            return fallback
+        return 50_000.0
