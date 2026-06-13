@@ -92,9 +92,23 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Validate API keys exist before doing anything
+    # Load .env FIRST before any credential checks
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+    # Validate API keys exist
     if not args.dry_run:
-        if not os.getenv("ALPACA_API_KEY") or not os.getenv("ALPACA_SECRET_KEY"):
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+
+        # Debug: log what Railway is injecting (masked for security)
+        print(f"DEBUG: ALPACA_API_KEY={'SET(' + str(len(api_key)) + ' chars)' if api_key else 'NOT SET'}", file=sys.stderr)
+        print(f"DEBUG: ALPACA_SECRET_KEY={'SET(' + str(len(secret_key)) + ' chars)' if secret_key else 'NOT SET'}", file=sys.stderr)
+
+        if not api_key or not secret_key:
             print(
                 "ERROR: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set.\n"
                 "Add them to your environment or a .env file.\n"
@@ -102,13 +116,6 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-
-    # Load .env if python-dotenv is available
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
 
     from options_bot.orchestrator import Orchestrator, OrchestratorConfig
     from options_bot.risk import RiskConfig
