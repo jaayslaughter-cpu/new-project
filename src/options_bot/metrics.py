@@ -1,7 +1,7 @@
 """
 Performance metrics for the options bot.
 
-Pure functions operating on numpy arrays — no pandas dependency, no side effects.
+Pure functions operating on numpy arrays -- no pandas dependency, no side effects.
 Used by the orchestrator's EOD summary and by backtests.
 
 All functions accept plain lists or numpy arrays.
@@ -10,6 +10,9 @@ Pass periods_per_year explicitly for intraday or weekly data.
 
 Extracted and rewritten from pairs-divergence-strategy/metrics.py
 (original: MIT license, pure numpy implementation).
+
+Drawdown duration functions extracted from backtesting.py/_stats.py
+(original: Apache 2.0 license, rewritten without pandas dependency).
 """
 from __future__ import annotations
 
@@ -36,6 +39,21 @@ def total_return(equity) -> float:
     if equity.size < 2 or equity[0] == 0:
         return 0.0
     return float(equity[-1] / equity[0] - 1.0)
+
+
+def geometric_mean(returns) -> float:
+    """
+    Geometric mean of a return series -- more accurate than arithmetic mean
+    for compounded returns. Returns 0 if any (1 + r) <= 0.
+
+    Extracted from backtesting.py/_stats.py.
+    """
+    returns = np.asarray(returns, dtype=float)
+    factors = returns + 1.0
+    if np.any(factors <= 0):
+        return 0.0
+    n = len(factors) or 1
+    return float(np.exp(np.log(factors).sum() / n) - 1.0)
 
 
 def sharpe_ratio(
@@ -82,6 +100,67 @@ def max_drawdown(equity) -> float:
     return float(drawdowns.min())
 
 
+def drawdown_duration(equity) -> dict:
+    """
+    Compute drawdown duration statistics from an equity curve.
+
+    Returns a dict with:
+      max_drawdown_pct      -- worst peak-to-trough decline (negative fraction)
+      max_duration_bars     -- longest number of bars spent underwater
+      avg_duration_bars     -- average drawdown episode length
+      n_drawdown_episodes   -- total number of distinct drawdown episodes
+
+    Extracted and rewritten from backtesting.py/_stats.py
+    compute_drawdown_duration_peaks() -- original: Apache 2.0.
+    """
+    equity = np.asarray(equity, dtype=float)
+    if equity.size < 2:
+        return {
+            "max_drawdown_pct":    0.0,
+            "max_duration_bars":   0,
+            "avg_duration_bars":   0.0,
+            "n_drawdown_episodes": 0,
+        }
+
+    peak     = np.maximum.accumulate(equity)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dd = np.where(peak != 0, (equity - peak) / peak, 0.0)
+
+    # Find indices where we return to zero drawdown (recovery points)
+    at_zero = np.where(dd == 0.0)[0]
+    if len(at_zero) == 0:
+        # Never recovered -- whole series is one drawdown
+        return {
+            "max_drawdown_pct":    float(dd.min()),
+            "max_duration_bars":   int(equity.size),
+            "avg_duration_bars":   float(equity.size),
+            "n_drawdown_episodes": 1,
+        }
+
+    # Build episode durations: gaps between consecutive zero-crossings
+    # where the gap is > 1 bar (i.e. there was actually a drawdown between them)
+    durations = []
+    for i in range(1, len(at_zero)):
+        gap = at_zero[i] - at_zero[i - 1]
+        if gap > 1:
+            durations.append(gap)
+
+    if not durations:
+        return {
+            "max_drawdown_pct":    float(dd.min()),
+            "max_duration_bars":   0,
+            "avg_duration_bars":   0.0,
+            "n_drawdown_episodes": 0,
+        }
+
+    return {
+        "max_drawdown_pct":    float(dd.min()),
+        "max_duration_bars":   int(max(durations)),
+        "avg_duration_bars":   round(float(np.mean(durations)), 1),
+        "n_drawdown_episodes": len(durations),
+    }
+
+
 def annualized_return(
     equity,
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
@@ -112,7 +191,7 @@ def profit_factor(pnls) -> float:
     """
     pnls = np.asarray(pnls, dtype=float)
     gross_profit = pnls[pnls > 0].sum()
-    gross_loss = abs(pnls[pnls < 0].sum())
+    gross_loss   = abs(pnls[pnls < 0].sum())
     if gross_loss == 0:
         return float("inf") if gross_profit > 0 else 0.0
     return float(gross_profit / gross_loss)
@@ -120,8 +199,8 @@ def profit_factor(pnls) -> float:
 
 def avg_win_loss_ratio(pnls) -> float:
     """Average winning trade / average losing trade (absolute values)."""
-    pnls = np.asarray(pnls, dtype=float)
-    wins = pnls[pnls > 0]
+    pnls   = np.asarray(pnls, dtype=float)
+    wins   = pnls[pnls > 0]
     losses = pnls[pnls < 0]
     if wins.size == 0 or losses.size == 0:
         return 0.0
@@ -143,8 +222,9 @@ def summary(pnls, equity_curve=None) -> dict:
     Returns
     -------
     dict with keys:
-        total_pnl, trade_count, win_rate, profit_factor,
-        avg_win_loss_ratio, sharpe, max_drawdown, annualized_return
+        total_pnl, trade_count, win_rate, profit_factor, avg_win_loss_ratio,
+        sharpe, max_drawdown, max_duration_bars, avg_duration_bars,
+        n_drawdown_episodes, annualized_return
     """
     pnls = np.asarray(pnls, dtype=float)
 
@@ -154,14 +234,19 @@ def summary(pnls, equity_curve=None) -> dict:
         equity_curve = np.array([100_000.0])
 
     returns = equity_to_returns(equity_curve)
+    dd_stats = drawdown_duration(equity_curve)
 
     return {
-        "total_pnl":         round(float(pnls.sum()), 2),
-        "trade_count":       int(pnls.size),
-        "win_rate":          round(win_rate(pnls), 4),
-        "profit_factor":     round(profit_factor(pnls), 3),
-        "avg_win_loss_ratio": round(avg_win_loss_ratio(pnls), 3),
-        "sharpe":            round(sharpe_ratio(returns), 3),
-        "max_drawdown":      round(max_drawdown(equity_curve), 4),
-        "annualized_return": round(annualized_return(equity_curve), 4),
+        "total_pnl":           round(float(pnls.sum()), 2),
+        "trade_count":         int(pnls.size),
+        "win_rate":            round(win_rate(pnls), 4),
+        "profit_factor":       round(profit_factor(pnls), 3),
+        "avg_win_loss_ratio":  round(avg_win_loss_ratio(pnls), 3),
+        "sharpe":              round(sharpe_ratio(returns), 3),
+        "max_drawdown":        round(dd_stats["max_drawdown_pct"], 4),
+        "max_duration_bars":   dd_stats["max_duration_bars"],
+        "avg_duration_bars":   dd_stats["avg_duration_bars"],
+        "n_drawdown_episodes": dd_stats["n_drawdown_episodes"],
+        "annualized_return":   round(annualized_return(equity_curve), 4),
     }
+
