@@ -42,6 +42,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from .hurst import hurst_exponent, classify_regime as hurst_classify, hurst_options_weight
+from .circuit_breaker import data_circuit_breaker as _cb
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,7 @@ class RegimeDetector:
         trend_strength = self._compute_trend_strength()
         yield_slope    = self._fetch_yield_curve_slope()
         hurst_val      = self._compute_hurst()
+        vix_pct        = self._compute_vix_percentile(vix_level)
 
         return {
             "vix_level":         round(vix_level,      2) if vix_level      is not None else 20.0,
@@ -153,21 +155,28 @@ class RegimeDetector:
             "yield_curve_slope": round(yield_slope,     4) if yield_slope    is not None else 0.5,
             "hurst":             round(hurst_val,       4) if hurst_val      is not None else 0.5,
             "hurst_regime":      hurst_classify(hurst_val) if hurst_val is not None else "random_walk",
+            "vix_percentile":    round(vix_pct,         1) if vix_pct        is not None else 50.0,
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
         """Fetch current VIX from yfinance ^VIX."""
+        if not _cb.is_available("yfinance_vix"):
+            logger.debug("[RegimeDetector] VIX fetch skipped — circuit breaker OPEN")
+            return None
         try:
             import yfinance as yf
             vix = yf.Ticker("^VIX")
             price = vix.fast_info.get("lastPrice")
             if price and float(price) > 0:
+                _cb.record_success("yfinance_vix")
                 return float(price)
-            # Fallback: last close from history
             hist = vix.history(period="5d")
             if not hist.empty:
+                _cb.record_success("yfinance_vix")
                 return float(hist["Close"].iloc[-1])
+            _cb.record_failure("yfinance_vix", "empty response")
         except Exception as exc:
+            _cb.record_failure("yfinance_vix", str(exc))
             logger.warning("[RegimeDetector] VIX fetch failed: %s", exc)
         return None
 
@@ -195,24 +204,25 @@ class RegimeDetector:
         return "stable"
 
     def _compute_market_breadth(self) -> Optional[float]:
-        """
-        SPY advance/decline breadth proxy.
-        Returns ratio of up-days to down-days over last 20 sessions.
-        From TradeX — uses yfinance SPY instead of FMP.
-        """
+        """SPY advance/decline breadth proxy — ratio of up-days to down-days over last 20 sessions."""
+        if not _cb.is_available("yfinance_spy"):
+            return None
         try:
             import yfinance as yf
             hist = yf.Ticker("SPY").history(period="35d")
             if hist.empty or len(hist) < 5:
+                _cb.record_failure("yfinance_spy", "insufficient bars")
                 return None
+            _cb.record_success("yfinance_spy")
             closes = hist["Close"].tolist()
-            recent = closes[-21:]   # 20 day-over-day changes
-            up_days = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
+            recent = closes[-21:]
+            up_days   = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
             down_days = len(recent) - 1 - up_days
             if down_days == 0:
-                return 2.0   # Cap: all up-days
+                return 2.0
             return up_days / down_days
         except Exception as exc:
+            _cb.record_failure("yfinance_spy", str(exc))
             logger.warning("[RegimeDetector] Breadth failed: %s", exc)
         return None
 
@@ -269,6 +279,40 @@ class RegimeDetector:
             logger.warning("[RegimeDetector] Trend strength failed: %s", exc)
         return None
 
+    def _compute_vix_percentile(self, current_vix: Optional[float], window_days: int = 252) -> Optional[float]:
+        """
+        Compute where the current VIX level sits within its own N-day history.
+
+        Returns a percentile 0–100:
+          VIX at 90th percentile → historically elevated → strong short-premium signal
+          VIX at 20th percentile → historically suppressed → avoid selling premium
+
+        More robust than raw VIX level: VIX=22 means very different things if
+        the 1-year range is 12–45 vs 18–25.
+        """
+        if current_vix is None:
+            return None
+        if not _cb.is_available("yfinance_vix_hist"):
+            return None
+        try:
+            import yfinance as yf
+            from scipy.stats import percentileofscore
+            hist = yf.Ticker("^VIX").history(period="2y")
+            if hist.empty or len(hist) < 20:
+                _cb.record_failure("yfinance_vix_hist", "insufficient history")
+                return None
+            _cb.record_success("yfinance_vix_hist")
+            closes = hist["Close"].tolist()
+            window = closes[-window_days:] if len(closes) >= window_days else closes
+            pct = percentileofscore(window, current_vix)
+            logger.debug("[RegimeDetector] VIX percentile=%.1f (VIX=%.2f, window=%d days)",
+                         pct, current_vix, len(window))
+            return float(pct)
+        except Exception as exc:
+            _cb.record_failure("yfinance_vix_hist", str(exc))
+            logger.warning("[RegimeDetector] VIX percentile failed: %s", exc)
+        return None
+
     def _compute_hurst(self) -> Optional[float]:
         """
         Compute the Hurst exponent for SPY over the last 252 trading days.
@@ -289,35 +333,37 @@ class RegimeDetector:
         return None
 
     def _fetch_yield_curve_slope(self) -> Optional[float]:
-        """
-        10Y - 2Y Treasury spread from FRED (DGS10 - DGS2).
-        Uses fredapi if FRED_API_KEY is set, otherwise falls back to
-        yfinance TNX/IRX as a proxy.
-        """
+        """10Y - 2Y Treasury spread from FRED, falling back to yfinance TNX/IRX."""
         fred_key = os.getenv("FRED_API_KEY", "")
 
-        if fred_key:
+        if fred_key and _cb.is_available("fred"):
             try:
                 from fredapi import Fred
-                fred = Fred(api_key=fred_key)
+                fred  = Fred(api_key=fred_key)
                 dgs10 = fred.get_series("DGS10").dropna()
                 dgs2  = fred.get_series("DGS2").dropna()
                 if len(dgs10) > 0 and len(dgs2) > 0:
+                    _cb.record_success("fred")
                     return float(dgs10.iloc[-1]) - float(dgs2.iloc[-1])
+                _cb.record_failure("fred", "empty series")
             except Exception as exc:
+                _cb.record_failure("fred", str(exc))
                 logger.warning("[RegimeDetector] FRED yield curve failed: %s", exc)
 
-        # Fallback: yfinance ^TNX (10Y) and ^IRX (13-week T-bill) as proxy
+        # Fallback: yfinance ^TNX / ^IRX
+        if not _cb.is_available("yfinance_rates"):
+            return None
         try:
             import yfinance as yf
             t10 = yf.Ticker("^TNX").fast_info.get("lastPrice")
             t2  = yf.Ticker("^IRX").fast_info.get("lastPrice")
             if t10 and t2:
-                # ^TNX is in percent (e.g. 4.25), ^IRX is also in percent
+                _cb.record_success("yfinance_rates")
                 return float(t10) - float(t2)
+            _cb.record_failure("yfinance_rates", "missing TNX/IRX")
         except Exception as exc:
+            _cb.record_failure("yfinance_rates", str(exc))
             logger.warning("[RegimeDetector] Yield curve fallback failed: %s", exc)
-
         return None
 
     # ------------------------------------------------------------------
@@ -335,6 +381,7 @@ class RegimeDetector:
         breadth        = indicators.get("breadth", 1.0)
         slope          = indicators.get("yield_curve_slope", 0.5)
         hurst          = indicators.get("hurst", 0.5)
+        vix_pct        = indicators.get("vix_percentile", 50.0)
 
         scores: dict[str, float] = {
             "trending":        0.0,
@@ -379,7 +426,22 @@ class RegimeDetector:
         if slope < 0:         scores["high_volatility"] += 0.15
         elif slope > 1.0:     scores["trending"]         += 0.05
 
-        # Hurst exponent — fourth signal (weight 0.20 of total)
+        # VIX percentile — 6th signal (where VIX sits in its own history)
+        # High percentile = historically elevated vol = ideal for short premium
+        # Low percentile = historically suppressed vol = avoid selling premium
+        if vix_pct >= 80:
+            scores["high_volatility"] += 0.20
+        elif vix_pct >= 65:
+            scores["high_volatility"] += 0.12
+            scores["mean_reverting"]  += 0.05
+        elif vix_pct <= 25:
+            scores["trending"]        += 0.10   # calm market, directional
+        elif vix_pct <= 40:
+            scores["mean_reverting"]  += 0.08   # mid-range, choppy
+        else:
+            scores["mean_reverting"]  += 0.04   # neutral zone
+
+        # Hurst exponent — 7th signal (was previously 5th, now 7th with VIX pct added)
         # Mean-reverting Hurst boosts mean_reverting regime
         # Trending Hurst boosts trending regime
         # Random walk Hurst is neutral (small boost to high_volatility as a hedge)
