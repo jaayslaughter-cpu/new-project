@@ -41,6 +41,8 @@ import time
 from datetime import date, timedelta
 from typing import Optional
 
+from .hurst import hurst_exponent, classify_regime as hurst_classify, hurst_options_weight
+
 logger = logging.getLogger(__name__)
 
 # Cache TTL — 15 minutes, same as TradeX default
@@ -136,11 +138,12 @@ class RegimeDetector:
 
     def _gather_indicators(self) -> dict:
         """Fetch all indicators. Each sub-fetch fails independently."""
-        vix_level     = self._fetch_vix_level()
-        vix_trend     = self._compute_vix_trend()
-        breadth       = self._compute_market_breadth()
+        vix_level      = self._fetch_vix_level()
+        vix_trend      = self._compute_vix_trend()
+        breadth        = self._compute_market_breadth()
         trend_strength = self._compute_trend_strength()
-        yield_slope   = self._fetch_yield_curve_slope()
+        yield_slope    = self._fetch_yield_curve_slope()
+        hurst_val      = self._compute_hurst()
 
         return {
             "vix_level":         round(vix_level,      2) if vix_level      is not None else 20.0,
@@ -148,6 +151,8 @@ class RegimeDetector:
             "breadth":           round(breadth,         4) if breadth        is not None else 1.0,
             "trend_strength":    round(trend_strength,  4) if trend_strength is not None else 0.5,
             "yield_curve_slope": round(yield_slope,     4) if yield_slope    is not None else 0.5,
+            "hurst":             round(hurst_val,       4) if hurst_val      is not None else 0.5,
+            "hurst_regime":      hurst_classify(hurst_val) if hurst_val is not None else "random_walk",
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
@@ -264,6 +269,25 @@ class RegimeDetector:
             logger.warning("[RegimeDetector] Trend strength failed: %s", exc)
         return None
 
+    def _compute_hurst(self) -> Optional[float]:
+        """
+        Compute the Hurst exponent for SPY over the last 252 trading days.
+        H < 0.48 → mean-reverting (best for short premium)
+        H > 0.52 → trending (dangerous for short premium)
+        """
+        try:
+            import yfinance as yf
+            hist = yf.Ticker("SPY").history(period="2y")
+            if hist.empty or len(hist) < 50:
+                return None
+            closes = hist["Close"].values
+            h = hurst_exponent(closes[-252:] if len(closes) >= 252 else closes)
+            logger.debug("[RegimeDetector] Hurst=%.4f (%s)", h, hurst_classify(h))
+            return h
+        except Exception as exc:
+            logger.warning("[RegimeDetector] Hurst computation failed: %s", exc)
+        return None
+
     def _fetch_yield_curve_slope(self) -> Optional[float]:
         """
         10Y - 2Y Treasury spread from FRED (DGS10 - DGS2).
@@ -303,17 +327,18 @@ class RegimeDetector:
     def _classify(self, indicators: dict) -> tuple[str, float]:
         """
         Score each regime and return (regime_name, confidence).
-        Logic ported from TradeX without modification.
+        Logic ported from TradeX, extended with Hurst exponent as fourth signal.
         """
         vix            = indicators.get("vix_level", 20.0)
         vix_trend      = indicators.get("vix_trend", "stable")
         trend_strength = indicators.get("trend_strength", 0.5)
         breadth        = indicators.get("breadth", 1.0)
         slope          = indicators.get("yield_curve_slope", 0.5)
+        hurst          = indicators.get("hurst", 0.5)
 
         scores: dict[str, float] = {
-            "trending":       0.0,
-            "mean_reverting": 0.0,
+            "trending":        0.0,
+            "mean_reverting":  0.0,
             "high_volatility": 0.0,
         }
 
@@ -353,6 +378,21 @@ class RegimeDetector:
         # Yield curve: inversion → higher volatility signal
         if slope < 0:         scores["high_volatility"] += 0.15
         elif slope > 1.0:     scores["trending"]         += 0.05
+
+        # Hurst exponent — fourth signal (weight 0.20 of total)
+        # Mean-reverting Hurst boosts mean_reverting regime
+        # Trending Hurst boosts trending regime
+        # Random walk Hurst is neutral (small boost to high_volatility as a hedge)
+        if hurst < 0.40:
+            scores["mean_reverting"]  += 0.20
+        elif hurst < 0.48:
+            scores["mean_reverting"]  += 0.12
+        elif hurst > 0.60:
+            scores["trending"]        += 0.20
+        elif hurst > 0.52:
+            scores["trending"]        += 0.12
+        else:
+            scores["high_volatility"] += 0.05  # random walk — slight uncertainty bump
 
         # Pick winner
         regime = max(scores, key=scores.__getitem__)
