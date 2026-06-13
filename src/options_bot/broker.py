@@ -278,9 +278,8 @@ class AlpacaBroker:
             "[AlpacaBroker] mleg: %d legs qty=%d limit_price=%.2f (credit=%.2f)",
             len(alpaca_legs), qty, limit_price, abs(net)
         )
-        logger.info(
-            "[AlpacaBroker] NOTE: mleg stop_loss not supported by API. "
-            "Monitor position and submit closing order at stop level %.2f manually.",
+        logger.debug(
+            "[AlpacaBroker] mleg: stop managed by PositionMonitor at %.2f",
             order.hard_stop_price
         )
         return self._post_order(req, order, client_id)
