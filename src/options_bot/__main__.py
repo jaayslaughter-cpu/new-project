@@ -104,10 +104,6 @@ def main() -> None:
         api_key = os.getenv("ALPACA_API_KEY", "")
         secret_key = os.getenv("ALPACA_SECRET_KEY", "")
 
-        # Debug: log what Railway is injecting (masked for security)
-        print(f"DEBUG: ALPACA_API_KEY={'SET(' + str(len(api_key)) + ' chars)' if api_key else 'NOT SET'}", file=sys.stderr)
-        print(f"DEBUG: ALPACA_SECRET_KEY={'SET(' + str(len(secret_key)) + ' chars)' if secret_key else 'NOT SET'}", file=sys.stderr)
-
         if not api_key or not secret_key:
             print(
                 "ERROR: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set.\n"
