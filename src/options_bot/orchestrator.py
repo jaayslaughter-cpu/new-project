@@ -58,6 +58,7 @@ from .greeks import GreeksEnricher
 from .market_data import YFinanceDataLoader
 from .risk import ExecutionGuard, RiskConfig, RiskManager
 from .regime import RegimeDetector
+from .sentiment import SentimentAnalyzer, SentimentConfig
 from .strategy import BaseStrategy, StrategySignal, get_strategy
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,10 @@ class OrchestratorConfig:
     min_iv_rank: float = 0.0          # minimum IV rank 0-100 for strangle entry (0 = disabled)
     regime_min_options_weight: float = 0.10  # minimum options weight to allow trading
     regime_cache_ttl: int = 900       # regime cache TTL in seconds (default 15 min)
+
+    # --- Sentiment filter ---
+    sentiment_enabled: bool = True    # enable FinBERT news sentiment gate
+    sentiment_config: SentimentConfig = field(default_factory=SentimentConfig)
 
     # --- Broker ---
     paper: bool = True                # always default to paper
@@ -853,6 +858,11 @@ class Orchestrator:
             cache_ttl_seconds=config.regime_cache_ttl
         )
 
+        # Sentiment analyzer — FinBERT news signal layer
+        self.sentiment_analyzer = SentimentAnalyzer(
+            config=config.sentiment_config
+        ) if config.sentiment_enabled else None
+
         logger.info(
             "[Orchestrator] Ready: tickers=%s strategy=%s paper=%s",
             config.tickers, config.strategy_name, config.paper
@@ -1042,6 +1052,28 @@ class Orchestrator:
             )
             return []
 
+        # Sentiment gate — fetch FinBERT signals for all tickers once per scan
+        # Blocks entry on tickers with SELL sentiment (bearish news)
+        sentiment_signals: dict = {}
+        if self.sentiment_analyzer is not None:
+            try:
+                sentiment_signals = self.sentiment_analyzer.get_signals(self.config.tickers)
+                sell_tickers = [
+                    t for t, s in sentiment_signals.items() if s.signal == "SELL"
+                ]
+                if sell_tickers:
+                    logger.info(
+                        "[Orchestrator] Sentiment SELL on %s — those tickers will be skipped",
+                        sell_tickers,
+                    )
+                    send_discord(
+                        self.config.discord_webhook_url,
+                        f"📰 **Sentiment gate** — SELL signal on: {', '.join(sell_tickers)}\n"
+                        f"Those tickers skipped this scan.",
+                    )
+            except Exception as exc:
+                logger.warning("[Orchestrator] Sentiment fetch failed (non-fatal): %s", exc)
+
         filled_orders = []
         for ticker in self.config.tickers:
             # Don't exceed max positions mid-scan
@@ -1050,6 +1082,15 @@ class Orchestrator:
             if current_count >= self.config.max_positions_total:
                 logger.info("[Orchestrator] Max positions reached — stopping scan")
                 break
+
+            # Sentiment gate — skip tickers with SELL signal
+            if self.sentiment_analyzer is not None and sentiment_signals:
+                if not self.sentiment_analyzer.is_entry_allowed(ticker, sentiment_signals):
+                    logger.info(
+                        "[Orchestrator] %s: sentiment SELL — skipping this ticker",
+                        ticker,
+                    )
+                    continue
 
             filled = self.pipeline.run_for_ticker(
                 ticker,
