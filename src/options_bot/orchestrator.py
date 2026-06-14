@@ -751,26 +751,56 @@ class PositionMonitor:
                 snapshots = self.broker.get_option_snapshots(all_symbols)
                 for trade in trades_needing_greeks:
                     legs = json.loads(trade.get("legs_json", "[]"))
-                    short_legs = [l for l in legs if "sell" in l.get("side", "")]
-                    if not short_legs:
+                    if not legs:
                         continue
-                    sym  = short_legs[0]["symbol"]
-                    snap = snapshots.get(sym, {})
-                    delta = snap.get("delta")
-                    vega  = snap.get("vega")
-                    theta = snap.get("theta")
-                    spot  = snap.get("underlying_price") or trade.get("underlying_price")
-                    if delta is not None and vega is not None and theta is not None:
+
+                    # Compute NET Greeks across all legs.
+                    # For spreads: short put delta + long put delta (long delta is positive,
+                    # partially offsetting short delta — net is smaller magnitude).
+                    # For strangles: short put delta + short call delta (both contribute).
+                    # Side convention: sell_to_open legs contribute negative delta (short),
+                    # buy_to_open legs contribute positive delta (long hedge).
+                    net_delta = 0.0
+                    net_vega  = 0.0
+                    net_theta = 0.0
+                    spot      = float(trade.get("underlying_price") or 0)
+                    any_valid = False
+
+                    for leg in legs:
+                        sym  = leg.get("symbol", "")
+                        snap = snapshots.get(sym, {})
+                        d    = snap.get("delta")
+                        v    = snap.get("vega")
+                        t    = snap.get("theta")
+                        if d is None:
+                            continue
+                        any_valid = True
+                        # sell_to_open = short position: flip sign convention so
+                        # portfolio delta reflects net directional exposure
+                        if "sell" in leg.get("side", ""):
+                            net_delta += d          # short put: d is already negative
+                            net_vega  += (v or 0)   # short options: vega is negative
+                            net_theta += (t or 0)   # short options: theta is positive
+                        else:
+                            net_delta += d          # long put hedge: d is negative but smaller
+                            net_vega  += (v or 0)
+                            net_theta += (t or 0)
+                        # Use spot from any snapshot that has it
+                        if spot == 0 and snap.get("underlying_price"):
+                            spot = float(snap["underlying_price"])
+
+                    if any_valid:
                         self.db.update_greeks(
                             order_id=trade["id"],
-                            delta=delta,
-                            vega=vega,
-                            theta=theta,
-                            underlying_price=float(spot or 0),
+                            delta=round(net_delta, 6),
+                            vega=round(net_vega, 6),
+                            theta=round(net_theta, 6),
+                            underlying_price=spot,
                         )
                         logger.debug(
-                            "[Monitor] Greeks backfilled for %s: delta=%.4f vega=%.4f theta=%.4f",
-                            trade["id"], delta, vega, theta,
+                            "[Monitor] Greeks backfilled for %s: "
+                            "net_delta=%.4f net_vega=%.4f net_theta=%.4f (%d legs)",
+                            trade["id"], net_delta, net_vega, net_theta, len(legs),
                         )
             except Exception as exc:
                 logger.debug("[Monitor] Greek backfill failed (non-fatal): %s", exc)
