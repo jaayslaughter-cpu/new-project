@@ -68,6 +68,7 @@ from .spread_math import (
     stop_price as calc_stop_price,
     validate_spread_inputs,
 )
+from .greeks import probability_of_profit, pop_spread, get_risk_free_rate
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +353,7 @@ class ShortPutSpreadConfig:
     min_credit: float = 0.50            # minimum credit to bother with the trade
     stop_multiplier: float = 2.0        # stop at 2x credit received
     profit_target_pct: float = 0.50     # close at 50% of max profit
+    min_pop: float = 0.65               # minimum probability of profit (65%)
 
 
 class ShortPutSpread(BaseStrategy):
@@ -468,6 +470,33 @@ class ShortPutSpread(BaseStrategy):
         max_loss_per_contract = spread_math["max_loss"]       # already per-contract dollars
         hard_stop             = calc_stop_price(net_credit, cfg.stop_multiplier)
         profit_target         = calc_profit_target(net_credit, cfg.profit_target_pct)
+
+        # Probability of profit + probability of touch validation
+        # Runs only if IV is available from the enriched row
+        short_iv = short_put.iv or 0.0
+        if short_iv > 0 and short_put.dte and short_put.underlying_price:
+            rate = get_risk_free_rate()
+            prob = pop_spread(
+                spread_type="bull_put",
+                short_strike=short_put.strike,
+                long_strike=long_put.strike,
+                net_credit=net_credit,
+                spot=short_put.underlying_price,
+                sigma=short_iv,
+                rate=rate,
+                days_to_expiry=short_put.dte,
+            )
+            if prob["pop"] < cfg.min_pop:
+                raise LiquidityFilterError(
+                    short_put.underlying,
+                    f"[{self.name}] PoP {prob['pop']:.0%} < min {cfg.min_pop:.0%} "
+                    f"(break-even=${prob['break_even']:.2f}, PoT={prob['pot_short']:.0%})"
+                )
+            if prob["pot_warning"]:
+                logger.warning(
+                    "[%s] PoT %.0%% > 35%% for %s $%.0f — elevated touch risk",
+                    self.name, prob["pot_short"], short_put.underlying, short_put.strike
+                )
 
         short_leg = OrderLeg(
             symbol=short_put.symbol,
