@@ -211,6 +211,63 @@ class BaseStrategy(ABC):
         )
         return closest
 
+    def _check_earnings(
+        self,
+        underlying: str,
+        expiry,
+        dte: Optional[int] = None,
+    ) -> None:
+        """
+        Hard earnings filter — raises LiquidityFilterError if earnings fall
+        within the DTE window. Call from every strategy before entering.
+        ETFs are automatically allowed through (no per-company earnings).
+        """
+        from datetime import date as _date
+        blocked, reason = _earnings_filter.check(
+            underlying,
+            entry_date=_date.today(),
+            expiry_date=expiry,
+            dte=dte,
+        )
+        if blocked:
+            raise LiquidityFilterError(
+                underlying,
+                f"[{self.name}] EARNINGS BLOCK: {reason}"
+            )
+
+    def _check_volume_profile(
+        self,
+        underlying: str,
+        short_strike: float,
+        spot: float,
+        spread_type: str = "bull_put",
+        min_hvn_distance_pct: float = 1.5,
+    ) -> None:
+        """
+        Volume profile strike safety check — raises LiquidityFilterError if the
+        short strike sits in a contested HVN zone. Non-fatal if data unavailable.
+        """
+        try:
+            profile = volume_profile_cache.get(underlying)
+            safe, reason = check_strike_safety(
+                ticker=underlying,
+                short_strike=short_strike,
+                spot=spot,
+                spread_type=spread_type,
+                min_hvn_distance_pct=min_hvn_distance_pct,
+                profile=profile,
+            )
+            if not safe:
+                raise LiquidityFilterError(
+                    underlying,
+                    f"[{self.name}] Volume profile REJECT: {reason}"
+                )
+            logger.debug("[%s] VP check OK: %s — %s", self.name, underlying, reason)
+        except LiquidityFilterError:
+            raise
+        except Exception as exc:
+            logger.debug("[%s] VP check skipped (data unavailable): %s", self.name, exc)
+
 
 # ---------------------------------------------------------------------------
 # Strategy 1: Cash-Secured Put (CSP)
@@ -302,6 +359,14 @@ class CashSecuredPut(BaseStrategy):
         # (ensures consistent math across all strategies)
         hard_stop = calc_stop_price(credit, cfg.stop_multiplier)
         profit_target = calc_profit_target(credit, cfg.profit_target_pct)
+
+        # Earnings hard filter — same risk as ShortPutSpread for single-stock gap
+        self._check_earnings(short_put.underlying, short_put.expiry, short_put.dte)
+
+        # Volume profile strike safety check
+        self._check_volume_profile(
+            short_put.underlying, short_put.strike, short_put.underlying_price
+        )
 
         leg = OrderLeg(
             symbol=short_put.symbol,
@@ -741,6 +806,20 @@ class ShortStrangle(BaseStrategy):
         practical_max_loss = strangle_math["practical_max_loss"]
         hard_stop          = calc_stop_price(total_credit, cfg.stop_multiplier)
         profit_target      = calc_profit_target(total_credit, cfg.profit_target_pct)
+
+        # Earnings hard filter — strangles are especially dangerous around earnings
+        # (realized move typically exceeds implied move, blowing through both strikes)
+        self._check_earnings(short_call.underlying, short_call.expiry, short_call.dte)
+
+        # Volume profile check on both short strikes
+        self._check_volume_profile(
+            short_call.underlying, short_call.strike, short_call.underlying_price,
+            spread_type="bear_call",
+        )
+        self._check_volume_profile(
+            short_put.underlying, short_put.strike, short_put.underlying_price,
+            spread_type="bull_put",
+        )
 
         call_leg = OrderLeg(
             symbol=short_call.symbol,
