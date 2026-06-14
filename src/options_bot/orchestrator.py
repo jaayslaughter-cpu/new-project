@@ -61,7 +61,7 @@ from .regime import RegimeDetector
 from .sentiment import SentimentAnalyzer, SentimentConfig
 from .metrics import summary as perf_summary
 from .adaptive import AdaptiveTuner
-from .strategy import BaseStrategy, StrategySignal, get_strategy
+from .strategy import BaseStrategy, StrategySignal, get_strategy, STRATEGY_REGISTRY
 from .strategy_0dte import ZeroDTEConfig, ZeroDTEStrategy, ZeroDTEMonitor
 from .scanner import TickerGate
 from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profile
@@ -259,6 +259,15 @@ class TradeDatabase:
             conn.commit()
         logger.debug("[TradeDB] Schema ready (%s)", "PostgreSQL" if self._use_pg else "SQLite")
 
+    # Map BaseStrategy class names → OrchestratorConfig strategy keys
+    # so AdaptiveTuner WHERE strategy=? queries match DB records.
+    _STRATEGY_NAME_MAP = {
+        "CashSecuredPut":  "csp",
+        "ShortPutSpread":  "short_put_spread",
+        "ShortStrangle":   "short_strangle",
+        "ZeroDTEStrategy": "zero_dte",
+    }
+
     def save_fill(self, filled: FilledOrder) -> None:
         order = filled.approved_order
         legs_json = json.dumps([
@@ -291,7 +300,7 @@ class TradeDatabase:
                 """, (
                     filled.order_id,
                     date.today().isoformat(),
-                    order.strategy_name,
+                    self._STRATEGY_NAME_MAP.get(order.strategy_name, order.strategy_name),
                     order.underlying,
                     legs_json,
                     filled.fill_price,
@@ -682,11 +691,13 @@ class PositionMonitor:
         db: TradeDatabase,
         state: SessionState,
         discord_webhook_url: str = "",
+        risk_manager=None,
     ):
         self.broker = broker
         self.db = db
         self.state = state
         self.discord_webhook_url = discord_webhook_url
+        self.rm = risk_manager  # used to update daily P&L for loss-halt enforcement
 
     def run(self) -> None:
         """Check all open trades against their stop levels."""
@@ -755,12 +766,15 @@ class PositionMonitor:
         for trade in open_trades:
             self._check_trade(trade, quotes)
 
-        # Update unrealized P&L in session state
+        # Update unrealized P&L in session state and RiskManager
         positions = self.broker.get_positions()
         total_unreal = sum(p.get("unrealized_pl", 0) for p in positions)
         with self.state._lock:
             self.state.open_positions = positions
             self.state.daily_unrealized_pnl = total_unreal
+        # Keep RiskManager in sync so daily loss halt sees current unrealized exposure
+        if self.rm is not None:
+            self.rm.record_pnl(unrealized=total_unreal)
 
     def _check_trade(self, trade: dict, quotes: dict) -> None:
         """
@@ -844,6 +858,9 @@ class PositionMonitor:
             )
             with self.state._lock:
                 self.state.daily_realized_pnl += realized_pnl
+            # Update RiskManager daily P&L so the daily loss halt can fire
+            if self.rm is not None:
+                self.rm.record_pnl(realized=realized_pnl)
 
             if reason == "stop_hit":
                 msg = _format_stop_message(trade, current_price)
@@ -977,12 +994,25 @@ class Orchestrator:
             db=self.db,
             state=self.state,
             discord_webhook_url=config.discord_webhook_url,
+            risk_manager=self.rm,
         )
 
-        # Apply risk profile — overrides relevant config fields
+        # Apply risk profile — overrides relevant config fields.
+        # strategy_config must be instantiated first so apply_profile() can
+        # set stop_multiplier, min_pop, min_credit, min_dte, max_dte on it.
+        # Without this, profile only sets orchestrator-level fields (scan times etc).
+        if config.strategy_config is None and config.strategy_name in STRATEGY_REGISTRY:
+            config.strategy_config = STRATEGY_REGISTRY[config.strategy_name]().config
+            logger.debug(
+                "[Orchestrator] Instantiated default strategy_config for '%s' "
+                "so risk profile can apply strategy-level parameters.",
+                config.strategy_name,
+            )
+
         if config.risk_level and config.risk_level != "custom":
             apply_profile(config, config.risk_level)
-            logger.info("[Orchestrator] Risk profile: %s", config.risk_level.upper())
+            logger.info("[Orchestrator] Risk profile: %s applied (strategy params included)",
+                        config.risk_level.upper())
 
         # Ticker pre-screening gate
         self.ticker_gate = TickerGate(
