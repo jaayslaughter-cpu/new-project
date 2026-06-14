@@ -234,11 +234,13 @@ class TradeDatabase:
                     broker           TEXT,
                     created_at       TEXT,
                     updated_at       TEXT,
-                    delta            REAL,
-                    vega             REAL,
-                    theta            REAL,
-                    underlying_price REAL,
-                    expiry           TEXT
+                    delta                REAL,
+                    vega                 REAL,
+                    theta                REAL,
+                    underlying_price     REAL,
+                    expiry               TEXT,
+                    profit_target_price  REAL,
+                    profit_target_pct    REAL
                 )
             """)
             conn.commit()
@@ -247,11 +249,13 @@ class TradeDatabase:
             # so we check the column list first and add only if missing.
             existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
             for col, typedef in [
-                ("delta",            "REAL"),
-                ("vega",             "REAL"),
-                ("theta",            "REAL"),
-                ("underlying_price", "REAL"),
-                ("expiry",           "TEXT"),
+                ("delta",               "REAL"),
+                ("vega",                "REAL"),
+                ("theta",               "REAL"),
+                ("underlying_price",    "REAL"),
+                ("expiry",              "TEXT"),
+                ("profit_target_price", "REAL"),
+                ("profit_target_pct",   "REAL"),
             ]:
                 if col not in existing:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
@@ -276,6 +280,9 @@ class TradeDatabase:
              "expiry": l.expiry.isoformat() if l.expiry else None}
             for l in order.legs
         ])
+        # Store profit_target_price and profit_target_pct for the monitor
+        _profit_target_price = order.profit_target_price
+        _profit_target_pct   = order.profit_target_pct
         now = datetime.now(tz=timezone.utc).isoformat()
         try:
             with self._get_conn() as conn:
@@ -295,8 +302,9 @@ class TradeDatabase:
                     (id, trade_date, strategy, underlying, legs_json,
                      fill_price, slippage, max_loss, hard_stop, contracts,
                      net_credit, status, broker, created_at, updated_at,
-                     delta, vega, theta, underlying_price, expiry)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     delta, vega, theta, underlying_price, expiry,
+                     profit_target_price, profit_target_pct)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     filled.order_id,
                     date.today().isoformat(),
@@ -313,6 +321,7 @@ class TradeDatabase:
                     filled.broker,
                     now, now,
                     _delta, _vega, _theta, _spot, _expiry_str,
+                    _profit_target_price, _profit_target_pct,
                 ))
                 conn.commit()
             logger.info("[TradeDB] Saved: %s %s", filled.order_id, order.strategy_name)
@@ -363,7 +372,8 @@ class TradeDatabase:
                 cur = conn.execute(
                     "SELECT id, strategy, underlying, hard_stop, contracts, "
                     "net_credit, fill_price, legs_json, "
-                    "delta, vega, theta, underlying_price, expiry "
+                    "delta, vega, theta, underlying_price, expiry, "
+                    "profit_target_price, profit_target_pct "
                     "FROM trades WHERE status='open'"
                 )
                 cols = [d[0] for d in cur.description]
@@ -642,6 +652,9 @@ class TradingPipeline:
 
         # --- Step 8: Record ---
         self.rm.record_trade_opened()
+        # Deduct committed max-loss from working equity so the next ticker
+        # in the same scan is sized against the remaining risk budget.
+        self.rm.update_equity_after_fill(order.max_loss_dollars)
         self.db.save_fill(filled)
         with self.state._lock:
             self.state.filled_today.append(filled)
@@ -785,8 +798,15 @@ class PositionMonitor:
             legs = json.loads(trade.get("legs_json", "[]"))
             hard_stop = float(trade.get("hard_stop", 0))
             entry_credit = abs(float(trade.get("net_credit") or 0))
-            # Profit target = 50% of credit received (close when we keep half)
-            profit_target = entry_credit * 0.50 if entry_credit > 0 else None
+            # Use stored profit_target_price if available (set from strategy config).
+            # Falls back to 50% of credit if not stored (legacy trades).
+            stored_target = trade.get("profit_target_price")
+            if stored_target is not None:
+                profit_target = float(stored_target)
+            elif entry_credit > 0:
+                profit_target = entry_credit * 0.50
+            else:
+                profit_target = None
 
             if hard_stop <= 0:
                 return
@@ -1275,12 +1295,33 @@ class Orchestrator:
                     # If none of the trade's symbols are in Alpaca positions,
                     # the position was closed externally (expired, manual close, etc.)
                     if not trade_symbols.intersection(alpaca_symbols):
-                        logger.warning(
-                            "[Reconcile] Trade %s (%s) not found in Alpaca positions — "
-                            "marking as closed",
-                            trade["id"], trade.get("strategy", "")
-                        )
-                        self.db.update_status(trade["id"], status="closed_external")
+                        # Grace window: don't mark fresh fills as closed_external.
+                        # Alpaca positions can take 5-30s to appear after submission.
+                        # Only mark closed_external if the fill is older than 15 minutes.
+                        from datetime import datetime, timezone as _tz
+                        created_at = trade.get("created_at", "")
+                        is_fresh = False
+                        if created_at:
+                            try:
+                                age_seconds = (
+                                    datetime.now(tz=_tz.utc) -
+                                    datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                                ).total_seconds()
+                                is_fresh = age_seconds < 900  # 15-minute grace window
+                            except Exception:
+                                pass
+                        if is_fresh:
+                            logger.debug(
+                                "[Reconcile] Trade %s is fresh (<15 min) — skipping closure",
+                                trade["id"]
+                            )
+                        else:
+                            logger.warning(
+                                "[Reconcile] Trade %s (%s) not found in Alpaca positions — "
+                                "marking as closed",
+                                trade["id"], trade.get("strategy", "")
+                            )
+                            self.db.update_status(trade["id"], status="closed_external")
                 except Exception as exc:
                     logger.warning("[Reconcile] Error checking trade %s: %s", trade.get("id"), exc)
 
@@ -1367,6 +1408,11 @@ class Orchestrator:
                 len(option_positions), self.config.max_positions_total
             )
             return []
+
+        # Correlation warning — logs Herfindahl N_eff and flags concentrated groups
+        if option_positions:
+            open_underlyings = [p.get("symbol", "")[:6] for p in option_positions]
+            self.rm.warn_correlation(open_underlyings)
 
         # Sentiment gate — fetch FinBERT signals for all tickers once per scan
         # Blocks entry on tickers with SELL sentiment (bearish news)
@@ -1474,6 +1520,16 @@ class Orchestrator:
     def run_eod(self) -> None:
         """EOD cleanup: close expiring positions, cancel unfilled orders, send daily summary."""
         logger.info("[Orchestrator] EOD cleanup")
+
+        # Fetch fresh equity from broker so stress test NLV reflects intraday P&L.
+        # self.state.equity is stale (set at 9:45 AM scan time).
+        try:
+            equity = self.broker.get_equity()
+            self.state.equity = equity
+            self.rm.update_equity(equity)
+        except Exception as exc:
+            equity = self.state.equity if self.state.equity > 0 else self.rm.equity
+            logger.warning("[EOD] Equity fetch failed, using cached $%.2f: %s", equity, exc)
 
         # Close any positions expiring today before market close
         open_trades = self.db.get_open_trades()
