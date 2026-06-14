@@ -65,6 +65,8 @@ from .strategy import BaseStrategy, StrategySignal, get_strategy
 from .strategy_0dte import ZeroDTEConfig, ZeroDTEStrategy, ZeroDTEMonitor
 from .scanner import TickerGate
 from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profile
+from .universe import UniverseBuilder
+from .volume_profile import volume_profile_cache
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,11 @@ class OrchestratorConfig:
     scanner_enabled: bool = True             # enable bullish + Piotroski pre-filter
     scanner_bullish_threshold: float = 3.0  # min composite score
     scanner_piotroski_threshold: int = 6    # min F-score (0–9)
+
+    # --- Dynamic universe ---
+    universe_enabled: bool = False           # auto-rebuild ticker list weekly
+    universe_top_n: int = 30                 # number of tickers in auto universe
+    universe_exclude_high_si: bool = True    # exclude high short-interest names
 
     # --- Broker ---
     paper: bool = True                # always default to paper
@@ -888,6 +895,9 @@ class Orchestrator:
             require_piotroski=config.scanner_enabled,
         ) if config.scanner_enabled else None
 
+        # Dynamic universe builder (weekly refresh)
+        self.universe_builder = UniverseBuilder() if config.universe_enabled else None
+
         # Regime detector — replaces simple VIX threshold
         self.regime_detector = RegimeDetector(
             cache_ttl_seconds=config.regime_cache_ttl
@@ -1000,6 +1010,21 @@ class Orchestrator:
             name="EOD cleanup",
         )
 
+        # Weekly universe rebuild: Sunday 6 PM PT (before Monday open)
+        if self.universe_builder is not None:
+            scheduler.add_job(
+                self._rebuild_universe,
+                CronTrigger(
+                    day_of_week="sun",
+                    hour=18,
+                    minute=0,
+                    timezone="America/Los_Angeles",
+                ),
+                id="universe_rebuild",
+                name="Weekly universe rebuild",
+            )
+            logger.info("[Orchestrator] Universe rebuild scheduled: Sundays 6 PM PT")
+
         logger.info(
             "[Orchestrator] Scheduler starting: scan=%02d:%02d PT, "
             "monitor=every %dmin, eod=%02d:%02d PT",
@@ -1019,6 +1044,33 @@ class Orchestrator:
         except (KeyboardInterrupt, SystemExit):
             logger.info("[Orchestrator] Shutting down")
             scheduler.shutdown(wait=False)
+
+    def _rebuild_universe(self) -> None:
+        """
+        Called every Sunday at 6 PM PT by APScheduler.
+        Rebuilds the ticker universe from iShares ETF constituents and
+        sends a Discord summary of the new watchlist.
+        """
+        if self.universe_builder is None:
+            return
+        try:
+            tickers = self.universe_builder.build_for_strategy(
+                strategy=self.config.strategy_name,
+                top_n=self.config.universe_top_n,
+                exclude_high_si=self.config.universe_exclude_high_si,
+            )
+            if tickers:
+                # Store rebuilt universe for this week's scans
+                self.config.tickers = tickers
+                logger.info("[Universe] Rebuilt: %d tickers", len(tickers))
+                send_discord(
+                    self.config.discord_webhook_url,
+                    f"🌎 **Weekly universe rebuilt** — {len(tickers)} tickers\n"
+                    f"Top 10: {', '.join(tickers[:10])}"
+                    + (f" +{len(tickers)-10} more" if len(tickers) > 10 else "")
+                )
+        except Exception as exc:
+            logger.error("[Universe] Weekly rebuild failed: %s", exc)
 
     def _run_zero_dte_scan(self) -> None:
         """
@@ -1212,8 +1264,22 @@ class Orchestrator:
                 logger.warning("[Orchestrator] Sentiment fetch failed (non-fatal): %s", exc)
 
         filled_orders = []
-        # Apply ticker pre-screening gate (bullish technicals + Piotroski)
+        # Dynamic universe rebuild (if enabled, replaces config.tickers for this scan)
         scan_tickers = self.config.tickers
+        if self.universe_builder is not None:
+            try:
+                rebuilt = self.universe_builder.build_for_strategy(
+                    strategy=self.config.strategy_name,
+                    top_n=self.config.universe_top_n,
+                    exclude_high_si=self.config.universe_exclude_high_si,
+                )
+                if rebuilt:
+                    scan_tickers = rebuilt
+                    logger.info("[Orchestrator] Dynamic universe: %d tickers", len(rebuilt))
+            except Exception as exc:
+                logger.warning("[Orchestrator] Universe rebuild failed (using config list): %s", exc)
+
+        # Apply ticker pre-screening gate (bullish technicals + Piotroski)
         if self.ticker_gate is not None:
             scan_tickers = self.ticker_gate.filter(scan_tickers)
             if not scan_tickers:
