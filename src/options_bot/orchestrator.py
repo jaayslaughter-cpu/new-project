@@ -814,6 +814,9 @@ def _get_iv_rank(ticker: str, lookback_days: int = 252) -> Optional[float]:
     except Exception as exc:
         logger.warning("[IVRank] Fetch failed for %s: %s", ticker, exc)
     return None
+
+
+def _reverse_side(side: str) -> Optional[str]:
     mapping = {
         "sell_to_open":  "buy_to_close",
         "buy_to_open":   "sell_to_close",
@@ -1497,4 +1500,3 @@ class Orchestrator:
                 "Will retry at scan time.", exc, fallback
             )
             return fallback
-        return 50_000.0
