@@ -69,6 +69,9 @@ from .spread_math import (
     validate_spread_inputs,
 )
 from .greeks import probability_of_profit, pop_spread, get_risk_free_rate
+from .earnings_calendar import EarningsFilter
+
+_earnings_filter = EarningsFilter(days_before=5, days_after=2)
 
 logger = logging.getLogger(__name__)
 
@@ -471,8 +474,30 @@ class ShortPutSpread(BaseStrategy):
         hard_stop             = calc_stop_price(net_credit, cfg.stop_multiplier)
         profit_target         = calc_profit_target(net_credit, cfg.profit_target_pct)
 
+        # AUDIT FIX: Earnings hard filter
+        # FINDING: "No earnings filter. The model has no earnings date lookup.
+        # Missing structural risk check."
+        # FIX: Reject if earnings fall within the DTE window.
+        # This is a HARD BLOCK — the trade is rejected, not warned.
+        from datetime import date as _date
+        today = _date.today()
+        expiry = short_put.expiry_date if hasattr(short_put, 'expiry_date') and short_put.expiry_date else None
+        earnings_blocked, earnings_reason = _earnings_filter.check(
+            short_put.underlying,
+            entry_date=today,
+            expiry_date=expiry,
+            dte=short_put.dte,
+        )
+        if earnings_blocked:
+            raise LiquidityFilterError(
+                short_put.underlying,
+                f"[{self.name}] EARNINGS BLOCK: {earnings_reason}"
+            )
+
         # Probability of profit + probability of touch validation
-        # Runs only if IV is available from the enriched row
+        # AUDIT FIX: PoT is now a HARD REJECT (was: warning only)
+        # FINDING: "PoT warning not enforced. A short put with PoP=66%
+        # and PoT=45% is structurally risky. Missing enforcement rule."
         short_iv = short_put.iv or 0.0
         if short_iv > 0 and short_put.dte and short_put.underlying_price:
             rate = get_risk_free_rate()
@@ -490,12 +515,16 @@ class ShortPutSpread(BaseStrategy):
                 raise LiquidityFilterError(
                     short_put.underlying,
                     f"[{self.name}] PoP {prob['pop']:.0%} < min {cfg.min_pop:.0%} "
-                    f"(break-even=${prob['break_even']:.2f}, PoT={prob['pot_short']:.0%})"
+                    f"(break-even=${prob['break_even']:.2f}, PoT={prob['pot_short']:.0%}). "
+                    f"LABEL: BS lognormal PoP — may underestimate fat-tail risk by 5-10pp."
                 )
+            # AUDIT FIX: PoT now REJECTS (was warning only)
             if prob["pot_warning"]:
-                logger.warning(
-                    "[%s] PoT %.0%% > 35%% for %s $%.0f — elevated touch risk",
-                    self.name, prob["pot_short"], short_put.underlying, short_put.strike
+                raise LiquidityFilterError(
+                    short_put.underlying,
+                    f"[{self.name}] PoT {prob['pot_short']:.0%} > 35% threshold — "
+                    f"strike ${short_put.strike:.0f} has elevated touch risk. REJECT. "
+                    f"(PoP={prob['pop']:.0%}, break-even=${prob['break_even']:.2f})"
                 )
 
         short_leg = OrderLeg(
