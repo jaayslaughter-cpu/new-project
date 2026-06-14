@@ -43,6 +43,7 @@ from typing import Optional
 
 from .hurst import hurst_exponent, classify_regime as hurst_classify, hurst_options_weight
 from .circuit_breaker import data_circuit_breaker as _cb
+from .breadth import get_market_breadth, composite_to_regime_score
 
 logger = logging.getLogger(__name__)
 
@@ -139,24 +140,38 @@ class RegimeDetector:
 
     def _gather_indicators(self) -> dict:
         """Fetch all indicators. Each sub-fetch fails independently."""
-        vix_level          = self._fetch_vix_level()
-        vix_trend          = self._compute_vix_trend()
-        sector_dispersion  = self._compute_market_breadth()   # renamed: was 'breadth'
-        trend_strength     = self._compute_trend_strength()   # real DX calculation
-        yield_slope        = self._fetch_yield_curve_slope()
-        hurst_val          = self._compute_hurst()
-        vix_pct            = self._compute_vix_percentile(vix_level)
+        vix_level      = self._fetch_vix_level()
+        vix_trend      = self._compute_vix_trend()
+        trend_strength = self._compute_trend_strength()
+        yield_slope    = self._fetch_yield_curve_slope()
+        hurst_val      = self._compute_hurst()
+        vix_pct        = self._compute_vix_percentile(vix_level)
+
+        # AUDIT FIX: Real market breadth from 100-name constituent universe
+        # Replaces: (1) SPY up/down day proxy (mislabeled as breadth)
+        #           (2) Sector ETF dispersion (proxy for rotation, not breadth)
+        # Source: breadth.py using Alpaca bars + yfinance fallback
+        # Data quality flag is propagated to scoring to down-weight thin data.
+        breadth_data   = get_market_breadth()
+        breadth_scores = composite_to_regime_score(breadth_data)
 
         return {
-            "vix_level":          round(vix_level,         2) if vix_level         is not None else 20.0,
+            "vix_level":          round(vix_level,      2) if vix_level      is not None else 20.0,
             "vix_trend":          vix_trend or "stable",
-            # AUDIT FIX: renamed from 'breadth' — this is sector dispersion, not A/D breadth
-            "sector_dispersion":  round(sector_dispersion,  4) if sector_dispersion is not None else 0.5,
-            "trend_strength":     round(trend_strength,     4) if trend_strength    is not None else 0.5,
-            "yield_curve_slope":  round(yield_slope,        4) if yield_slope       is not None else 0.5,
-            "hurst":              round(hurst_val,          4) if hurst_val         is not None else 0.5,
+            "trend_strength":     round(trend_strength,  4) if trend_strength is not None else 0.5,
+            "yield_curve_slope":  round(yield_slope,     4) if yield_slope    is not None else 0.5,
+            "hurst":              round(hurst_val,       4) if hurst_val      is not None else 0.5,
             "hurst_regime":       hurst_classify(hurst_val) if hurst_val is not None else "random_walk",
-            "vix_percentile":     round(vix_pct,            1) if vix_pct           is not None else 50.0,
+            "vix_percentile":     round(vix_pct,         1) if vix_pct        is not None else 50.0,
+            # Real breadth metrics (direct arithmetic, labeled)
+            "breadth_composite":  round(breadth_data.get("composite_breadth", 0.5), 4),
+            "pct_above_20ma":     round(breadth_data.get("pct_above_20ma",    0.5), 4),
+            "pct_above_50ma":     round(breadth_data.get("pct_above_50ma",    0.5), 4),
+            "adv_dec_ratio":      round(breadth_data.get("adv_dec_ratio",     1.0), 3),
+            "up_vol_ratio":       round(breadth_data.get("up_vol_ratio",      0.5), 4),
+            "breadth_quality":    breadth_data.get("data_quality", "unknown"),
+            # Pre-scored contributions (PROVISIONAL_WEIGHTS — see breadth.py)
+            "_breadth_scores":    breadth_scores,
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
@@ -205,6 +220,8 @@ class RegimeDetector:
         return "stable"
 
     def _compute_market_breadth(self) -> Optional[float]:
+        """DEPRECATED: Replaced by breadth.get_market_breadth(). Kept for reference only."""
+        return None  # breadth.py now handles all breadth computation
         """
         AUDIT FIX: Previous implementation used SPY up/down days as a breadth
         proxy. AUDIT FINDING: "SPY is a single instrument, not an advance/decline
@@ -422,10 +439,8 @@ class RegimeDetector:
         vix            = indicators.get("vix_level", 20.0)
         vix_trend      = indicators.get("vix_trend", "stable")
         trend_strength = indicators.get("trend_strength", 0.5)
-        # AUDIT FIX: renamed from 'breadth' — sector_dispersion measures cross-sector
-        # return variance. High = sectors diverging (trending/rotating).
-        # Low = sectors moving together (mean-reverting/macro-driven).
-        sector_disp    = indicators.get("sector_dispersion", 0.5)
+        # Real breadth scores from constituent universe (PROVISIONAL_WEIGHTS — see breadth.py)
+        breadth_scores = indicators.get("_breadth_scores", {})
         slope          = indicators.get("yield_curve_slope", 0.5)
         hurst          = indicators.get("hurst", 0.5)
         vix_pct        = indicators.get("vix_percentile", 50.0)
@@ -468,18 +483,14 @@ class RegimeDetector:
 
         if vix_trend == "stable":   scores["mean_reverting"] += 0.15
 
-        # Sector dispersion — AUDIT FIX (was: SPY up/down day ratio mislabeled as breadth)
-        # High dispersion (> 0.7) = sectors rotating/diverging = trending regime
-        # Low dispersion (< 0.3)  = sectors moving together = macro-driven or mean-reverting
-        # Mid dispersion (0.3–0.7) = neutral — no contribution
-        if sector_disp > 0.7:
-            scores["trending"]        += 0.12
-        elif sector_disp > 0.5:
-            scores["trending"]        += 0.06
-        elif sector_disp < 0.3:
-            scores["mean_reverting"]  += 0.10
-        elif sector_disp < 0.4:
-            scores["mean_reverting"]  += 0.05
+        # Real market breadth — FINAL AUDIT FIX
+        # Replaces: (1) SPY up/down proxy (2) sector ETF dispersion proxy
+        # Source: breadth.py — 100-name constituent universe, Alpaca + yfinance bars
+        # Scores are from composite_to_regime_score() — PROVISIONAL_WEIGHTS labeled
+        # Quality-weighted: thin data (< 40 tickers) receives 30% of stated weight
+        for regime_key, contrib in breadth_scores.items():
+            if regime_key in scores:
+                scores[regime_key] += contrib
 
         # Yield curve: inversion → higher volatility signal
         if slope < 0:         scores["high_volatility"] += 0.15
