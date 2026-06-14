@@ -62,6 +62,7 @@ from .sentiment import SentimentAnalyzer, SentimentConfig
 from .metrics import summary as perf_summary
 from .adaptive import AdaptiveTuner
 from .strategy import BaseStrategy, StrategySignal, get_strategy
+from .strategy_0dte import ZeroDTEConfig, ZeroDTEStrategy, ZeroDTEMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,10 @@ class OrchestratorConfig:
     adaptive_enabled: bool = True     # enable self-tuning of strategy parameters
     adaptive_eval_window: int = 20    # number of recent closed trades to analyze
     adaptive_tune_interval: int = 10  # min closed trades between tune cycles
+
+    # --- 0DTE module ---
+    zero_dte_enabled: bool = False           # enable intraday 0DTE GEX scalper
+    zero_dte_config: ZeroDTEConfig = field(default_factory=ZeroDTEConfig)
 
     # --- Broker ---
     paper: bool = True                # always default to paper
@@ -878,6 +883,19 @@ class Orchestrator:
             tune_interval=config.adaptive_tune_interval,
         ) if config.adaptive_enabled else None
 
+        # 0DTE GEX scalper — intraday module, runs on separate 2-min schedule
+        if config.zero_dte_enabled:
+            _0dte_cfg = config.zero_dte_config
+            _0dte_cfg.discord_webhook_url = config.discord_webhook_url
+            _0dte_cfg.paper = config.paper
+            self.zero_dte = ZeroDTEStrategy(_0dte_cfg, self.broker, self.db)
+            self.zero_dte_monitor = ZeroDTEMonitor(_0dte_cfg, self.broker, self.db)
+            logger.info("[Orchestrator] 0DTE GEX scalper enabled (underlying=%s)",
+                        _0dte_cfg.underlying)
+        else:
+            self.zero_dte = None
+            self.zero_dte_monitor = None
+
         logger.info(
             "[Orchestrator] Ready: tickers=%s strategy=%s paper=%s",
             config.tickers, config.strategy_name, config.paper
@@ -920,6 +938,29 @@ class Orchestrator:
             name="Position monitor",
         )
 
+        # 0DTE scan job: every 2 minutes, 9:32–14:00 ET (Mon–Fri)
+        if self.zero_dte is not None:
+            scheduler.add_job(
+                self._run_zero_dte_scan,
+                CronTrigger(
+                    day_of_week="mon-fri",
+                    hour="9-13",
+                    minute="*/2",
+                    timezone="America/New_York",
+                ),
+                id="zero_dte_scan",
+                name="0DTE GEX scalper scan",
+                misfire_grace_time=30,
+            )
+            # 0DTE monitor job: every 15 seconds during market hours
+            scheduler.add_job(
+                self._run_zero_dte_monitor,
+                IntervalTrigger(seconds=self.config.zero_dte_config.monitor_poll_seconds),
+                id="zero_dte_monitor",
+                name="0DTE position monitor",
+            )
+            logger.info("[Orchestrator] 0DTE jobs scheduled: scan every 2min 9:32-14:00 ET, monitor every 15s")
+
         # EOD job: cancel unfilled orders, send daily summary
         scheduler.add_job(
             self.run_eod,
@@ -951,6 +992,60 @@ class Orchestrator:
         except (KeyboardInterrupt, SystemExit):
             logger.info("[Orchestrator] Shutting down")
             scheduler.shutdown(wait=False)
+
+    def _run_zero_dte_scan(self) -> None:
+        """
+        Called every 2 minutes by APScheduler (9:32–14:00 ET, Mon–Fri).
+        Evaluates all 0DTE entry conditions and submits an order if approved.
+        """
+        if self.zero_dte is None:
+            return
+
+        # Respect max daily position cap
+        if self.zero_dte_monitor and \
+           self.zero_dte_monitor.open_count >= self.config.zero_dte_config.max_daily_positions:
+            logger.debug("[0DTE scan] Max positions (%d) open — skip",
+                         self.config.zero_dte_config.max_daily_positions)
+            return
+
+        try:
+            order = self.zero_dte.evaluate()
+            if order is None:
+                return
+
+            fill = self.broker.submit(order)
+            if fill and self.zero_dte_monitor:
+                self.zero_dte_monitor.register(order, fill)
+
+                # Persist to DB
+                if self.db:
+                    self.db.record_trade(order, fill)
+
+                send_discord(
+                    self.config.discord_webhook_url,
+                    f"🎯 **0DTE ENTRY — {order.strategy.upper()}**\n"
+                    f"Credit: ${order.net_credit:.3f} x {order.position_size_contracts} contracts\n"
+                    f"TP: ${order.profit_target:.3f} | SL: ${order.hard_stop:.3f}\n"
+                    f"Pin: {order.metadata.get('gex_pin')} | "
+                    f"Regime: {order.metadata.get('gex_regime')} | "
+                    f"VIX: {order.metadata.get('vix')} | "
+                    f"Session: {order.metadata.get('session')}"
+                )
+
+        except Exception as exc:
+            logger.error("[0DTE scan] Unhandled error: %s", exc, exc_info=True)
+
+    def _run_zero_dte_monitor(self) -> None:
+        """
+        Called every 15 seconds by APScheduler.
+        Checks all open 0DTE positions for exit conditions.
+        """
+        if self.zero_dte_monitor is None:
+            return
+        try:
+            self.zero_dte_monitor.run_once()
+        except Exception as exc:
+            logger.error("[0DTE monitor] Unhandled error: %s", exc, exc_info=True)
 
     def _reconcile_positions(self) -> None:
         """
