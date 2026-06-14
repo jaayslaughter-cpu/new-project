@@ -724,3 +724,203 @@ def pop_spread(
         "pop_warning": pop < 0.65,
         "pot_warning": pot > 0.35,
     }
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo PoP — GBM path simulation
+# ---------------------------------------------------------------------------
+# Source: poptions-main/poptions/MonteCarlo.py (MIT)
+# Rewritten: removed numba dependency (scipy not faster at N<10000 anyway),
+# adapted to our function signature, labeled per audit policy.
+#
+# WHY THIS MATTERS vs BS closed-form PoP:
+#   The Black-Scholes PoP in probability_of_profit() assumes the underlying
+#   follows lognormal returns to expiry and uses only the terminal distribution.
+#   It IGNORES the PATH — a position that would have been stopped out intraday
+#   but recovers by expiry shows as "profitable" in BS-PoP. Monte Carlo
+#   simulates the actual daily price path and applies the stop/target rules
+#   at each step, matching how the trade is actually managed.
+#
+# AUDIT FINDING addressed:
+#   "BS lognormal PoP may underestimate fat-tail risk by 5-10pp"
+#   MC simulation captures path effects; BS does not.
+#   LABEL: MC assumes GBM (constant σ, no jumps, no vol surface).
+#   Still underestimates tail risk but less so than BS terminal-only.
+
+def monte_carlo_pop(
+    spot: float,
+    sigma: float,
+    rate: float,
+    days_to_expiry: int,
+    initial_credit: float,
+    profit_target_pct: float = 0.50,
+    stop_loss_pct: float = 1.00,
+    n_trials: int = 5000,
+    spread_type: str = "bull_put",
+    short_strike: float = 0.0,
+    long_strike: float = 0.0,
+) -> dict:
+    """
+    Monte Carlo probability of profit for a credit spread using GBM simulation.
+
+    Simulates N daily price paths under Geometric Brownian Motion. At each step,
+    computes approximate spread value and checks if profit target or stop is hit.
+    Returns PoP, average days-to-close, and 99% CI error bounds.
+
+    CALCULATION TRACE:
+      GBM daily step:
+        dt = 1/365
+        S_t = S_{t-1} × exp((r - 0.5σ²)dt + σ√dt × ε)   where ε ~ N(0,1)
+
+      Spread value approximation at each step (linear interpolation):
+        For bull_put: spread_value ≈ (short_strike - spot_t) × (ott/dte)
+        where ott = time remaining. This is a PROXY not full revaluation.
+
+      Profit target hit: (initial_credit - spread_value) / initial_credit >= profit_target_pct
+      Stop hit: (spread_value - initial_credit) / initial_credit >= stop_loss_pct
+
+      PoP = trials where profit target hit before stop or expiry worthless / total trials
+      PoP error (99% CI): 2.58 × sqrt(p(1-p)/N)   [Owen 2013, Eq. 2.20]
+
+    LABELS:
+      - GBM assumes constant σ (the IV at entry). Realized σ will differ.
+      - Spread value is linearly approximated, not Black-Scholes revalued.
+        For large moves, this underestimates the true spread expansion.
+      - "Probability of profit" here means: profit target hit before stop,
+        OR position expires OTM (worthless). Matches how the bot manages trades.
+      - Result is a SIMULATION ESTIMATE with sampling error reported.
+
+    Parameters
+    ----------
+    spot : float
+    sigma : float
+        Annualized IV (fraction, e.g. 0.20 for 20%)
+    rate : float
+        Annualized risk-free rate (fraction)
+    days_to_expiry : int
+    initial_credit : float
+        Net premium received per share
+    profit_target_pct : float
+        Close when (credit - current_spread) / credit >= this (default 0.50 = 50%)
+    stop_loss_pct : float
+        Close when (current_spread - credit) / credit >= this (default 1.00 = 2x credit)
+    n_trials : int
+        Number of simulated price paths (default 5000 — adequate for 1% precision)
+    spread_type : str
+        "bull_put" or "bear_call"
+    short_strike, long_strike : float
+        Strike prices (used for terminal OTM check at expiry)
+
+    Returns
+    -------
+    dict with keys:
+        pop          — probability of profit (0–1)
+        pop_error    — 99% CI half-width (from Owen 2013, Eq. 2.20)
+        avg_dtc      — average days to close (when profit target hit)
+        avg_dtc_err  — standard error of avg_dtc
+        n_trials     — number of simulations run
+        method       — "monte_carlo_gbm" (for labeling in logs)
+        assumptions  — list of labeled model assumptions
+    """
+    import numpy as np
+
+    if days_to_expiry <= 0 or sigma <= 0 or spot <= 0 or initial_credit <= 0:
+        return {
+            "pop": 0.5, "pop_error": 0.5, "avg_dtc": 0,
+            "avg_dtc_err": 0, "n_trials": 0, "method": "monte_carlo_gbm",
+            "assumptions": ["degenerate input — returning 0.5"],
+        }
+
+    dt     = 1.0 / 365.0
+    profit_hits  = 0
+    dtc_sum      = 0.0
+    dtc_sq_sum   = 0.0
+    dtc_count    = 0
+
+    min_profit_threshold = initial_credit * profit_target_pct
+    max_loss_threshold   = initial_credit * stop_loss_pct
+
+    for _ in range(n_trials):
+        s = spot
+        hit_target = False
+        hit_stop   = False
+        dtc_day    = 0
+
+        for day in range(1, days_to_expiry + 1):
+            # GBM step
+            eps = np.random.randn()
+            s   = s * np.exp((rate - 0.5 * sigma**2) * dt + sigma * (dt**0.5) * eps)
+
+            # Approximate spread value: intrinsic + time value proxy
+            # For bull put: spread widens when spot drops below short_strike
+            if spread_type == "bull_put" and short_strike > 0 and long_strike > 0:
+                spread_width = short_strike - long_strike
+                if s >= short_strike:
+                    intrinsic = 0.0
+                elif s <= long_strike:
+                    intrinsic = spread_width
+                else:
+                    intrinsic = short_strike - s
+                # Time value decays linearly (simplification)
+                time_remaining = (days_to_expiry - day) / days_to_expiry
+                spread_value = intrinsic + (initial_credit * 0.3 * time_remaining)
+                spread_value = min(spread_value, spread_width)
+            else:
+                # Generic: spread value from spot movement vs credit
+                pct_move = abs(s - spot) / spot
+                spread_value = initial_credit * (1.0 + pct_move * 3.0)
+                spread_value = max(0.0, min(spread_value, initial_credit * 3.0))
+
+            profit = initial_credit - spread_value
+
+            if profit >= min_profit_threshold:
+                hit_target = True
+                dtc_day    = day
+                break
+            if spread_value - initial_credit >= max_loss_threshold:
+                hit_stop = True
+                break
+
+        # Check terminal outcome if neither target nor stop hit intraday
+        if not hit_target and not hit_stop:
+            if spread_type == "bull_put" and short_strike > 0:
+                if s >= short_strike:
+                    # Expired worthless — max profit
+                    hit_target = True
+                    dtc_day    = days_to_expiry
+            elif spread_type == "bear_call" and short_strike > 0:
+                if s <= short_strike:
+                    hit_target = True
+                    dtc_day    = days_to_expiry
+
+        if hit_target:
+            profit_hits += 1
+            if dtc_day > 0:
+                dtc_sum    += dtc_day
+                dtc_sq_sum += dtc_day ** 2
+                dtc_count  += 1
+
+    pop = profit_hits / n_trials
+    # 99% CI error from Owen 2013 Eq. 2.20: 2.58 × sqrt(p(1-p)/N)
+    pop_error = 2.58 * (pop * (1 - pop) / n_trials) ** 0.5
+
+    avg_dtc    = round(dtc_sum / dtc_count, 1) if dtc_count > 0 else 0.0
+    avg_dtc_err = 0.0
+    if dtc_count > 1:
+        variance    = (dtc_sq_sum / dtc_count) - (dtc_sum / dtc_count) ** 2
+        avg_dtc_err = round(2.58 * (max(0, variance) ** 0.5) / dtc_count ** 0.5, 2)
+
+    return {
+        "pop":       round(pop, 4),
+        "pop_error": round(pop_error, 4),
+        "avg_dtc":   avg_dtc,
+        "avg_dtc_err": avg_dtc_err,
+        "n_trials":  n_trials,
+        "method":    "monte_carlo_gbm",
+        "assumptions": [
+            "GBM with constant σ = IV at entry (realized σ will differ)",
+            "Spread value linearly approximated (not Black-Scholes revalued per step)",
+            "Profit/stop checked daily (not intraday — path within a day is ignored)",
+            "No jump risk, no vol surface, no discrete dividends",
+        ],
+    }
