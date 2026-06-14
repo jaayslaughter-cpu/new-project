@@ -63,6 +63,8 @@ from .metrics import summary as perf_summary
 from .adaptive import AdaptiveTuner
 from .strategy import BaseStrategy, StrategySignal, get_strategy
 from .strategy_0dte import ZeroDTEConfig, ZeroDTEStrategy, ZeroDTEMonitor
+from .scanner import TickerGate
+from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profile
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,14 @@ class OrchestratorConfig:
     # --- 0DTE module ---
     zero_dte_enabled: bool = False           # enable intraday 0DTE GEX scalper
     zero_dte_config: ZeroDTEConfig = field(default_factory=ZeroDTEConfig)
+
+    # --- Risk profile ---
+    risk_level: str = "medium"               # "low", "medium", or "high"
+
+    # --- Ticker pre-screening ---
+    scanner_enabled: bool = True             # enable bullish + Piotroski pre-filter
+    scanner_bullish_threshold: float = 3.0  # min composite score
+    scanner_piotroski_threshold: int = 6    # min F-score (0–9)
 
     # --- Broker ---
     paper: bool = True                # always default to paper
@@ -865,6 +875,19 @@ class Orchestrator:
             discord_webhook_url=config.discord_webhook_url,
         )
 
+        # Apply risk profile — overrides relevant config fields
+        if config.risk_level and config.risk_level != "custom":
+            apply_profile(config, config.risk_level)
+            logger.info("[Orchestrator] Risk profile: %s", config.risk_level.upper())
+
+        # Ticker pre-screening gate
+        self.ticker_gate = TickerGate(
+            bullish_threshold=config.scanner_bullish_threshold,
+            piotroski_threshold=config.scanner_piotroski_threshold,
+            require_bullish=config.scanner_enabled,
+            require_piotroski=config.scanner_enabled,
+        ) if config.scanner_enabled else None
+
         # Regime detector — replaces simple VIX threshold
         self.regime_detector = RegimeDetector(
             cache_ttl_seconds=config.regime_cache_ttl
@@ -938,28 +961,32 @@ class Orchestrator:
             name="Position monitor",
         )
 
-        # 0DTE scan job: every 2 minutes, 9:32–14:00 ET (Mon–Fri)
+        # 0DTE scan job: every 2 minutes, 6:32–11:00 AM PT (= 9:32–14:00 ET, Mon–Fri)
         if self.zero_dte is not None:
             scheduler.add_job(
                 self._run_zero_dte_scan,
                 CronTrigger(
                     day_of_week="mon-fri",
-                    hour="9-13",
+                    hour="6-10",          # 6:32 AM – 10:59 AM PT
                     minute="*/2",
-                    timezone="America/New_York",
+                    timezone="America/Los_Angeles",
                 ),
                 id="zero_dte_scan",
-                name="0DTE GEX scalper scan",
+                name="0DTE GEX scalper scan (PT)",
                 misfire_grace_time=30,
             )
-            # 0DTE monitor job: every 15 seconds during market hours
+            # 0DTE monitor: every 15 seconds during market hours
             scheduler.add_job(
                 self._run_zero_dte_monitor,
                 IntervalTrigger(seconds=self.config.zero_dte_config.monitor_poll_seconds),
                 id="zero_dte_monitor",
                 name="0DTE position monitor",
             )
-            logger.info("[Orchestrator] 0DTE jobs scheduled: scan every 2min 9:32-14:00 ET, monitor every 15s")
+            logger.info(
+                "[Orchestrator] 0DTE jobs scheduled: "
+                "scan every 2min 6:32-11:00 AM PT (9:32-2:00 PM ET), "
+                "monitor every 15s"
+            )
 
         # EOD job: cancel unfilled orders, send daily summary
         scheduler.add_job(
@@ -1185,7 +1212,15 @@ class Orchestrator:
                 logger.warning("[Orchestrator] Sentiment fetch failed (non-fatal): %s", exc)
 
         filled_orders = []
-        for ticker in self.config.tickers:
+        # Apply ticker pre-screening gate (bullish technicals + Piotroski)
+        scan_tickers = self.config.tickers
+        if self.ticker_gate is not None:
+            scan_tickers = self.ticker_gate.filter(scan_tickers)
+            if not scan_tickers:
+                logger.info("[Orchestrator] All tickers blocked by pre-screening gate — no scan")
+                return []
+
+        for ticker in scan_tickers:
             # Don't exceed max positions mid-scan
             positions = self.broker.get_positions()
             current_count = len([p for p in positions if p.get("asset_class") == "us_option"])
