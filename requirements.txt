@@ -22,10 +22,13 @@ python-dotenv>=1.0.0
 # Macro data
 fredapi>=0.5.0
 
-# Sentiment analysis (FinBERT — optional, graceful degradation if absent)
-# Install on Railway by adding to Dockerfile or requirements:
-torch>=2.0.0
-transformers>=4.40.0
+# Sentiment analysis (FinBERT — OPTIONAL, NOT installed on Railway by default)
+# PyTorch is ~2GB to install and requires ~500MB RAM at runtime.
+# Railway containers (512MB-1GB) will OOM if torch is included here.
+# The sentiment module degrades gracefully to HOLD signals without torch.
+# To enable FinBERT locally: pip install torch transformers
+# torch>=2.0.0
+# transformers>=4.40.0
 
 # Dev / testing
 pytest>=8.0.0
