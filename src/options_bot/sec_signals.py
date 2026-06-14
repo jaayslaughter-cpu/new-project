@@ -120,56 +120,70 @@ def get_cik(ticker: str) -> Optional[str]:
     return _cik_cache.get(ticker)
 
 
-def get_insider_transactions(
-    ticker: str,
-    days_back: int = 90,
-) -> list[dict]:
-    """
-    Return recent insider buy/sell transactions for a ticker (Form 4).
+def _parse_form4_xml(cik: str, accession: str) -> list[dict]:
+    """Parse Form 4 XML. Returns list of {transaction_type, shares, price, value}."""
+    try:
+        acc_nodash = accession.replace('-', '')
+        acc_dashes = f'{acc_nodash[:10]}-{acc_nodash[10:12]}-{acc_nodash[12:]}'
+        cik_plain  = str(int(cik))
+        index_url  = (f'https://www.sec.gov/Archives/edgar/data/{cik_plain}/'
+                      f'{acc_nodash}/{acc_dashes}-index.json')
+        index = _sec_get(index_url)
+        if not index: return []
+        xml_name = next((d['document'] for d in index.get('documents',[]) if d.get('document','').endswith('.xml')), None)
+        if not xml_name: return []
+        import urllib.request as _ur, xml.etree.ElementTree as ET
+        xml_url = f'https://www.sec.gov/Archives/edgar/data/{cik_plain}/{acc_nodash}/{xml_name}'
+        r = _ur.Request(xml_url, headers={'User-Agent': 'OptionsBot research@localhost'})
+        with _ur.urlopen(r, timeout=10) as resp:
+            root = ET.fromstring(resp.read().decode('utf-8', errors='ignore'))
+        txns = []
+        for txn in root.iter('nonDerivativeTransaction'):
+            code_el   = txn.find('.//transactionCode')
+            shares_el = txn.find('.//transactionShares/value')
+            price_el  = txn.find('.//transactionPricePerShare/value')
+            code   = code_el.text.strip()  if code_el   is not None else ''
+            shares = float(shares_el.text) if shares_el is not None and shares_el.text else 0.0
+            price  = float(price_el.text)  if price_el  is not None and price_el.text  else 0.0
+            txns.append({'transaction_type': code, 'shares': shares, 'price': price, 'value': shares*price})
+        return txns
+    except Exception as exc:
+        logger.debug('[SEC] Form 4 XML parse failed (%s/%s): %s', cik, accession, exc)
+        return []
 
-    Each transaction dict contains:
-        date, form, insider_name, transaction_type (P=purchase, S=sale),
-        shares, price, value, accession
 
-    Only returns confirmed direct-purchase transactions (type "P").
-    Sale transactions are excluded (not meaningful for our use case).
-    """
+def get_insider_transactions(ticker: str, days_back: int = 90) -> list[dict]:
+    """Return confirmed insider PURCHASE transactions (type=P only, XML-parsed)."""
     cik = get_cik(ticker)
-    if not cik:
-        logger.debug("[SEC] No CIK found for %s", ticker)
-        return []
-
-    url = f"{_EDGAR_BASE}/submissions/CIK{cik}.json"
-    data = _sec_get(url)
-    if not data:
-        return []
-
-    recent  = data.get("filings", {}).get("recent", {})
-    forms   = recent.get("form",         [])
-    dates   = recent.get("filingDate",   [])
-    accessions = recent.get("accessionNumber", [])
-
-    cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    transactions = []
-
+    if not cik: return []
+    data = _sec_get(f'{_EDGAR_BASE}/submissions/CIK{cik}.json')
+    if not data: return []
+    recent     = data.get('filings', {}).get('recent', {})
+    forms      = recent.get('form', [])
+    dates      = recent.get('filingDate', [])
+    accessions = recent.get('accessionNumber', [])
+    cutoff     = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+    purchases  = []
+    xml_fetches = 0
     for i, form in enumerate(forms):
-        if form != "4":
-            continue
-        filing_date = dates[i] if i < len(dates) else ""
-        if filing_date < cutoff:
-            continue
+        if form != '4': continue
+        filing_date = dates[i] if i < len(dates) else ''
+        if filing_date < cutoff: continue
+        if xml_fetches >= 5: break
+        accession = accessions[i] if i < len(accessions) else ''
+        if not accession: continue
+        xml_fetches += 1
+        for txn in _parse_form4_xml(cik, accession):
+            if txn.get('transaction_type') == 'P':
+                purchases.append({'date': filing_date, 'form': form,
+                                  'accession': accession, 'transaction_type': 'P',
+                                  'shares': txn['shares'], 'price': txn['price'], 'value': txn['value']})
+    logger.debug('[SEC] %s: %d purchase(s) in last %dd', ticker, len(purchases), days_back)
+    return purchases
 
-        accession = accessions[i] if i < len(accessions) else ""
-        transactions.append({
-            "date":             filing_date,
-            "form":             form,
-            "accession":        accession,
-            "transaction_type": "unknown",  # parsed from XML in full implementation
-        })
-        if len(transactions) >= 20:
-            break
 
-    return transactions
+
+
 
 
 def get_activist_filings(
@@ -222,108 +236,39 @@ def get_activist_filings(
 
 
 def score_sec_signals(ticker: str, use_cache: bool = True) -> dict:
-    """
-    DISABLED: Form 4 transaction type parsing is not implemented.
-    All Form 4 filings (buys AND sells) were counted as purchases,
-    producing an inverted signal — heavy insider selling scored STRONG_BUY.
-    Returns NEUTRAL/0 until Form 4 XML parsing is complete.
-
-    To re-enable: parse accession XML and filter only transaction_type == 'P'.
-    """
-    return {
-        "ticker":              ticker.upper(),
-        "score":               0,
-        "insider_buy_count":   0,
-        "has_activist":        False,
-        "is_activist":         False,
-        "last_insider_buy_date": "",
-        "signal":              "NEUTRAL",
-        "detail":              "SEC signals disabled — Form 4 buy/sell unparsed, inverted signal risk. Returns NEUTRAL.",
-    }
+    """Re-enabled — Form 4 XML parsing now filters type=P purchases only."""
+    return _score_sec_signals_impl(ticker, use_cache=use_cache)
 
 
-def _score_sec_signals_raw(ticker: str, use_cache: bool = True) -> dict:
-    """Original implementation (broken — counts sell filings as buys). DO NOT CALL.
-    Generate a composite SEC signal score for a ticker.
-
-    Scoring (0–100):
-      Cluster insider buys (3+ Form 4 purchases in 90 days): +40
-      Recent insider buys (1–2 purchases): +20
-      Activist 13D filing in past year: +30
-      Activist 13G filing in past year: +15
-      No insider transactions: 0
-
-    Returns dict:
-        score                  — 0 to 100
-        insider_buy_count      — Form 4 purchase filings in last 90d
-        has_activist           — True if 13D/13G in past year
-        is_activist            — True if 13D specifically
-        last_insider_buy_date  — date of most recent purchase
-        signal                 — "STRONG_BUY" | "BUY" | "NEUTRAL"
-        detail                 — plain-language summary
-    """
+def _score_sec_signals_impl(ticker: str, use_cache: bool = True) -> dict:
+    """Core SEC scoring — confirmed open-market purchases only."""
     now = time.monotonic()
     ticker = ticker.upper()
-
     if use_cache:
         ts, cached = _results_cache.get(ticker, (0.0, {}))
         if cached and (now - ts) < _CACHE_TTL:
             return cached
-
-    insider_txns  = get_insider_transactions(ticker, days_back=90)
+    insider_txns     = get_insider_transactions(ticker, days_back=90)
     activist_filings = get_activist_filings(ticker, days_back=365)
-
-    # Count buys (in practice Form 4 doesn't give us P/S without parsing XML;
-    # we count all Form 4 filings as a proxy for insider activity)
-    buy_count = len(insider_txns)
-    act_count = len(activist_filings)
-    has_activist  = act_count > 0
-    is_activist   = any(f.get("is_activist") for f in activist_filings)
-
-    last_buy_date = ""
-    if insider_txns:
-        last_buy_date = max(t["date"] for t in insider_txns if t.get("date"))
-
-    # Score
+    buy_count    = len(insider_txns)
+    has_activist = len(activist_filings) > 0
+    is_activist  = any(f.get('is_activist') for f in activist_filings)
+    last_buy_date = max((t['date'] for t in insider_txns if t.get('date')), default='')
     score = 0
-    if buy_count >= 3:
-        score += 40
-    elif buy_count >= 1:
-        score += 20
-
-    if is_activist:
-        score += 30
-    elif has_activist:
-        score += 15
-
-    if score >= 60:
-        signal = "STRONG_BUY"
-    elif score >= 20:
-        signal = "BUY"
-    else:
-        signal = "NEUTRAL"
-
-    detail_parts = []
-    if buy_count > 0:
-        detail_parts.append(f"{buy_count} insider Form 4 filing(s) in last 90d")
-    if is_activist:
-        detail_parts.append("activist 13D stake detected")
-    elif has_activist:
-        detail_parts.append("passive 13G stake detected")
-    if not detail_parts:
-        detail_parts.append("no significant SEC activity")
-
-    result = {
-        "ticker":              ticker,
-        "score":               min(score, 100),
-        "insider_buy_count":   buy_count,
-        "has_activist":        has_activist,
-        "is_activist":         is_activist,
-        "last_insider_buy_date": last_buy_date,
-        "signal":              signal,
-        "detail":              "; ".join(detail_parts),
-    }
-
+    if buy_count >= 3: score += 40
+    elif buy_count >= 1: score += 20
+    if is_activist: score += 30
+    elif has_activist: score += 15
+    signal = 'STRONG_BUY' if score >= 60 else ('BUY' if score >= 20 else 'NEUTRAL')
+    parts = []
+    if buy_count > 0: parts.append(f'{buy_count} confirmed insider purchase(s) in last 90d')
+    if is_activist: parts.append('activist 13D stake')
+    elif has_activist: parts.append('passive 13G stake')
+    if not parts: parts.append('no significant SEC activity')
+    result = {'ticker': ticker, 'score': min(score,100), 'insider_buy_count': buy_count,
+              'has_activist': has_activist, 'is_activist': is_activist,
+              'last_insider_buy_date': last_buy_date, 'signal': signal,
+              'detail': '; '.join(parts)}
     _results_cache[ticker] = (now, result)
     return result
 
