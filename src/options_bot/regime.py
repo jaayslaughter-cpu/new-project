@@ -139,23 +139,24 @@ class RegimeDetector:
 
     def _gather_indicators(self) -> dict:
         """Fetch all indicators. Each sub-fetch fails independently."""
-        vix_level      = self._fetch_vix_level()
-        vix_trend      = self._compute_vix_trend()
-        breadth        = self._compute_market_breadth()
-        trend_strength = self._compute_trend_strength()
-        yield_slope    = self._fetch_yield_curve_slope()
-        hurst_val      = self._compute_hurst()
-        vix_pct        = self._compute_vix_percentile(vix_level)
+        vix_level          = self._fetch_vix_level()
+        vix_trend          = self._compute_vix_trend()
+        sector_dispersion  = self._compute_market_breadth()   # renamed: was 'breadth'
+        trend_strength     = self._compute_trend_strength()   # real DX calculation
+        yield_slope        = self._fetch_yield_curve_slope()
+        hurst_val          = self._compute_hurst()
+        vix_pct            = self._compute_vix_percentile(vix_level)
 
         return {
-            "vix_level":         round(vix_level,      2) if vix_level      is not None else 20.0,
-            "vix_trend":         vix_trend or "stable",
-            "breadth":           round(breadth,         4) if breadth        is not None else 1.0,
-            "trend_strength":    round(trend_strength,  4) if trend_strength is not None else 0.5,
-            "yield_curve_slope": round(yield_slope,     4) if yield_slope    is not None else 0.5,
-            "hurst":             round(hurst_val,       4) if hurst_val      is not None else 0.5,
-            "hurst_regime":      hurst_classify(hurst_val) if hurst_val is not None else "random_walk",
-            "vix_percentile":    round(vix_pct,         1) if vix_pct        is not None else 50.0,
+            "vix_level":          round(vix_level,         2) if vix_level         is not None else 20.0,
+            "vix_trend":          vix_trend or "stable",
+            # AUDIT FIX: renamed from 'breadth' — this is sector dispersion, not A/D breadth
+            "sector_dispersion":  round(sector_dispersion,  4) if sector_dispersion is not None else 0.5,
+            "trend_strength":     round(trend_strength,     4) if trend_strength    is not None else 0.5,
+            "yield_curve_slope":  round(yield_slope,        4) if yield_slope       is not None else 0.5,
+            "hurst":              round(hurst_val,          4) if hurst_val         is not None else 0.5,
+            "hurst_regime":       hurst_classify(hurst_val) if hurst_val is not None else "random_walk",
+            "vix_percentile":     round(vix_pct,            1) if vix_pct           is not None else 50.0,
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
@@ -204,26 +205,69 @@ class RegimeDetector:
         return "stable"
 
     def _compute_market_breadth(self) -> Optional[float]:
-        """SPY advance/decline breadth proxy — ratio of up-days to down-days over last 20 sessions."""
-        if not _cb.is_available("yfinance_spy"):
+        """
+        AUDIT FIX: Previous implementation used SPY up/down days as a breadth
+        proxy. AUDIT FINDING: "SPY is a single instrument, not an advance/decline
+        line. It can mislead the regime detector."
+
+        REPLACEMENT: Sector ETF dispersion — measures how spread apart the
+        11 SPDR sector ETFs are in their 20-day returns. High dispersion =
+        rotation/trending market. Low dispersion = mean-reverting/range-bound.
+
+        OUTPUT: Dispersion ratio (0–1):
+          0.0 = all sectors moving together (low dispersion, mean-reverting)
+          1.0 = sectors highly divergent (high dispersion, trending/rotating)
+
+        LABEL: This is a SECTOR DISPERSION measure, not advance/decline breadth.
+        It measures cross-sector return variance, not individual stock advances.
+        It is a proxy for market rotation intensity, which correlates with
+        trending vs mean-reverting regimes. Labeled correctly in indicators dict
+        as 'sector_dispersion' (renamed from 'breadth').
+        """
+        sector_etfs = ["XLF", "XLK", "XLE", "XLV", "XLI", "XLC",
+                       "XLY", "XLP", "XLU", "XLRE", "XLB"]
+        src = "yfinance_sectors"
+        if not _cb.is_available(src):
             return None
         try:
             import yfinance as yf
-            hist = yf.Ticker("SPY").history(period="35d")
-            if hist.empty or len(hist) < 5:
-                _cb.record_failure("yfinance_spy", "insufficient bars")
+            import numpy as np
+
+            data = yf.download(sector_etfs, period="35d", progress=False, auto_adjust=True)
+            closes = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+
+            if closes.empty or len(closes) < 20:
+                _cb.record_failure(src, "insufficient data")
                 return None
-            _cb.record_success("yfinance_spy")
-            closes = hist["Close"].tolist()
-            recent = closes[-21:]
-            up_days   = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
-            down_days = len(recent) - 1 - up_days
-            if down_days == 0:
-                return 2.0
-            return up_days / down_days
+
+            # 20-day returns per sector
+            recent = closes.tail(20)
+            returns_20d = []
+            for etf in sector_etfs:
+                if etf in recent.columns:
+                    col = recent[etf].dropna()
+                    if len(col) >= 2 and float(col.iloc[0]) != 0:
+                        r = float(col.iloc[-1]) / float(col.iloc[0]) - 1.0
+                        returns_20d.append(r)
+
+            if len(returns_20d) < 5:
+                _cb.record_failure(src, "insufficient sectors")
+                return None
+
+            _cb.record_success(src)
+            # Dispersion = std of cross-sector returns, normalized to [0,1]
+            # Typical range: std < 0.02 = low dispersion, > 0.08 = high
+            dispersion = float(np.std(returns_20d))
+            normalized  = min(1.0, dispersion / 0.08)
+            logger.debug(
+                "[RegimeDetector] Sector dispersion: std=%.4f normalized=%.3f "
+                "(%d sectors)", dispersion, normalized, len(returns_20d)
+            )
+            return round(normalized, 4)
+
         except Exception as exc:
-            _cb.record_failure("yfinance_spy", str(exc))
-            logger.warning("[RegimeDetector] Breadth failed: %s", exc)
+            _cb.record_failure(src, str(exc))
+            logger.warning("[RegimeDetector] Sector dispersion failed: %s", exc)
         return None
 
     def _compute_trend_strength(self) -> Optional[float]:
@@ -378,10 +422,18 @@ class RegimeDetector:
         vix            = indicators.get("vix_level", 20.0)
         vix_trend      = indicators.get("vix_trend", "stable")
         trend_strength = indicators.get("trend_strength", 0.5)
-        breadth        = indicators.get("breadth", 1.0)
+        # AUDIT FIX: renamed from 'breadth' — sector_dispersion measures cross-sector
+        # return variance. High = sectors diverging (trending/rotating).
+        # Low = sectors moving together (mean-reverting/macro-driven).
+        sector_disp    = indicators.get("sector_dispersion", 0.5)
         slope          = indicators.get("yield_curve_slope", 0.5)
         hurst          = indicators.get("hurst", 0.5)
         vix_pct        = indicators.get("vix_percentile", 50.0)
+
+        # AUDIT NOTE: Score weights below are PROVISIONAL heuristics.
+        # They have not been calibrated against historical trade outcomes.
+        # Label: treat regime classification as a directional opinion,
+        # not a statistically validated rule. Confidence reflects this.
 
         scores: dict[str, float] = {
             "trending":        0.0,
@@ -416,11 +468,18 @@ class RegimeDetector:
 
         if vix_trend == "stable":   scores["mean_reverting"] += 0.15
 
-        # Breadth contribution
-        if breadth > 1.5 or breadth < 0.5:
-            scores["mean_reverting"] += 0.10
-        else:
-            scores["trending"] += 0.05
+        # Sector dispersion — AUDIT FIX (was: SPY up/down day ratio mislabeled as breadth)
+        # High dispersion (> 0.7) = sectors rotating/diverging = trending regime
+        # Low dispersion (< 0.3)  = sectors moving together = macro-driven or mean-reverting
+        # Mid dispersion (0.3–0.7) = neutral — no contribution
+        if sector_disp > 0.7:
+            scores["trending"]        += 0.12
+        elif sector_disp > 0.5:
+            scores["trending"]        += 0.06
+        elif sector_disp < 0.3:
+            scores["mean_reverting"]  += 0.10
+        elif sector_disp < 0.4:
+            scores["mean_reverting"]  += 0.05
 
         # Yield curve: inversion → higher volatility signal
         if slope < 0:         scores["high_volatility"] += 0.15
