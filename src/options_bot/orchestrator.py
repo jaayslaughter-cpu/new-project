@@ -327,6 +327,27 @@ class TradeDatabase:
         except Exception as exc:
             logger.error("[TradeDB] Update failed for %s: %s", order_id, exc)
 
+    def update_greeks(
+        self,
+        order_id: str,
+        delta: float,
+        vega: float,
+        theta: float,
+        underlying_price: float,
+    ) -> None:
+        """Backfill Greeks on an open trade after the first monitor cycle snapshot."""
+        now = __import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc).isoformat()
+        try:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE trades SET delta=?, vega=?, theta=?, underlying_price=?, "
+                    "updated_at=? WHERE id=? AND status='open'",
+                    (delta, vega, theta, underlying_price, now, order_id)
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.error("[TradeDB] update_greeks failed for %s: %s", order_id, exc)
+
     def get_open_trades(self) -> list[dict]:
         try:
             with self._get_conn() as conn:
@@ -693,6 +714,42 @@ class PositionMonitor:
         except PipelineConnectionError as exc:
             logger.warning("[Monitor] Quote fetch failed: %s", exc)
             return
+
+        # Backfill Greeks for any open trades that still have NULL delta/vega/theta.
+        # Uses get_option_snapshots() which returns Greeks from Alpaca's Black-Scholes model.
+        # This runs on every monitor cycle but the DB write is skipped if Greeks already set.
+        trades_needing_greeks = [
+            t for t in open_trades
+            if t.get("delta") is None or t.get("vega") is None
+        ]
+        if trades_needing_greeks:
+            try:
+                snapshots = self.broker.get_option_snapshots(all_symbols)
+                for trade in trades_needing_greeks:
+                    legs = json.loads(trade.get("legs_json", "[]"))
+                    short_legs = [l for l in legs if "sell" in l.get("side", "")]
+                    if not short_legs:
+                        continue
+                    sym  = short_legs[0]["symbol"]
+                    snap = snapshots.get(sym, {})
+                    delta = snap.get("delta")
+                    vega  = snap.get("vega")
+                    theta = snap.get("theta")
+                    spot  = snap.get("underlying_price") or trade.get("underlying_price")
+                    if delta is not None and vega is not None and theta is not None:
+                        self.db.update_greeks(
+                            order_id=trade["id"],
+                            delta=delta,
+                            vega=vega,
+                            theta=theta,
+                            underlying_price=float(spot or 0),
+                        )
+                        logger.debug(
+                            "[Monitor] Greeks backfilled for %s: delta=%.4f vega=%.4f theta=%.4f",
+                            trade["id"], delta, vega, theta,
+                        )
+            except Exception as exc:
+                logger.debug("[Monitor] Greek backfill failed (non-fatal): %s", exc)
 
         # Check each trade
         for trade in open_trades:
