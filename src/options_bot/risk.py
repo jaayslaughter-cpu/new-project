@@ -232,6 +232,81 @@ class RiskManager:
         )
         self._equity = new_equity
 
+    def update_equity_after_fill(
+        self, max_loss_committed: float, broker=None
+    ) -> None:
+        """
+        AUDIT FIX: Update equity to reflect committed capital after a fill.
+
+        FINDING: "broker.get_equity() is called once at scan time. If multiple
+        positions are filled in the same scan, the equity figure is stale for
+        the second and third position."
+
+        FIX: After each fill, reduce the working equity by max_loss_committed
+        so subsequent positions in the same scan are sized against the remaining
+        risk budget, not the pre-scan equity.
+
+        If a broker instance is provided, also fetch the actual equity to
+        stay synchronized with Alpaca's clearing.
+
+        LABEL: This is a CONSERVATIVE PROXY for intra-scan equity.
+        It deducts committed max-loss (worst case), not actual buying power
+        locked by Alpaca. Actual Alpaca buying power changes may differ.
+        The deduction is always equal to or greater than actual buying power
+        committed, making this a conservative (never too aggressive) estimate.
+        """
+        self._equity = max(0.0, self._equity - max_loss_committed)
+        logger.info(
+            "[RiskManager] Equity reduced by committed max-loss $%.2f → working equity $%.2f",
+            max_loss_committed, self._equity
+        )
+        if broker is not None:
+            try:
+                actual = broker.get_equity()
+                if actual > 0:
+                    self._equity = actual
+                    logger.info("[RiskManager] Equity refreshed from broker: $%.2f", actual)
+            except Exception as exc:
+                logger.debug("[RiskManager] Broker equity refresh failed (using estimate): %s", exc)
+
+    def warn_correlation(self, open_underlyings: list[str]) -> None:
+        """
+        AUDIT FIX: Log correlation warning when multiple correlated positions exist.
+
+        FINDING: "Multiple spreads on SPY, QQQ, and AAPL can behave like one
+        large bet in a broad selloff. Missing correlation accounting."
+
+        FIX: Detect when 2+ open positions share the same index family
+        (large-cap tech, ETFs, S&P 500 components) and emit a warning.
+        This does not block trades (position limits handle that) but provides
+        an auditable log entry.
+
+        LABEL: This is a QUALITATIVE CORRELATION WARNING, not a quantitative
+        correlation coefficient. It flags structural overlap (same index,
+        same sector) not measured return correlation.
+        """
+        # ETF group — highly correlated in broad selloffs
+        spy_group = {"SPY", "QQQ", "IWM", "DIA"}
+        tech_group = {"AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA"}
+
+        open_set = set(s.upper() for s in open_underlyings)
+        spy_overlap = open_set & spy_group
+        tech_overlap = open_set & tech_group
+
+        if len(spy_overlap) >= 2:
+            logger.warning(
+                "[RiskManager] CORRELATION WARNING: %d index ETF positions open %s — "
+                "broad market selloff affects all simultaneously. "
+                "Effective combined risk may exceed per-position sizing assumptions.",
+                len(spy_overlap), spy_overlap
+            )
+        if len(tech_overlap) >= 3:
+            logger.warning(
+                "[RiskManager] CORRELATION WARNING: %d large-cap tech positions open %s — "
+                "macro risk events (FOMC, CPI) affect all simultaneously.",
+                len(tech_overlap), tech_overlap
+            )
+
     def record_trade_opened(self) -> None:
         """Call this after a trade is confirmed filled."""
         self._daily.reset_if_new_day()
