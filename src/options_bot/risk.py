@@ -271,40 +271,78 @@ class RiskManager:
 
     def warn_correlation(self, open_underlyings: list[str]) -> None:
         """
-        AUDIT FIX: Log correlation warning when multiple correlated positions exist.
+        AUDIT FIX: Compute effective bet count (Herfindahl N_eff) and log
+        correlation warning when multiple correlated positions exist.
 
         FINDING: "Multiple spreads on SPY, QQQ, and AAPL can behave like one
         large bet in a broad selloff. Missing correlation accounting."
 
-        FIX: Detect when 2+ open positions share the same index family
-        (large-cap tech, ETFs, S&P 500 components) and emit a warning.
-        This does not block trades (position limits handle that) but provides
-        an auditable log entry.
+        CALCULATION (from diablotrading/inferno_portfolio_correlation.py):
+          Equal-weight assumption (no position-size data here):
+            w_i = 1 / N  for all i
+          Herfindahl N_eff = 1 / Σ(w_i²) = N  (trivially N for equal weights)
 
-        LABEL: This is a QUALITATIVE CORRELATION WARNING, not a quantitative
-        correlation coefficient. It flags structural overlap (same index,
-        same sector) not measured return correlation.
+          For non-equal weights (when max_loss data is available):
+            w_i = max_loss_i / Σ(max_loss_j)
+            N_eff = 1 / Σ(w_i²)
+
+          Dalio Holy Grail (equal-sigma, pairwise rho ρ):
+            σ²_portfolio / σ²_individual = 1/N + (N-1)/N × ρ
+          At ρ = 0.7 (typical SPY-correlated names):
+            N=3: portfolio variance = 3x individual variance × (1/3 + 2/3×0.7) = 3×0.8 = 2.4x
+            Effective diversification is lost.
+
+        LABEL: This is a QUALITATIVE structural overlap warning.
+        Correlation coefficients are not computed from actual return data here —
+        that requires historical return correlation (see stress_testing.py for
+        scenario-based approach). The group membership below is based on
+        structural overlap (same index, same sector), not measured correlation.
         """
-        # ETF group — highly correlated in broad selloffs
-        spy_group = {"SPY", "QQQ", "IWM", "DIA"}
-        tech_group = {"AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA"}
+        import math as _math
 
-        open_set = set(s.upper() for s in open_underlyings)
+        n = len(open_underlyings)
+        if n == 0:
+            return
+
+        # Equal-weight Herfindahl — degenerate but establishes the framework
+        # When all weights are equal: N_eff = N
+        equal_w = 1.0 / n
+        n_eff_equal = round(1.0 / (n * equal_w ** 2), 2)  # = N for equal weights
+
+        # Group overlap detection
+        spy_group  = {"SPY", "QQQ", "IWM", "DIA", "MDY"}
+        tech_group = {"AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AMD"}
+        fin_group  = {"JPM", "BAC", "GS", "MS", "WFC", "C", "V", "MA"}
+
+        open_set    = set(s.upper() for s in open_underlyings)
         spy_overlap = open_set & spy_group
         tech_overlap = open_set & tech_group
+        fin_overlap  = open_set & fin_group
 
-        if len(spy_overlap) >= 2:
+        # Dalio estimate at assumed rho=0.7 for same-group positions
+        # σ²_P / σ²_i = 1/N + (N-1)/N * rho
+        rho = 0.70
+        correlated_n = len(spy_overlap) + len(tech_overlap) + len(fin_overlap)
+        if correlated_n >= 2:
+            variance_ratio = (1 / correlated_n) + ((correlated_n - 1) / correlated_n) * rho
+            # Individual position seems to be 1 risk unit; portfolio has variance_ratio × risk
+            effective_risk_mult = round(_math.sqrt(variance_ratio * correlated_n), 2)
             logger.warning(
-                "[RiskManager] CORRELATION WARNING: %d index ETF positions open %s — "
-                "broad market selloff affects all simultaneously. "
-                "Effective combined risk may exceed per-position sizing assumptions.",
-                len(spy_overlap), spy_overlap
+                "[RiskManager] CORRELATION WARNING: %d positions in correlated groups "
+                "(spy=%d tech=%d fins=%d). "
+                "At assumed rho=%.1f: portfolio vol ~%.1fx single position. "
+                "N_eff (equal-weight)=%.1f. "
+                "LABEL: rho is ASSUMED (0.70 for same-sector), not measured. "
+                "See stress_testing.py for scenario-based correlation impact.",
+                n, len(spy_overlap), len(tech_overlap), len(fin_overlap),
+                rho, effective_risk_mult, n_eff_equal,
             )
-        if len(tech_overlap) >= 3:
-            logger.warning(
-                "[RiskManager] CORRELATION WARNING: %d large-cap tech positions open %s — "
-                "macro risk events (FOMC, CPI) affect all simultaneously.",
-                len(tech_overlap), tech_overlap
+        elif n >= 4:
+            logger.info(
+                "[RiskManager] Correlation check: %d open positions, "
+                "N_eff=%.1f (equal-weight). Groups: spy=%d tech=%d fins=%d. "
+                "No concentrated overlap detected.",
+                n, n_eff_equal, len(spy_overlap), len(tech_overlap), len(fin_overlap),
             )
 
     def record_trade_opened(self) -> None:
