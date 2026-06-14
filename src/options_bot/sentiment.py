@@ -127,6 +127,37 @@ class TickerSignal:
 # Model loading (lazy, cached)
 # ---------------------------------------------------------------------------
 
+_vader_analyzer = None
+_vader_loaded   = False
+
+
+def _try_load_vader() -> bool:
+    """Load VADER — ~1MB, Railway-safe, no model download."""
+    global _vader_analyzer, _vader_loaded
+    if _vader_loaded: return _vader_analyzer is not None
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+        _vader_analyzer = SentimentIntensityAnalyzer()
+        _vader_loaded   = True
+        logger.info('[Sentiment] VADER loaded (Railway mode, ~72%% accuracy)')
+        return True
+    except ImportError:
+        logger.warning('[Sentiment] vaderSentiment not installed. pip install vaderSentiment')
+        _vader_loaded = True; return False
+    except Exception as exc:
+        logger.warning('[Sentiment] VADER load failed: %s', exc)
+        _vader_loaded = True; return False
+
+
+def _score_text_vader(text: str) -> tuple[str, float]:
+    """VADER score: returns (sentiment, confidence)."""
+    if _vader_analyzer is None: return 'neutral', 0.0
+    compound = _vader_analyzer.polarity_scores(text)['compound']
+    if compound >= 0.05:  return 'positive', min(abs(compound), 1.0)
+    if compound <= -0.05: return 'negative', min(abs(compound), 1.0)
+    return 'neutral', min(abs(compound) + 0.1, 0.5)
+
+
 def _try_load_model() -> bool:
     """
     Attempt to load FinBERT. Returns True if successful.
@@ -209,8 +240,20 @@ def score_articles(
 
     cfg = config or SentimentConfig()
 
-    if not _try_load_model():
-        logger.debug("[Sentiment] Skipping scoring — FinBERT unavailable")
+    model_available = _try_load_model()
+    vader_available = _try_load_vader()
+
+    if not model_available and not vader_available:
+        for art in articles:
+            art.sentiment = 'neutral'; art.confidence = 0.0; art.model_used = 'none'
+        return articles
+
+    if not model_available and vader_available:
+        # VADER path — Railway default when torch not installed
+        for art in articles:
+            text = f'{art.title}. {art.summary}'.strip()
+            art.sentiment, art.confidence = _score_text_vader(text)
+            art.model_used = 'vader'
         return articles
 
     import torch
