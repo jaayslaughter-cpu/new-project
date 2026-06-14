@@ -175,25 +175,89 @@ class RegimeDetector:
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
-        """Fetch current VIX from yfinance ^VIX."""
-        if not _cb.is_available("yfinance_vix"):
-            logger.debug("[RegimeDetector] VIX fetch skipped — circuit breaker OPEN")
+        """
+        Fetch current VIX using a 3-source fallback chain:
+          1. CBOE direct CSV (authoritative, no rate limit, no auth required)
+          2. Stooq daily CSV  (free, no auth)
+          3. yfinance ^VIX   (original single source — now last resort)
+
+        Using a fallback chain means a yfinance outage during a real volatility
+        spike — exactly when VIX data is most critical — does not silently default
+        to VIX=20.0 and allow new trades through the regime gate.
+        """
+        # ── Source 1: CBOE direct (authoritative) ────────────────────────────
+        src1 = "cboe_vix"
+        if _cb.is_available(src1):
+            try:
+                import csv as _csv
+                from io import StringIO as _StringIO
+                import urllib.request as _ur
+                url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+                req = _ur.Request(url, headers={"User-Agent": "OptionsBot/1.0"})
+                with _ur.urlopen(req, timeout=8) as r:
+                    text = r.read().decode("utf-8", errors="ignore")
+                rows = list(_csv.DictReader(_StringIO(text)))
+                # Walk backward for most-recent valid close
+                for row in reversed(rows):
+                    c = row.get("CLOSE") or row.get("Close")
+                    if c:
+                        v = float(str(c).strip().replace(",", ""))
+                        if v > 0:
+                            _cb.record_success(src1)
+                            logger.debug("[RegimeDetector] VIX from CBOE CSV: %.2f", v)
+                            return v
+                _cb.record_failure(src1, "no valid close in CSV")
+            except Exception as exc:
+                _cb.record_failure(src1, str(exc))
+                logger.debug("[RegimeDetector] CBOE VIX failed: %s", exc)
+
+        # ── Source 2: Stooq daily CSV ─────────────────────────────────────────
+        src2 = "stooq_vix"
+        if _cb.is_available(src2):
+            try:
+                import csv as _csv
+                from io import StringIO as _StringIO
+                import urllib.request as _ur
+                url = "https://stooq.com/q/d/l/?s=%5Evix&i=d"
+                req = _ur.Request(url, headers={"User-Agent": "OptionsBot/1.0"})
+                with _ur.urlopen(req, timeout=8) as r:
+                    text = r.read().decode("utf-8", errors="ignore")
+                rows = list(_csv.DictReader(_StringIO(text)))
+                if rows:
+                    last = rows[-1]
+                    c = last.get("Close") or last.get("close")
+                    if c:
+                        v = float(str(c).strip())
+                        if v > 0:
+                            _cb.record_success(src2)
+                            logger.debug("[RegimeDetector] VIX from Stooq: %.2f", v)
+                            return v
+                _cb.record_failure(src2, "empty or unparseable")
+            except Exception as exc:
+                _cb.record_failure(src2, str(exc))
+                logger.debug("[RegimeDetector] Stooq VIX failed: %s", exc)
+
+        # ── Source 3: yfinance (original, now last resort) ────────────────────
+        src3 = "yfinance_vix"
+        if not _cb.is_available(src3):
+            logger.warning("[RegimeDetector] All VIX sources unavailable — returning None")
             return None
         try:
             import yfinance as yf
             vix = yf.Ticker("^VIX")
             price = vix.fast_info.get("lastPrice")
             if price and float(price) > 0:
-                _cb.record_success("yfinance_vix")
+                _cb.record_success(src3)
+                logger.debug("[RegimeDetector] VIX from yfinance: %.2f", float(price))
                 return float(price)
             hist = vix.history(period="5d")
             if not hist.empty:
-                _cb.record_success("yfinance_vix")
+                _cb.record_success(src3)
                 return float(hist["Close"].iloc[-1])
-            _cb.record_failure("yfinance_vix", "empty response")
+            _cb.record_failure(src3, "empty response")
         except Exception as exc:
-            _cb.record_failure("yfinance_vix", str(exc))
-            logger.warning("[RegimeDetector] VIX fetch failed: %s", exc)
+            _cb.record_failure(src3, str(exc))
+            logger.warning("[RegimeDetector] All 3 VIX sources failed: %s", exc)
         return None
 
     def _compute_vix_trend(self) -> Optional[str]:
