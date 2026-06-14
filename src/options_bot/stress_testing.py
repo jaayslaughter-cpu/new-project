@@ -495,19 +495,26 @@ def positions_from_broker(broker, db=None) -> list[StressPosition]:
             logger.debug("[StressTest] DB Greek fetch failed: %s", exc)
 
     for pos in raw_positions:
-        ticker = pos.get("symbol", "").split(pos.get("symbol", "")[:3])[0][:6]
-        underlying = pos.get("underlying_symbol") or pos.get("symbol", "UNKNOWN")[:6]
+        # Extract underlying from the OCC symbol (e.g. "AAPL230120C00150000" → "AAPL")
+        # Previous code used str.split() which splits ON the delimiter, not after it,
+        # returning "" for index [0]. Now uses a char-by-char alpha prefix extraction.
+        raw_sym = pos.get("symbol", "") or ""
+        underlying = pos.get("underlying_symbol") or "".join(
+            c for c in raw_sym if c.isalpha()
+        )[:6] or "UNKNOWN"
 
-        db = db_trades.get(underlying, {})
+        # Look up DB record using underlying ticker (renamed from 'db' to avoid
+        # shadowing the TradeDatabase parameter passed into this function)
+        trade_data = db_trades.get(underlying, {})
 
-        max_loss    = float(db.get("max_loss") or pos.get("cost_basis") or 0)
-        net_credit  = float(db.get("net_credit") or 0)
-        strategy    = str(db.get("strategy") or "unknown")
-        contracts   = int(db.get("contracts") or 1)
-        delta       = float(db.get("delta") or 0)
-        vega        = float(db.get("vega") or 0)
-        theta       = float(db.get("theta") or 0)
-        spot        = float(db.get("underlying_price") or 0)
+        max_loss    = float(trade_data.get("max_loss") or pos.get("cost_basis") or 0)
+        net_credit  = float(trade_data.get("net_credit") or 0)
+        strategy    = str(trade_data.get("strategy") or "unknown")
+        contracts   = int(trade_data.get("contracts") or 1)
+        delta       = float(trade_data.get("delta") or 0)
+        vega        = float(trade_data.get("vega") or 0)
+        theta       = float(trade_data.get("theta") or 0)
+        spot        = float(trade_data.get("underlying_price") or 0)
         current_pnl = float(pos.get("unrealized_pl") or 0)
 
         direction = "neutral"
