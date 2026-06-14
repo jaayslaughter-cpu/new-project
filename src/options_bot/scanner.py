@@ -171,58 +171,94 @@ class BullishScanner:
             else:
                 rsi_score = 0.0
 
-            # MACD (12/26/9)
-            def ema(arr: np.ndarray, n: int) -> float:
+            # MACD (12/26/9) — proper EMA computation
+            # EMA series helper: returns full array of EMA values
+            def ema_series(arr: np.ndarray, n: int) -> np.ndarray:
                 k = 2.0 / (n + 1)
-                e = float(arr[0])
-                for v in arr[1:]:
-                    e = float(v) * k + e * (1 - k)
-                return e
+                result = np.empty(len(arr))
+                result[0] = arr[0]
+                for i in range(1, len(arr)):
+                    result[i] = arr[i] * k + result[i - 1] * (1 - k)
+                return result
 
-            ema12 = ema(close[-40:], 12)
-            ema26 = ema(close[-40:], 26)
-            macd_line = ema12 - ema26
+            # Need enough bars: 26 for EMA26 warmup + 9 for signal line + buffer
+            if len(close) < 60:
+                macd_score = 0.0
+            else:
+                ema12_arr  = ema_series(close[-60:], 12)
+                ema26_arr  = ema_series(close[-60:], 26)
+                macd_arr   = ema12_arr - ema26_arr
 
-            # Signal = 9-period EMA of MACD (approximate from last two values)
-            ema12_prev = ema(close[-41:-1], 12)
-            ema26_prev = ema(close[-41:-1], 26)
-            macd_prev  = ema12_prev - ema26_prev
-            signal     = (macd_line * (2/10) + macd_prev * (8/10))
-            histogram  = macd_line - signal
-            hist_prev  = macd_prev - (macd_prev * (2/10) + macd_prev * (8/10))
+                # 9-period EMA of the MACD line = signal line (correct computation)
+                signal_arr = ema_series(macd_arr, 9)
 
-            macd_score = 0.0
-            if macd_line > signal:
-                macd_score += 1.0
-            if histogram > hist_prev:
-                macd_score += 0.5
+                # Use last two bars for current vs previous histogram
+                macd_line  = macd_arr[-1]
+                signal_now = signal_arr[-1]
+                histogram  = macd_line - signal_now
+                hist_prev  = macd_arr[-2] - signal_arr[-2]
 
-            # ADX (14-period, simplified)
+                macd_score = 0.0
+                if macd_line > signal_now:
+                    macd_score += 1.0
+                # Histogram rising: strictly > previous bar (not just > 0)
+                if histogram > hist_prev:
+                    macd_score += 0.5
+
+            # ADX (14-period, Wilder-smoothed — true ADX not raw DX)
+            # Raw DX is 2-3x more volatile than ADX and causes false positives.
+            # True ADX = 14-period Wilder EMA of DX.
             adx_score = 0.0
             adx = None
             try:
                 n = 14
-                if len(high) >= n + 1:
-                    tr  = np.maximum(high[1:] - low[1:],
-                          np.maximum(np.abs(high[1:] - close[:-1]),
-                                     np.abs(low[1:]  - close[:-1])))
-                    dm_plus  = np.where((high[1:] - high[:-1]) > (low[:-1] - low[1:]),
-                                        np.maximum(high[1:] - high[:-1], 0), 0)
-                    dm_minus = np.where((low[:-1] - low[1:]) > (high[1:] - high[:-1]),
-                                        np.maximum(low[:-1] - low[1:], 0), 0)
+                # Need 2*n bars minimum for meaningful ADX warmup
+                if len(high) >= 2 * n + 1:
+                    tr_arr = np.maximum(high[1:] - low[1:],
+                             np.maximum(np.abs(high[1:] - close[:-1]),
+                                        np.abs(low[1:]  - close[:-1])))
+                    dm_plus_arr  = np.where(
+                        (high[1:] - high[:-1]) > (low[:-1] - low[1:]),
+                        np.maximum(high[1:] - high[:-1], 0.0), 0.0)
+                    dm_minus_arr = np.where(
+                        (low[:-1] - low[1:]) > (high[1:] - high[:-1]),
+                        np.maximum(low[:-1] - low[1:], 0.0), 0.0)
 
-                    atr14 = float(np.mean(tr[-n:]))
-                    dmp14 = float(np.mean(dm_plus[-n:]))
-                    dmm14 = float(np.mean(dm_minus[-n:]))
+                    # Wilder smoothing: seed with sum of first n bars,
+                    # then apply: smoothed = prev * (n-1)/n + current
+                    def wilder(arr, n):
+                        s = float(np.sum(arr[:n]))
+                        result = [s]
+                        for v in arr[n:]:
+                            s = s * (n - 1) / n + float(v)
+                            result.append(s)
+                        return result
 
-                    di_plus  = 100 * dmp14 / atr14 if atr14 > 0 else 0
-                    di_minus = 100 * dmm14 / atr14 if atr14 > 0 else 0
-                    di_sum   = di_plus + di_minus
-                    dx       = 100 * abs(di_plus - di_minus) / di_sum if di_sum > 0 else 0
-                    adx      = dx  # simplified (true ADX is smoothed DX)
+                    atr_w  = wilder(tr_arr,       n)
+                    dmp_w  = wilder(dm_plus_arr,  n)
+                    dmm_w  = wilder(dm_minus_arr, n)
 
-                    if adx > 25 and di_plus > di_minus:
-                        adx_score = 1.5
+                    # Build DX series then Wilder-smooth into ADX
+                    dx_series = []
+                    di_plus_last = di_minus_last = 0.0
+                    for i in range(len(atr_w)):
+                        atr_i = atr_w[i]
+                        if atr_i == 0:
+                            dx_series.append(0.0)
+                            continue
+                        dip = 100 * dmp_w[i] / atr_i
+                        dim = 100 * dmm_w[i] / atr_i
+                        di_plus_last  = dip
+                        di_minus_last = dim
+                        di_sum = dip + dim
+                        dx_series.append(100 * abs(dip - dim) / di_sum if di_sum > 0 else 0.0)
+
+                    if len(dx_series) >= n:
+                        adx_smooth = wilder(np.array(dx_series), n)
+                        adx = float(adx_smooth[-1]) / n  # normalise back from Wilder sum
+
+                        if adx > 25 and di_plus_last > di_minus_last:
+                            adx_score = 1.5
             except Exception:
                 pass
 
