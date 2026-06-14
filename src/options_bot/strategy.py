@@ -481,7 +481,7 @@ class ShortPutSpread(BaseStrategy):
         # This is a HARD BLOCK — the trade is rejected, not warned.
         from datetime import date as _date
         today = _date.today()
-        expiry = short_put.expiry_date if hasattr(short_put, 'expiry_date') and short_put.expiry_date else None
+        expiry = short_put.expiry if hasattr(short_put, 'expiry') and short_put.expiry else None
         earnings_blocked, earnings_reason = _earnings_filter.check(
             short_put.underlying,
             entry_date=today,
