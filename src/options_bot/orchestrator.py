@@ -217,25 +217,45 @@ class TradeDatabase:
         with self._get_conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
-                    id           TEXT PRIMARY KEY,
-                    trade_date   TEXT NOT NULL,
-                    strategy     TEXT,
-                    underlying   TEXT,
-                    legs_json    TEXT,
-                    fill_price   REAL,
-                    slippage     REAL,
-                    max_loss     REAL,
-                    hard_stop    REAL,
-                    contracts    INTEGER,
-                    net_credit   REAL,
-                    status       TEXT DEFAULT 'open',
-                    close_price  REAL,
-                    realized_pnl REAL,
-                    broker       TEXT,
-                    created_at   TEXT,
-                    updated_at   TEXT
+                    id               TEXT PRIMARY KEY,
+                    trade_date       TEXT NOT NULL,
+                    strategy         TEXT,
+                    underlying       TEXT,
+                    legs_json        TEXT,
+                    fill_price       REAL,
+                    slippage         REAL,
+                    max_loss         REAL,
+                    hard_stop        REAL,
+                    contracts        INTEGER,
+                    net_credit       REAL,
+                    status           TEXT DEFAULT 'open',
+                    close_price      REAL,
+                    realized_pnl     REAL,
+                    broker           TEXT,
+                    created_at       TEXT,
+                    updated_at       TEXT,
+                    delta            REAL,
+                    vega             REAL,
+                    theta            REAL,
+                    underlying_price REAL,
+                    expiry           TEXT
                 )
             """)
+            conn.commit()
+            # Migration: add columns to existing DBs that predate this schema version.
+            # ALTER TABLE IF NOT EXISTS column is not supported in all SQLite versions,
+            # so we check the column list first and add only if missing.
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            for col, typedef in [
+                ("delta",            "REAL"),
+                ("vega",             "REAL"),
+                ("theta",            "REAL"),
+                ("underlying_price", "REAL"),
+                ("expiry",           "TEXT"),
+            ]:
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
+                    logger.info("[TradeDB] Migration: added column %s %s", col, typedef)
             conn.commit()
         logger.debug("[TradeDB] Schema ready (%s)", "PostgreSQL" if self._use_pg else "SQLite")
 
@@ -243,18 +263,31 @@ class TradeDatabase:
         order = filled.approved_order
         legs_json = json.dumps([
             {"symbol": l.symbol, "side": l.side,
-             "strike": l.strike, "qty": l.quantity}
+             "strike": l.strike, "qty": l.quantity,
+             "expiry": l.expiry.isoformat() if l.expiry else None}
             for l in order.legs
         ])
         now = datetime.now(tz=timezone.utc).isoformat()
         try:
             with self._get_conn() as conn:
+                # Extract Greeks from the first source contract if available
+                # These are stored so stress_testing.py can use real deltas
+                src = order.legs[0] if order.legs else None
+                _delta = _vega = _theta = _spot = None
+                _expiry_str = None
+                if src:
+                    _expiry_str = src.expiry.isoformat() if hasattr(src, "expiry") and src.expiry else None
+                # Greeks are on the signal, not the order — pull from notes or default to None
+                # (GreeksEnricher stores them on EnrichedOptionRow, not propagated to ApprovedOrder)
+                # They will be backfilled by a mark-to-market update on the next monitor cycle
+
                 conn.execute("""
                     INSERT OR REPLACE INTO trades
                     (id, trade_date, strategy, underlying, legs_json,
                      fill_price, slippage, max_loss, hard_stop, contracts,
-                     net_credit, status, broker, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     net_credit, status, broker, created_at, updated_at,
+                     delta, vega, theta, underlying_price, expiry)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     filled.order_id,
                     date.today().isoformat(),
@@ -270,6 +303,7 @@ class TradeDatabase:
                     filled.status,
                     filled.broker,
                     now, now,
+                    _delta, _vega, _theta, _spot, _expiry_str,
                 ))
                 conn.commit()
             logger.info("[TradeDB] Saved: %s %s", filled.order_id, order.strategy_name)
@@ -298,7 +332,9 @@ class TradeDatabase:
             with self._get_conn() as conn:
                 cur = conn.execute(
                     "SELECT id, strategy, underlying, hard_stop, contracts, "
-                    "net_credit, fill_price, legs_json FROM trades WHERE status='open'"
+                    "net_credit, fill_price, legs_json, "
+                    "delta, vega, theta, underlying_price, expiry "
+                    "FROM trades WHERE status='open'"
                 )
                 cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, row)) for row in cur.fetchall()]
