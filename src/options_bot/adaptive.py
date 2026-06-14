@@ -227,17 +227,15 @@ class AdaptiveTuner:
         The returned config is a modified deepcopy. If no adjustments are needed,
         the copy is identical to the input — always safe to use the return value.
 
-        Parameters
-        ----------
-        strategy_name : str
-            One of: "csp", "short_put_spread", "short_strangle"
-        config : CSPConfig | ShortPutSpreadConfig | ShortStrangleConfig
-            Current strategy configuration dataclass.
-
-        Returns
-        -------
-        (new_config, PerfSnapshot, list[ParamAdjustment])
+        AUDIT FIX: Walk-forward validation gate added.
+        FINDING: "20-trade window too small. Tightening delta based on 20-trade
+        win rate is acting on noise."
+        FIX: Before applying any parameter change, run walk-forward validation.
+        If verdict is 'reverses', 'decays', or 'no_edge', suppress all adjustments.
+        Only 'survives' and 'emerged' verdicts permit tuner to act.
         """
+        from .walk_forward import check_tuner_permission
+
         snap    = self._compute_snapshot(strategy_name)
         new_cfg = deepcopy(config)
         adjustments: list[ParamAdjustment] = []
@@ -247,6 +245,22 @@ class AdaptiveTuner:
                 "[Adaptive] %s: insufficient history (%s trades) — no tuning",
                 strategy_name, snap.window_size if snap else 0
             )
+            return new_cfg, snap, adjustments
+
+        # Walk-forward validation gate
+        tuner_permitted, wf_result = check_tuner_permission(strategy_name, self.db)
+        logger.info("[Adaptive] %s walk-forward: %s — %s",
+                    strategy_name, wf_result.verdict.upper(), wf_result.explanation[:120])
+
+        if not tuner_permitted:
+            # Suppressed — notify but do NOT adjust
+            logger.warning(
+                "[Adaptive] %s: tuner SUPPRESSED by walk-forward (%s). "
+                "No parameter changes applied this cycle.",
+                strategy_name, wf_result.verdict,
+            )
+            if self.discord_webhook:
+                self._notify_suppressed(strategy_name, wf_result)
             return new_cfg, snap, adjustments
 
         logger.info("[Adaptive] %s: %s", strategy_name, snap.to_discord_line())
@@ -554,6 +568,27 @@ class AdaptiveTuner:
             urllib.request.urlopen(req, timeout=5)
         except Exception as exc:
             logger.warning("[Adaptive] Discord notify failed: %s", exc)
+
+    def _notify_suppressed(self, strategy_name: str, wf_result) -> None:
+        """Notify Discord when tuner is suppressed by walk-forward validation."""
+        import urllib.request, json as _json
+        msg = (
+            f"🚫 **Adaptive tuner SUPPRESSED — {strategy_name.upper()}**\n"
+            f"Walk-forward verdict: **{wf_result.verdict.upper()}**\n"
+            f"Train μ=${wf_result.mean_train:.1f} (WR={wf_result.winrate_train:.0%}) → "
+            f"Val μ=${wf_result.mean_val:.1f} (WR={wf_result.winrate_val:.0%})\n"
+            f"Reason: {wf_result.explanation[:200]}\n"
+            f"Parameters unchanged this cycle."
+        )
+        try:
+            payload = _json.dumps({"content": msg}).encode()
+            req = urllib.request.Request(
+                self.discord_webhook, data=payload,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception as exc:
+            logger.debug("[Adaptive] Discord notify failed: %s", exc)
 
     def adjustment_history(self) -> list[dict]:
         """Return all adjustments made this session as a list of dicts."""
