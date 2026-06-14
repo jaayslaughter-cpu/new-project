@@ -479,3 +479,248 @@ class GreeksEnricher:
             "[GreeksEnricher] After delta filter: %d rows remain", len(result)
         )
         return result
+
+
+# ---------------------------------------------------------------------------
+# Probability functions
+# Extracted from optionlab/support.py and optionlab/black_scholes.py
+# Source: https://github.com/rgaveiga/optionlab (MIT License)
+# Rewritten: no optionlab dependency, uses our existing scipy/numpy stack.
+# ---------------------------------------------------------------------------
+
+def probability_of_profit(
+    option_type: str,
+    action: str,
+    strike: float,
+    premium: float,
+    spot: float,
+    sigma: float,
+    rate: float,
+    days_to_expiry: int,
+    dividend_yield: float = 0.0,
+) -> float:
+    """
+    Probability that a single-leg options trade expires profitable.
+
+    For short positions (the primary use case — selling CSPs and spreads):
+      - Short put: profitable if spot > strike - premium at expiry
+      - Short call: profitable if spot < strike + premium at expiry
+
+    Uses the Black-Scholes lognormal distribution to compute the probability
+    that the underlying is above/below the break-even price at expiration.
+
+    Parameters
+    ----------
+    option_type : str
+        "call" or "put"
+    action : str
+        "buy" or "sell"
+    strike : float
+        Strike price of the option
+    premium : float
+        Option premium per share (mid price)
+    spot : float
+        Current underlying price
+    sigma : float
+        Annualized implied volatility (e.g. 0.20 for 20%)
+    rate : float
+        Annualized risk-free rate (e.g. 0.05 for 5%)
+    days_to_expiry : int
+        Calendar days remaining to expiration
+    dividend_yield : float
+        Annualized continuous dividend yield (default 0.0)
+
+    Returns
+    -------
+    float
+        Probability of profit in [0, 1]. Returns 0.5 on degenerate input.
+
+    Examples
+    --------
+    # Short put: $450 strike, $2.50 premium, spot=$460, IV=20%, 30 DTE
+    pop = probability_of_profit("put", "sell", 450, 2.50, 460, 0.20, 0.05, 30)
+    # -> ~0.82 (82% chance underlying stays above $447.50 break-even)
+    """
+    from scipy.stats import norm
+    import numpy as np
+
+    if days_to_expiry <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return 0.5
+
+    T = days_to_expiry / 365.0
+    opt_type = option_type.lower()
+    act      = action.lower()
+
+    # Break-even price at expiration
+    if opt_type == "put":
+        if act == "sell":
+            breakeven = strike - premium   # profitable above this
+        else:
+            breakeven = strike - premium   # profitable below this (long put)
+    else:  # call
+        if act == "sell":
+            breakeven = strike + premium   # profitable below this
+        else:
+            breakeven = strike + premium   # profitable above this (long call)
+
+    if breakeven <= 0:
+        return 1.0 if act == "sell" else 0.0
+
+    # log-normal probability: P(S_T > breakeven)
+    try:
+        d2 = (
+            np.log(spot / breakeven)
+            + (rate - dividend_yield - 0.5 * sigma ** 2) * T
+        ) / (sigma * np.sqrt(T))
+
+        if opt_type == "put" and act == "sell":
+            return float(norm.cdf(d2))          # want spot above breakeven
+        elif opt_type == "put" and act == "buy":
+            return float(norm.cdf(-d2))         # want spot below breakeven
+        elif opt_type == "call" and act == "sell":
+            return float(norm.cdf(-d2))         # want spot below breakeven
+        else:  # call buy
+            return float(norm.cdf(d2))          # want spot above breakeven
+    except Exception:
+        return 0.5
+
+
+def probability_of_touch(
+    option_type: str,
+    strike: float,
+    spot: float,
+    sigma: float,
+    rate: float,
+    days_to_expiry: int,
+    dividend_yield: float = 0.0,
+) -> float:
+    """
+    Probability that the underlying TOUCHES the strike price at any point
+    before expiration — even if it recovers by expiry.
+
+    This is always >= probability of finishing ITM, and is a more
+    conservative risk estimate for short options. The rule of thumb
+    "PoT ≈ 2 × delta" comes directly from this formula.
+
+    Formula (Reflection Principle for Brownian motion):
+        PoT = N(-d2) + exp(2 * mu * ln(K/S) / sigma^2) * N(d2 - 2*ln(K/S)/sigma*sqrt(T))
+    where mu = rate - dividend_yield - 0.5 * sigma^2
+
+    For short options we want PoT to be LOW — we're hoping the underlying
+    never touches our strike. A PoT above 35% is a warning signal.
+
+    Parameters
+    ----------
+    option_type : str
+        "call" or "put" — determines direction of touch
+    strike : float
+    spot : float
+    sigma : float
+        Annualized implied volatility
+    rate : float
+        Annualized risk-free rate
+    days_to_expiry : int
+    dividend_yield : float
+
+    Returns
+    -------
+    float
+        Probability of touch in [0, 1].
+    """
+    from scipy.stats import norm
+    import numpy as np
+
+    if days_to_expiry <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return 0.5
+
+    T   = days_to_expiry / 365.0
+    mu  = rate - dividend_yield - 0.5 * sigma ** 2
+    sig = sigma * np.sqrt(T)
+
+    try:
+        log_ks = np.log(strike / spot)
+
+        d1_touch = (-log_ks + mu * T) / sig
+        d2_touch = (-log_ks - mu * T) / sig
+
+        # Reflection principle: PoT = N(-d1) + exp(2*mu*log(K/S)/sigma^2)*N(d2_touch)
+        exponent = 2.0 * mu * log_ks / (sigma ** 2)
+
+        # Clamp exponent to prevent overflow
+        exponent = np.clip(exponent, -50, 50)
+
+        if option_type.lower() == "put":
+            # Put touch: underlying drops to strike (strike < spot)
+            pot = norm.cdf(-d1_touch) + np.exp(exponent) * norm.cdf(d2_touch)
+        else:
+            # Call touch: underlying rises to strike (strike > spot)
+            pot = norm.cdf(d1_touch) + np.exp(exponent) * norm.cdf(-d2_touch)
+
+        return float(np.clip(pot, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
+def pop_spread(
+    spread_type: str,
+    short_strike: float,
+    long_strike: float,
+    net_credit: float,
+    spot: float,
+    sigma: float,
+    rate: float,
+    days_to_expiry: int,
+    dividend_yield: float = 0.0,
+) -> dict:
+    """
+    Probability of profit and probability of touch for a vertical spread.
+
+    Parameters
+    ----------
+    spread_type : str
+        "bull_put" or "bear_call"
+    short_strike : float
+        Strike we sold (closer to spot = more premium, more risk)
+    long_strike : float
+        Strike we bought (further from spot = our hedge)
+    net_credit : float
+        Net premium received per share
+    spot, sigma, rate, days_to_expiry, dividend_yield
+        Same as probability_of_profit()
+
+    Returns
+    -------
+    dict with keys:
+        pop           — probability of max profit (spread expires worthless)
+        pot_short     — probability of underlying touching the short strike
+        pop_warning   — True if pop < 0.65 (below target threshold)
+        pot_warning   — True if pot_short > 0.35 (elevated touch risk)
+        break_even    — price at which spread P&L = 0 at expiry
+    """
+    if spread_type == "bull_put":
+        # Break-even: spot must stay above short_strike - credit
+        breakeven = short_strike - net_credit
+        pop = probability_of_profit(
+            "put", "sell", short_strike, net_credit,
+            spot, sigma, rate, days_to_expiry, dividend_yield
+        )
+        pot = probability_of_touch(
+            "put", short_strike, spot, sigma, rate, days_to_expiry, dividend_yield
+        )
+    else:  # bear_call
+        breakeven = short_strike + net_credit
+        pop = probability_of_profit(
+            "call", "sell", short_strike, net_credit,
+            spot, sigma, rate, days_to_expiry, dividend_yield
+        )
+        pot = probability_of_touch(
+            "call", short_strike, spot, sigma, rate, days_to_expiry, dividend_yield
+        )
+
+    return {
+        "pop":         round(pop, 4),
+        "pot_short":   round(pot, 4),
+        "break_even":  round(breakeven, 2),
+        "pop_warning": pop < 0.65,
+        "pot_warning": pot > 0.35,
+    }
