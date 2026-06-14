@@ -1425,7 +1425,7 @@ class Orchestrator:
             if stress_positions:
                 suite = run_stress_suite(
                     stress_positions,
-                    account_nlv=equity,
+                    account_nlv=self.state.equity if self.state.equity > 0 else self.rm.equity,
                     drawdown_threshold=self.config.risk_config.max_daily_loss_pct
                     if hasattr(self.config, 'risk_config') else 0.10,
                 )
