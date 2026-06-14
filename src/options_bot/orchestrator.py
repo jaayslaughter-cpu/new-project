@@ -67,6 +67,7 @@ from .scanner import TickerGate
 from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profile
 from .universe import UniverseBuilder
 from .volume_profile import volume_profile_cache
+from .stress_testing import run_stress_suite, positions_from_broker
 
 logger = logging.getLogger(__name__)
 
@@ -1414,7 +1415,26 @@ class Orchestrator:
         hurst_val  = regime.get("indicators", {}).get("hurst", 0.5)
         hurst_reg  = regime.get("indicators", {}).get("hurst_regime", "unknown")
 
-        # Show today's adaptive tuning activity if any
+        # Run stress test suite against current open positions
+        stress_line = ""
+        try:
+            stress_positions = positions_from_broker(self.broker, self.db)
+            if stress_positions:
+                suite = run_stress_suite(
+                    stress_positions,
+                    account_nlv=equity,
+                    drawdown_threshold=self.config.risk_config.max_daily_loss_pct
+                    if hasattr(self.config, 'risk_config') else 0.10,
+                )
+                stress_line = suite.discord_line + "\n"
+                if not suite.survives_all:
+                    logger.warning(
+                        "[EOD] Stress test: portfolio does NOT survive all scenarios. "
+                        "Worst: %s (%.1f%% NLV). Review positions.",
+                        suite.worst_scenario, suite.worst_impact_pct,
+                    )
+        except Exception as exc:
+            logger.warning("[EOD] Stress test failed (non-fatal): %s", exc)
         tuning_line = ""
         if self.tuner and self.tuner.adjustment_history():
             today_adj = [
@@ -1433,6 +1453,7 @@ class Orchestrator:
             f"Realized P&L: ${self.state.daily_realized_pnl:+.2f}\n"
             f"Unrealized P&L: ${self.state.daily_unrealized_pnl:+.2f}\n"
             f"{metrics_line}"
+            f"{stress_line}"
             f"{tuning_line}"
             f"Regime: {regime['regime'].upper()} "
             f"(conf={regime['confidence']:.0%}, "
