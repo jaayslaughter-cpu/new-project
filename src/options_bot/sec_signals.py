@@ -223,6 +223,27 @@ def get_activist_filings(
 
 def score_sec_signals(ticker: str, use_cache: bool = True) -> dict:
     """
+    DISABLED: Form 4 transaction type parsing is not implemented.
+    All Form 4 filings (buys AND sells) were counted as purchases,
+    producing an inverted signal — heavy insider selling scored STRONG_BUY.
+    Returns NEUTRAL/0 until Form 4 XML parsing is complete.
+
+    To re-enable: parse accession XML and filter only transaction_type == 'P'.
+    """
+    return {
+        "ticker":              ticker.upper(),
+        "score":               0,
+        "insider_buy_count":   0,
+        "has_activist":        False,
+        "is_activist":         False,
+        "last_insider_buy_date": "",
+        "signal":              "NEUTRAL",
+        "detail":              "SEC signals disabled — Form 4 buy/sell unparsed, inverted signal risk. Returns NEUTRAL.",
+    }
+
+
+def _score_sec_signals_raw(ticker: str, use_cache: bool = True) -> dict:
+    """Original implementation (broken — counts sell filings as buys). DO NOT CALL.
     Generate a composite SEC signal score for a ticker.
 
     Scoring (0–100):
