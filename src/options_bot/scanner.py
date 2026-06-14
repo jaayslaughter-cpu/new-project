@@ -35,6 +35,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from .volume_profile import volume_profile_cache, check_strike_safety
+from .sec_signals import score_sec_signals, is_entry_confirmed
+
 logger = logging.getLogger(__name__)
 
 # Cache TTLs
@@ -481,13 +484,13 @@ class TickerGate:
 
     def filter(self, tickers: list[str]) -> list[str]:
         """
-        Returns the subset of tickers that pass both screens.
+        Returns the subset of tickers that pass all screens.
         Logs why each ticker was blocked.
         """
         allowed = []
         for t in tickers:
-            tech_ok = (not self.require_bullish)  or self.scanner.is_entry_allowed(t)
-            fund_ok = (not self.require_piotroski) or self.piotroski.is_entry_allowed(t)
+            tech_ok = (not self.require_bullish)   or self.scanner.is_entry_allowed(t)
+            fund_ok = (not self.require_piotroski)  or self.piotroski.is_entry_allowed(t)
             if tech_ok and fund_ok:
                 allowed.append(t)
             else:
@@ -501,3 +504,26 @@ class TickerGate:
             len(allowed), len(tickers)
         )
         return allowed
+
+    def check_strike(
+        self,
+        ticker: str,
+        short_strike: float,
+        spot: float,
+        spread_type: str = "bull_put",
+    ) -> tuple[bool, str]:
+        """
+        Check if a short strike is safe relative to volume-based S/R levels.
+        Wraps volume_profile.check_strike_safety() with per-ticker cache.
+
+        Returns (safe: bool, reason: str).
+        """
+        profile = volume_profile_cache.get(ticker)
+        return check_strike_safety(ticker, short_strike, spot, spread_type, profile=profile)
+
+    def sec_confirmation(self, ticker: str) -> tuple[bool, str]:
+        """
+        Check SEC EDGAR for insider buying / activist confirmation.
+        Non-blocking — returns (True, reason) when present, (False, reason) when absent.
+        """
+        return is_entry_confirmed(ticker)
