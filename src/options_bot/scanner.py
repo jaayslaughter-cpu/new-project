@@ -55,7 +55,7 @@ class TechnicalScore:
     score:         float          # 0.0 – 5.5 (higher = more bullish)
     sma_score:     float          # 0–2: above SMA20 (+1), above SMA50 (+1)
     rsi_score:     float          # 0–1: RSI 50–70 (+1), 30–50 (+0.5)
-    macd_score:    float          # 0–1.5: above signal (+1), histogram rising (+0.5)
+    macd_score:    float          # 0–1.8: above signal (+1.0), histogram rising (+0.5), normalised magnitude (+0.3 max)
     adx_score:     float          # 0–1.5: ADX>25 with +DI>-DI (+1.5)
     rsi:           Optional[float] = None
     adx:           Optional[float] = None
@@ -79,6 +79,7 @@ class BullishScanner:
       RSI 30–50 (recovering):      +0.5
       MACD above signal:           +1.0
       MACD histogram rising:       +0.5
+# Normalised hist magnitude: up to +0.3 (hist/price*100, capped at 1.0)
       ADX > 25 with +DI > -DI:     +1.5
 
     Max score: 6.0. Bullish threshold: 3.0 (configurable).
@@ -204,6 +205,17 @@ class BullishScanner:
                 # Histogram rising: strictly > previous bar (not just > 0)
                 if histogram > hist_prev:
                     macd_score += 0.5
+
+                # Price-normalised histogram magnitude bonus (+0.3 max).
+                # Adapted from Algo-Trader/strategy/scorer.py:
+                # macd_hist / price * 100 makes histogram comparable across
+                # tickers regardless of price level. A $1 hist on a $10 stock
+                # (10%) is far more significant than on a $500 stock (0.2%).
+                # Clip at 1.0 to prevent extreme values dominating the score.
+                spot_price = float(close[-1]) if len(close) > 0 else 1.0
+                if spot_price > 0:
+                    hist_pct = abs(histogram) / spot_price * 100
+                    macd_score += min(hist_pct, 1.0) * 0.3
 
             # ADX (14-period, Wilder-smoothed — true ADX not raw DX)
             # Raw DX is 2-3x more volatile than ADX and causes false positives.
