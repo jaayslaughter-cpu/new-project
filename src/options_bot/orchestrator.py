@@ -1747,14 +1747,19 @@ class Orchestrator:
             if today_adj:
                 tuning_line = f"Tuning adjustments today: {len(today_adj)}\n"
 
+        week_start = date.today() - timedelta(days=date.today().weekday())
+        wtd_pnls   = self._query_pnls_since(week_start)
+        wtd_pnl    = sum(wtd_pnls)
+        n_total    = len(self._query_all_pnls())
         summary = (
-            f"📊 **Daily Summary — {date.today()}**\n"
+            f"Daily Summary - {date.today()}\n"
             f"Strategy: {self.config.strategy_name.upper()}  "
             f"{'[PAPER]' if self.config.paper else '[LIVE]'}\n"
-            f"Trades today: {len(self.state.filled_today)}\n"
-            f"Open positions: {len(open_trades)}\n"
-            f"Realized P&L: ${self.state.daily_realized_pnl:+.2f}\n"
-            f"Unrealized P&L: ${self.state.daily_unrealized_pnl:+.2f}\n"
+            f"Trades today: {len(self.state.filled_today)}  |  Open: {len(open_trades)}\n"
+            f"Today P&L: ${self.state.daily_realized_pnl:+.2f} realized  "
+            f"${self.state.daily_unrealized_pnl:+.2f} unrealized\n"
+            f"Week-to-date: ${wtd_pnl:+.2f} ({len(wtd_pnls)} closed trades)\n"
+            f"Total trades: {n_total}/30 to walk-forward unlock\n"
             f"{metrics_line}"
             f"{stress_line}"
             f"{tuning_line}"
@@ -1766,6 +1771,139 @@ class Orchestrator:
         )
         logger.info("[Orchestrator] %s", summary.replace("\n", " | "))
         send_discord(self.config.discord_webhook_url, summary)
+
+        # Milestone + periodic summaries
+        self._check_milestones()
+        if date.today().weekday() == 4:  # Friday
+            self._send_weekly_summary()
+        tomorrow = date.today() + timedelta(days=1)
+        if tomorrow.month != date.today().month:
+            self._send_monthly_summary()
+
+    def _query_all_pnls(self):
+        try:
+            with self.db._get_conn() as conn:
+                cur = conn.execute(
+                    "SELECT realized_pnl FROM trades "
+                    "WHERE status NOT IN ('open') AND realized_pnl IS NOT NULL"
+                )
+                return [row[0] for row in cur.fetchall()]
+        except Exception:
+            return []
+
+    def _query_pnls_since(self, since_date):
+        try:
+            with self.db._get_conn() as conn:
+                cur = conn.execute(
+                    "SELECT realized_pnl FROM trades "
+                    "WHERE status NOT IN ('open') AND realized_pnl IS NOT NULL "
+                    "AND trade_date >= ?",
+                    (since_date.isoformat(),)
+                )
+                return [row[0] for row in cur.fetchall()]
+        except Exception:
+            return []
+
+    def _pnl_block(self, pnls, label):
+        NL = chr(10)
+        if not pnls:
+            return label + ": no closed trades yet" + NL
+        wins   = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        total  = sum(pnls)
+        wr     = len(wins) / len(pnls) * 100
+        avg_w  = sum(wins)   / len(wins)   if wins   else 0.0
+        avg_l  = sum(losses) / len(losses) if losses else 0.0
+        pf     = sum(wins) / abs(sum(losses)) if losses else 999.0
+        return (
+            "**" + label + "** (" + str(len(pnls)) + " trades)" + NL +
+            "Total P&L: **$" + "{:+.2f}".format(total) + "**  "
+            "Win rate: **" + "{:.0f}".format(wr) + "%**" + NL +
+            "Avg win: $" + "{:+.2f}".format(avg_w) + "  "
+            "Avg loss: $" + "{:+.2f}".format(avg_l) + "  "
+            "Profit factor: " + "{:.2f}".format(pf) + NL
+        )
+
+    def _check_milestones(self):
+        all_pnls = self._query_all_pnls()
+        n = len(all_pnls)
+        NL = chr(10)
+        MILESTONES = {
+            10: ("Milestone: 10 trades closed",
+                 "Adaptive tuner has initial data. 20 more to walk-forward unlock."),
+            20: ("Milestone: 20 trades closed",
+                 "10 more trades until the adaptive tuner walk-forward gate opens."),
+            30: ("Milestone: 30 trades - WALK-FORWARD UNLOCKED",
+                 "The tuner can now make statistically valid parameter adjustments."),
+            60: ("Milestone: 60 trades (~2 months)",
+                 "At least one full market regime cycle covered. Review performance before going live."),
+            90: ("Milestone: 90 trades (~3 months)",
+                 "Breadth weights can now be calibrated. Final go-live assessment."),
+        }
+        if n not in MILESTONES:
+            return
+        title, detail = MILESTONES[n]
+        wins   = [p for p in all_pnls if p > 0]
+        losses = [p for p in all_pnls if p <= 0]
+        wr     = len(wins) / n * 100 if n else 0
+        pf     = sum(wins) / abs(sum(losses)) if losses else 999.0
+        pnl_block = self._pnl_block(all_pnls, "All-time")
+        readiness = ""
+        if n >= 30:
+            checks = [
+                ("Win rate >= 60%",      wr >= 60,  "{:.0f}%".format(wr)),
+                ("Profit factor >= 1.3", pf >= 1.3, "{:.2f}".format(pf)),
+            ]
+            lines_r = ["Go-live readiness:"]
+            for chk, passed, val in checks:
+                lines_r.append(("OK " if passed else "X  ") + chk + ": " + val)
+            all_pass = all(p for _, p, _ in checks)
+            lines_r.append("READY FOR LIVE TRADING" if all_pass else "Continue paper trading")
+            readiness = NL.join(lines_r) + NL
+        msg = title + NL + detail + NL + NL + pnl_block + readiness
+        send_discord(self.config.discord_webhook_url, msg)
+
+    def _send_weekly_summary(self):
+        NL = chr(10)
+        week_start = date.today() - timedelta(days=4)
+        pnls      = self._query_pnls_since(week_start)
+        all_pnls  = self._query_all_pnls()
+        n_all     = len(all_pnls)
+        equity    = self.state.equity or 100_000.0
+        bar_filled = min(int(n_all / 3), 10)
+        bar = ("X" * bar_filled) + ("-" * (10 - bar_filled))
+        unlock_status = "UNLOCKED" if n_all >= 30 else (str(30 - n_all) + " to unlock")
+        msg = (
+            "Weekly Summary - " + str(date.today()) + NL +
+            "Account equity: $" + "{:,.2f}".format(equity) + NL + NL +
+            self._pnl_block(pnls, "This week") + NL +
+            self._pnl_block(all_pnls, "All-time") + NL +
+            "Paper progress: [" + bar + "] " + str(n_all) + "/30 trades (" + unlock_status + ")" + NL
+        )
+        send_discord(self.config.discord_webhook_url, msg)
+
+    def _send_monthly_summary(self):
+        NL = chr(10)
+        today       = date.today()
+        month_start = today.replace(day=1)
+        pnls        = self._query_pnls_since(month_start)
+        all_pnls    = self._query_all_pnls()
+        equity      = self.state.equity or 100_000.0
+        n           = len(all_pnls)
+        wins        = [p for p in all_pnls if p > 0]
+        losses      = [p for p in all_pnls if p <= 0]
+        wr          = len(wins) / n * 100 if n else 0
+        pf          = sum(wins) / abs(sum(losses)) if losses else 999.0
+        ready       = n >= 30 and wr >= 60 and pf >= 1.3
+        msg = (
+            "Monthly Summary - " + today.strftime("%B %Y") + NL +
+            "Account equity: $" + "{:,.2f}".format(equity) + NL + NL +
+            self._pnl_block(pnls, today.strftime("%B") + " P&L") + NL +
+            self._pnl_block(all_pnls, "All-time P&L") + NL +
+            "Go-live status: " + ("READY" if ready else "NOT YET") +
+            " (" + str(n) + " trades, " + "{:.0f}".format(wr) + "% WR, " + "{:.2f}".format(pf) + " PF)" + NL
+        )
+        send_discord(self.config.discord_webhook_url, msg)
 
     def _check_options_approved(self) -> None:
         """
