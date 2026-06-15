@@ -105,7 +105,7 @@ def main() -> None:
         help="Max concurrent open positions",
     )
     parser.add_argument(
-        "--scan-time", default="09:45",
+        "--scan-time", default="06:45",
         help="Scan time in PT (HH:MM)",
     )
     parser.add_argument(
@@ -202,7 +202,14 @@ def main() -> None:
     print(f"  Tickers:  {config.tickers}")
     print(f"  Strategy: {config.strategy_name}")
     print(f"  Risk:     {config.risk_config.risk_budget_pct:.1%} per trade")
-    print(f"  Scan:     {args.scan_time} PT daily")
+    scan_pt = args.scan_time
+    try:
+        _h, _m = map(int, scan_pt.split(":"))
+        _et_h  = (_h + 3) % 24
+        scan_et = f"{_et_h:02d}:{_m:02d}"
+    except Exception:
+        scan_et = "?"
+    print(f"  Scan:     {scan_pt} PT = {scan_et} ET daily")
 
     orch = Orchestrator(config)
 
