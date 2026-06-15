@@ -1293,12 +1293,18 @@ class Orchestrator:
             )
             logger.info("[Orchestrator] Universe rebuild scheduled: Sundays 6 PM PT")
 
+        et_scan = (self.config.scan_hour + 3) % 24
+        et_eod  = (self.config.close_hour + 3) % 24
         logger.info(
-            "[Orchestrator] Scheduler starting: scan=%02d:%02d PT, "
-            "monitor=every %dmin, eod=%02d:%02d PT",
+            "[Orchestrator] Scheduler starting: "
+            "scan=%02d:%02d PT (%02d:%02d ET), "
+            "monitor=every %dmin, "
+            "eod=%02d:%02d PT (%02d:%02d ET)",
             self.config.scan_hour, self.config.scan_minute,
+            et_scan, self.config.scan_minute,
             self.config.monitor_interval_minutes,
-            self.config.close_hour, self.config.close_minute,
+            self.config.close_hour, self.config.scan_minute,
+            et_eod, self.config.scan_minute,
         )
         send_discord(
             self.config.discord_webhook_url,
