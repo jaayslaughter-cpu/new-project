@@ -89,6 +89,9 @@ class EnrichedOptionRow:
     theta: Optional[float] = None      # daily decay, negative for long positions
     vega: Optional[float] = None       # per 1% IV move
     rho: Optional[float] = None        # per 1% rate move
+    vanna: Optional[float] = None       # dDelta/dSigma per 1% vol
+    volga: Optional[float] = None       # dVega/dSigma per (1% vol)^2
+    charm: Optional[float] = None       # dDelta/dt per day (0DTE decay)
 
     # --- Pricing model used ---
     pricing_model: str = "black_scholes"   # or "binomial_crr" for American options
