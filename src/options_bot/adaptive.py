@@ -241,10 +241,15 @@ class AdaptiveTuner:
         adjustments: list[ParamAdjustment] = []
 
         if snap is None or snap.window_size < MIN_TRADES_TO_TUNE:
+            count = snap.window_size if snap else 0
             logger.info(
-                "[Adaptive] %s: insufficient history (%s trades) — no tuning",
-                strategy_name, snap.window_size if snap else 0
+                "[Adaptive] %s: insufficient history (%d trades, need %d) — no tuning",
+                strategy_name, count, MIN_TRADES_TO_TUNE,
             )
+            # Notify Discord so it's clear the tuner is waiting, not broken.
+            # Only fires once every 10 trades to avoid spam.
+            if self.discord_webhook and count % 10 == 0:
+                self._notify_waiting(strategy_name, count)
             return new_cfg, snap, adjustments
 
         # Walk-forward validation gate
@@ -589,6 +594,26 @@ class AdaptiveTuner:
             urllib.request.urlopen(req, timeout=5)
         except Exception as exc:
             logger.debug("[Adaptive] Discord notify failed: %s", exc)
+
+    def _notify_waiting(self, strategy_name: str, count: int) -> None:
+        """Notify Discord that the tuner is waiting for enough trades — not broken."""
+        import urllib.request as _ur, json as _json
+        msg = (
+            f"⏳ **Adaptive tuner waiting — {strategy_name.upper()}**\n"
+            f"Closed trades so far: **{count}/{MIN_TRADES_TO_TUNE}** needed\n"
+            f"Walk-forward validation requires {MIN_WF_SAMPLES} trades before "
+            f"parameter changes are permitted.\n"
+            f"No action needed — tuner will activate automatically."
+        )
+        try:
+            payload = _json.dumps({"content": msg}).encode()
+            req = _ur.Request(
+                self.discord_webhook, data=payload,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            _ur.urlopen(req, timeout=5)
+        except Exception as exc:
+            logger.debug("[Adaptive] Discord notify_waiting failed: %s", exc)
 
     def adjustment_history(self) -> list[dict]:
         """Return all adjustments made this session as a list of dicts."""
