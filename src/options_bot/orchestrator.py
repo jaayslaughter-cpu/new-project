@@ -191,9 +191,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server(port: int = 8080) -> None:
-    s = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    threading.Thread(target=s.serve_forever, daemon=True).start()
-    logger.info("[Health] Listening on :%d /health", port)
+    try:
+        s = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        logger.info("[Health] Listening on :%d /health", port)
+    except OSError:
+        # Port already bound by the boot server in __main__.py — fine.
+        # Module-level _hs dict is shared so _update_health() still works.
+        logger.debug("[Health] Port %d already in use — boot server active", port)
 
 
 # ---------------------------------------------------------------------------
