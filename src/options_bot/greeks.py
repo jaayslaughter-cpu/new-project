@@ -424,6 +424,9 @@ class GreeksEnricher:
             theta=greeks["theta"],
             vega=greeks["vega"],
             rho=greeks["rho"],
+            vanna=greeks.get("vanna"),
+            volga=greeks.get("volga"),
+            charm=greeks.get("charm"),
             risk_free_rate=rate,
             pricing_model=self.pricing_model,
         )
