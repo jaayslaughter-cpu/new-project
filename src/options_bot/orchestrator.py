@@ -68,6 +68,7 @@ from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profi
 from .universe import UniverseBuilder
 from .volume_profile import volume_profile_cache
 from .stress_testing import run_stress_suite, positions_from_broker
+from .sec_signals import is_entry_confirmed
 
 logger = logging.getLogger(__name__)
 
@@ -518,10 +519,9 @@ class TradingPipeline:
         self.broker = broker
         self.db = db
         self.state = state
-        self.enricher = GreeksEnricher()   # fetches Treasury rate on init
-        self.strategy = get_strategy(
-            config.strategy_name, config.strategy_config
-        )
+        self.enricher   = GreeksEnricher()   # fetches Treasury rate on init
+        self.strategy   = get_strategy(config.strategy_name, config.strategy_config)
+        self._sentiment = SentimentAnalyzer(config=SentimentConfig())
 
     def run_for_ticker(
         self,
@@ -593,6 +593,46 @@ class TradingPipeline:
                 ticker, len(already_open)
             )
             return None
+
+        # --- Step 2c: Sentiment gate ---
+        # VADER (vaderSentiment, ~1MB, no GPU) runs as the default on Railway.
+        # FinBERT runs automatically if torch is locally installed.
+        # SELL signal blocks entry; HOLD and BUY allow through.
+        # Non-fatal: news fetch failure defaults to HOLD (never blocks).
+        try:
+            sentiment_signals = self._sentiment.get_signals(
+                tickers=[ticker],
+                config=self._sentiment.config,
+            )
+            sig = sentiment_signals.get(ticker)
+            if sig and sig.signal == "SELL":
+                logger.info(
+                    "[Pipeline] %s sentiment SELL — skipping "
+                    "(score=%.3f, articles=%d, model=%s)",
+                    ticker, sig.weighted_score, sig.article_count, sig.model_used,
+                )
+                return None
+            if sig:
+                logger.debug(
+                    "[Pipeline] %s sentiment %s (score=%.3f, articles=%d, model=%s)",
+                    ticker, sig.signal, sig.weighted_score,
+                    sig.article_count, sig.model_used,
+                )
+        except Exception as exc:
+            logger.debug("[Pipeline] %s sentiment gate skipped (non-fatal): %s", ticker, exc)
+
+        # --- Step 2d: SEC insider signal (positive confirmation gate) ---
+        # Never blocks a trade — only logs when insider buying is confirmed.
+        # Form 4 XML parsed for type=P (open-market purchases) only.
+        # Non-fatal: EDGAR unavailable silently allows through.
+        try:
+            confirmed, sec_reason = is_entry_confirmed(ticker, require_score=20)
+            if confirmed:
+                logger.info("[Pipeline] %s SEC confirmed: %s", ticker, sec_reason)
+            else:
+                logger.debug("[Pipeline] %s SEC: %s", ticker, sec_reason)
+        except Exception as exc:
+            logger.debug("[Pipeline] %s SEC gate skipped (non-fatal): %s", ticker, exc)
 
         # --- Step 3: Strategy evaluation ---
         try:
