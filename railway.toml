@@ -4,3 +4,10 @@ builder = "DOCKERFILE"
 [deploy]
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+# Health check — Railway polls GET /health on port 8080.
+# The bot starts a lightweight HTTP server at process boot (before Orchestrator init)
+# so this responds immediately. Set HEALTH_PORT env var to override port.
+[deploy.healthcheck]
+path = "/health"
+# timeout = 300   # seconds Railway waits before marking unhealthy (default 300)
