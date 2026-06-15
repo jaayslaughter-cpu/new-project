@@ -209,13 +209,12 @@ def bs_greeks(
     else:
         rho = -K * T * exp_rT * norm.cdf(-d2) * 0.01
 
-    return {
-        "delta": delta,
-        "gamma": gamma,
-        "theta": theta,
-        "vega": vega,
-        "rho": rho,
-    }
+    vanna = -norm.pdf(d1) * d2 / sigma * 0.01
+    vega_raw = S * norm.pdf(d1) * sqrt_T
+    volga = vega_raw * d1 * d2 / sigma * 0.0001
+    charm = (-norm.pdf(d1)*(2*r*T-d2*sigma*sqrt_T)/(2*T*sigma*sqrt_T))/365.0
+    return {"delta":delta,"gamma":gamma,"theta":theta,"vega":vega,"rho":rho,
+            "vanna":round(vanna,8),"volga":round(volga,8),"charm":round(charm,8)}
 
 
 def solve_iv(
