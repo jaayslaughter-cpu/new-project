@@ -444,6 +444,40 @@ def aggregate_signals(
 # News fetcher (yfinance — no extra API key required)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# News importance pre-filter (adapted from AlphaTrade breaking_news_monitor)
+# Only articles containing at least one high-signal keyword are passed to
+# VADER/FinBERT. Generic price-action headlines ("stock rises 1%") add noise
+# without changing the sentiment signal for option entry decisions.
+# ---------------------------------------------------------------------------
+_IMPORTANCE_KEYWORDS: frozenset[str] = frozenset([
+    # Earnings / guidance
+    "earnings", "beats", "misses", "guidance", "revenue", "profit", "loss",
+    "eps", "forecast", "outlook", "raised", "lowered", "estimate",
+    # Corporate events
+    "merger", "acquisition", "buyout", "spinoff", "ipo", "secondary",
+    "partnership", "deal", "contract", "awarded",
+    # Regulatory / legal
+    "fda", "approval", "approved", "rejected", "recall", "investigation",
+    "sec", "doj", "lawsuit", "settlement", "fine", "penalty",
+    # Management
+    "ceo", "cfo", "resign", "fired", "appointed", "departure",
+    # Macro catalysts
+    "fed", "rate", "inflation", "cpi", "nfp", "gdp", "fomc",
+    # Extreme price events
+    "crash", "surge", "plunge", "rally", "halt", "delisted", "bankrupt",
+    # Analyst actions
+    "upgrade", "downgrade", "initiated", "price target", "overweight",
+    "underweight", "buy", "sell", "hold",
+])
+
+
+def _is_important(title: str, summary: str = "") -> bool:
+    """Return True if the headline contains at least one high-signal keyword."""
+    text = (title + " " + summary).lower()
+    return any(kw in text for kw in _IMPORTANCE_KEYWORDS)
+
+
 def fetch_news(
     tickers: list[str],
     max_articles_per_ticker: int = 10,
@@ -453,6 +487,10 @@ def fetch_news(
 
     yfinance returns up to ~10 articles per ticker from Yahoo Finance news.
     No API key required — same source used by the market_data module.
+
+    Articles are pre-filtered by _is_important() before being added — generic
+    price-action headlines are dropped so VADER/FinBERT only scores
+    high-signal content (earnings, FDA, M&A, analyst actions, macro events).
 
     Returns a flat list of ScoredArticle objects (unscored — run through
     score_articles() before aggregating signals).
@@ -464,6 +502,7 @@ def fetch_news(
         return []
 
     articles: list[ScoredArticle] = []
+    filtered_out = 0
 
     for ticker in tickers:
         try:
@@ -476,6 +515,11 @@ def fetch_news(
                 ts      = item.get("providerPublishTime")
 
                 if not title:
+                    continue
+
+                # Pre-filter: skip low-signal articles before running ML scorer
+                if not _is_important(title, summary):
+                    filtered_out += 1
                     continue
 
                 published = None
@@ -493,14 +537,15 @@ def fetch_news(
                     published_at=published,
                 ))
 
-            logger.debug("[Sentiment] %s: fetched %d articles", ticker, len(news))
+            logger.debug("[Sentiment] %s: fetched %d articles, kept %d after keyword filter",
+                         ticker, len(news), sum(1 for a in articles if a.ticker == ticker))
 
         except Exception as exc:
             logger.warning("[Sentiment] News fetch failed for %s: %s", ticker, exc)
 
     logger.info(
-        "[Sentiment] Fetched %d total articles for %d tickers",
-        len(articles), len(tickers),
+        "[Sentiment] Fetched %d articles for %d tickers (%d dropped by keyword filter)",
+        len(articles), len(tickers), filtered_out,
     )
     return articles
 
