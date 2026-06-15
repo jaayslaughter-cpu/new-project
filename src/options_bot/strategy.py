@@ -546,52 +546,16 @@ class ShortPutSpread(BaseStrategy):
         # FINDING: "No earnings filter. The model has no earnings date lookup.
         # Missing structural risk check."
         # FIX: Reject if earnings fall within the DTE window.
-        # This is a HARD BLOCK — the trade is rejected, not warned.
-        from datetime import date as _date
-        today = _date.today()
-        expiry = short_put.expiry if hasattr(short_put, 'expiry') and short_put.expiry else None
-        earnings_blocked, earnings_reason = _earnings_filter.check(
+        # Earnings hard filter + volume profile — shared BaseStrategy helpers.
+        # Consistent with CashSecuredPut and ShortStrangle implementations.
+        self._check_earnings(short_put.underlying, short_put.expiry, short_put.dte)
+        self._check_volume_profile(
             short_put.underlying,
-            entry_date=today,
-            expiry_date=expiry,
-            dte=short_put.dte,
+            short_put.strike,
+            short_put.underlying_price,
+            spread_type="bull_put",
+            min_hvn_distance_pct=cfg.vp_min_hvn_distance_pct,
         )
-        if earnings_blocked:
-            raise LiquidityFilterError(
-                short_put.underlying,
-                f"[{self.name}] EARNINGS BLOCK: {earnings_reason}"
-            )
-
-        # Volume profile strike safety check
-        # Rejects if the short strike sits in a contested zone (inside value area,
-        # within min_vp_hvn_distance_pct% of a strong HVN, or between spot and POC).
-        # Uses 1-hour cached profile — non-fatal if data unavailable (allows through).
-        if cfg.vp_check_enabled:
-            try:
-                profile = volume_profile_cache.get(short_put.underlying)
-                vp_safe, vp_reason = check_strike_safety(
-                    ticker=short_put.underlying,
-                    short_strike=short_put.strike,
-                    spot=short_put.underlying_price,
-                    spread_type="bull_put",
-                    min_hvn_distance_pct=cfg.vp_min_hvn_distance_pct,
-                    profile=profile,
-                )
-                if not vp_safe:
-                    raise LiquidityFilterError(
-                        short_put.underlying,
-                        f"[{self.name}] Volume profile REJECT: {vp_reason}. "
-                        f"Short strike ${short_put.strike:.0f} near high-volume S/R level."
-                    )
-                logger.debug(
-                    "[%s] Volume profile OK: %s — %s",
-                    self.name, short_put.underlying, vp_reason
-                )
-            except LiquidityFilterError:
-                raise
-            except Exception as exc:
-                # Non-fatal: allow through if VP data unavailable
-                logger.debug("[%s] Volume profile check skipped: %s", self.name, exc)
 
         # Probability of profit + probability of touch validation
         # AUDIT FIX: PoT is now a HARD REJECT (was: warning only)
