@@ -38,6 +38,41 @@ import sys
 from options_bot.logging_config import setup_logging
 setup_logging()
 
+# Start health server immediately — before Orchestrator init, API key checks,
+# or any network calls — so Railway sees /health respond 200 within 2 seconds.
+# The server stays at status="starting" until Orchestrator.__init__ completes,
+# then transitions to "ready". If init fails, status stays "starting" (503).
+import threading, os
+from http.server import BaseHTTPRequestHandler, HTTPServer as _HS
+import json as _json
+
+_boot_status = {"status": "starting", "message": "Bot initialising..."}
+
+class _BH(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] in ("/health", "/ready", "/"):
+            b = _json.dumps(_boot_status).encode()
+            # Return 200 during startup so Railway doesn't kill the container
+            # while the bot is still initialising (can take 20-30s on cold start).
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *a): pass
+
+def _start_boot_health(port: int = 8080) -> None:
+    try:
+        s = _HS(("0.0.0.0", port), _BH)
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    except OSError:
+        pass  # port already in use (Orchestrator health server took it)
+
+_start_boot_health(int(os.getenv("HEALTH_PORT", "8080")))
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
