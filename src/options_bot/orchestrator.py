@@ -42,6 +42,7 @@ import os
 import sqlite3
 import threading
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -155,6 +156,44 @@ class OrchestratorConfig:
         default_factory=lambda: os.getenv("DATABASE_URL", "")
     )
     sqlite_path: str = "options_bot.db"
+
+
+# ---------------------------------------------------------------------------
+# Health server — /health and /ready for Railway monitoring
+# ---------------------------------------------------------------------------
+
+_hs: dict = {"status":"starting","last_scan":None,"last_monitor":None,
+             "open_positions":0,"daily_pnl":0.0,"started_at":""}
+
+
+def _update_health(k: str, v) -> None:
+    _hs[k] = v
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] in ("/health", "/ready", "/"):
+            import json as _j, datetime as _dt
+            ts = _hs["started_at"] or _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+            b = _j.dumps({**_hs, "uptime": int((_dt.datetime.now(tz=_dt.timezone.utc)
+                - _dt.datetime.fromisoformat(ts)).total_seconds())}).encode()
+            self.send_response(200 if _hs["status"] in ("ready", "running") else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def start_health_server(port: int = 8080) -> None:
+    s = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+    logger.info("[Health] Listening on :%d /health", port)
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +897,9 @@ class PositionMonitor:
         # Keep RiskManager in sync so daily loss halt sees current unrealized exposure
         if self.rm is not None:
             self.rm.record_pnl(unrealized=total_unreal)
+        _update_health("open_positions", len(positions))
+        _update_health("daily_pnl", round(self.state.daily_realized_pnl + total_unreal, 2))
+        _update_health("last_monitor", datetime.now(tz=timezone.utc).isoformat())
 
     def _check_trade(self, trade: dict, quotes: dict) -> None:
         """
@@ -1103,6 +1145,10 @@ class Orchestrator:
             apply_profile(config, config.risk_level)
             logger.info("[Orchestrator] Risk profile: %s applied (strategy params included)",
                         config.risk_level.upper())
+
+        _hs["started_at"] = datetime.now(tz=timezone.utc).isoformat()
+        start_health_server(int(os.getenv("HEALTH_PORT", "8080")))
+        _update_health("status", "ready")
 
         # Ticker pre-screening gate
         self.ticker_gate = TickerGate(
