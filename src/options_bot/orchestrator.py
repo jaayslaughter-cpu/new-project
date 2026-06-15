@@ -14,7 +14,7 @@ Ties every pipeline module together:
 Architecture follows your existing PropIQ pattern:
   - APScheduler owns all scheduled jobs (no loose threads)
   - Single shared state object passed by reference
-  - Jobs fire at configurable times (default: scan at 9:45 AM PT,
+  - Jobs fire at configurable times (default: scan at 6:45 AM PT = 9:45 AM ET,
     monitor every 15 min during market hours, close at 3:45 PM PT)
   - Discord webhook for pick dispatch (matches PropIQ setup)
   - PostgreSQL / SQLite for trade state persistence
@@ -95,10 +95,10 @@ class OrchestratorConfig:
     risk_config: RiskConfig = field(default_factory=RiskConfig)
 
     # --- Scheduling (hour, minute in PT) ---
-    scan_hour: int = 9       # 9:45 AM PT = 12:45 PM ET (after open volatility settles)
+    scan_hour: int = 6       # 6:45 AM PT = 9:45 AM ET (15 min after open)
     scan_minute: int = 45
     monitor_interval_minutes: int = 15   # position check frequency
-    close_hour: int = 15     # 3:45 PM PT = EOD, close stale orders
+    close_hour: int = 12     # 12:45 PM PT = 3:45 PM ET (15 min before close)
     close_minute: int = 45
 
     # --- Chain filter ---
@@ -1643,7 +1643,7 @@ class Orchestrator:
         logger.info("[Orchestrator] EOD cleanup")
 
         # Fetch fresh equity from broker so stress test NLV reflects intraday P&L.
-        # self.state.equity is stale (set at 9:45 AM scan time).
+        # self.state.equity is stale (set at 6:45 AM PT / 9:45 AM ET scan time).
         try:
             equity = self.broker.get_equity()
             self.state.equity = equity
