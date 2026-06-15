@@ -153,6 +153,49 @@ _FOMC_2026 = {
     date(2026, 12, 15), date(2026, 12, 16),
 }
 
+# 2027 FOMC statement dates (federalreserve.gov — published in advance)
+_FOMC_2027 = {
+    date(2027, 1, 26), date(2027, 1, 27),
+    date(2027, 3, 16), date(2027, 3, 17),
+    date(2027, 5, 4),  date(2027, 5, 5),
+    date(2027, 6, 15), date(2027, 6, 16),
+    date(2027, 7, 27), date(2027, 7, 28),
+    date(2027, 9, 21), date(2027, 9, 22),
+    date(2027, 10, 26), date(2027, 10, 27),
+    date(2027, 12, 14), date(2027, 12, 15),
+}
+
+# Hardcoded CPI release dates — Bureau of Labor Statistics publishes the
+# schedule annually at bls.gov/schedule/news_release/cpi.htm
+# CPI is released at 8:30 AM ET on these dates; 0DTE gets half-size.
+_CPI_2026 = {
+    date(2026, 1, 14), date(2026, 2, 11), date(2026, 3, 11),
+    date(2026, 4, 10), date(2026, 5, 13), date(2026, 6, 11),
+    date(2026, 7, 14), date(2026, 8, 12), date(2026, 9, 11),
+    date(2026, 10, 14), date(2026, 11, 12), date(2026, 12, 11),
+}
+_CPI_2027 = {
+    date(2027, 1, 13), date(2027, 2, 10), date(2027, 3, 11),
+    date(2027, 4, 13), date(2027, 5, 12), date(2027, 6, 11),
+    date(2027, 7, 14), date(2027, 8, 11), date(2027, 9, 14),
+    date(2027, 10, 13), date(2027, 11, 10), date(2027, 12, 14),
+}
+
+# Hardcoded NFP (Non-Farm Payroll) release dates — BLS publishes at 8:30 AM ET
+# on the first Friday of each month. 0DTE gets half-size on these days.
+_NFP_2026 = {
+    date(2026, 1, 9),  date(2026, 2, 6),  date(2026, 3, 6),
+    date(2026, 4, 3),  date(2026, 5, 8),  date(2026, 6, 5),
+    date(2026, 7, 10), date(2026, 8, 7),  date(2026, 9, 4),
+    date(2026, 10, 2), date(2026, 11, 6), date(2026, 12, 4),
+}
+_NFP_2027 = {
+    date(2027, 1, 8),  date(2027, 2, 5),  date(2027, 3, 5),
+    date(2027, 4, 2),  date(2027, 5, 7),  date(2027, 6, 4),
+    date(2027, 7, 9),  date(2027, 8, 6),  date(2027, 9, 3),
+    date(2027, 10, 1), date(2027, 11, 5), date(2027, 12, 3),
+}
+
 
 def _monthly_opex(year: int) -> set[date]:
     """3rd Friday of each month."""
@@ -173,11 +216,15 @@ class EventCalendar:
 
     def __init__(self):
         year = date.today().year
-        self._fomc = _FOMC_2026
+        # Combine all known FOMC dates — 0DTE never trades on FOMC announcement days
+        self._fomc = _FOMC_2026 | _FOMC_2027
         self._opex = _monthly_opex(year)
         self._triple = {d for d in self._opex if d.month in (3, 6, 9, 12)}
-        self._cpi: set[date] = set()
-        self._nfp: set[date] = set()
+        # Seed CPI and NFP from hardcoded BLS schedule — always populated,
+        # not dependent on Finnhub API key being present.
+        self._cpi: set[date] = _CPI_2026 | _CPI_2027
+        self._nfp: set[date] = _NFP_2026 | _NFP_2027
+        # Finnhub can add additional dates if the key is available
         self._try_load_finnhub()
 
     def _try_load_finnhub(self) -> None:
