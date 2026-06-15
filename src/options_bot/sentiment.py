@@ -43,7 +43,9 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import json
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -478,74 +480,143 @@ def _is_important(title: str, summary: str = "") -> bool:
     return any(kw in text for kw in _IMPORTANCE_KEYWORDS)
 
 
+def _fetch_alpaca_news(
+    tickers: list[str],
+    max_per_ticker: int = 10,
+    lookback_days: int = 3,
+) -> list[dict]:
+    """
+    Fetch news from Alpaca's /v1beta1/news endpoint.
+    Uses existing ALPACA_API_KEY + ALPACA_SECRET_KEY env vars — no extra auth.
+    Alpaca news has reliable UTC timestamps, better coverage than yfinance,
+    and supports pagination. Adapted from Algo-Trader/strategy/news_filter.py.
+    Returns raw dicts; caller converts to ScoredArticle.
+    """
+    import urllib.request as _ur
+    from datetime import timezone as _tz, timedelta as _td
+
+    api_key    = os.environ.get("ALPACA_API_KEY", "")
+    api_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+    if not api_key or not api_secret:
+        return []
+
+    base_url = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets")
+    url      = f"{base_url}/v1beta1/news"
+    start    = (datetime.now(tz=timezone.utc) - timedelta(days=lookback_days)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+    symbols  = ",".join(tickers)
+    params   = f"symbols={symbols}&start={start}&limit={min(max_per_ticker * len(tickers), 50)}"
+    headers  = {
+        "APCA-API-KEY-ID":     api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+    try:
+        req = _ur.Request(f"{url}?{params}", headers=headers)
+        with _ur.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+        return data.get("news", [])
+    except Exception as exc:
+        logger.debug("[Sentiment] Alpaca news fetch failed: %s", exc)
+        return []
+
+
 def fetch_news(
     tickers: list[str],
     max_articles_per_ticker: int = 10,
 ) -> list[ScoredArticle]:
     """
-    Fetch recent news headlines for a list of tickers using yfinance.
+    Fetch recent news headlines using Alpaca as primary source, yfinance as fallback.
 
-    yfinance returns up to ~10 articles per ticker from Yahoo Finance news.
-    No API key required — same source used by the market_data module.
+    Source priority:
+      1. Alpaca /v1beta1/news — authenticated with existing API keys, reliable
+         UTC timestamps, better coverage, consistent JSON schema.
+      2. yfinance — fallback when Alpaca keys are absent or request fails.
 
-    Articles are pre-filtered by _is_important() before being added — generic
-    price-action headlines are dropped so VADER/FinBERT only scores
+    Articles are pre-filtered by _is_important() before scoring — generic
+    price-action headlines are dropped so VADER/FinBERT only processes
     high-signal content (earnings, FDA, M&A, analyst actions, macro events).
-
-    Returns a flat list of ScoredArticle objects (unscored — run through
-    score_articles() before aggregating signals).
     """
-    try:
-        import yfinance as yf
-    except ImportError:
-        logger.warning("[Sentiment] yfinance not installed — cannot fetch news")
-        return []
-
     articles: list[ScoredArticle] = []
     filtered_out = 0
+    source_used  = "none"
 
-    for ticker in tickers:
-        try:
-            t = yf.Ticker(ticker)
-            news = t.news or []
-            for item in news[:max_articles_per_ticker]:
-                title   = item.get("title", "").strip()
-                summary = item.get("summary", "").strip()
-                source  = item.get("source", "")
-                ts      = item.get("providerPublishTime")
+    # ── Source 1: Alpaca news ────────────────────────────────────────────────
+    raw_alpaca = _fetch_alpaca_news(tickers, max_per_ticker=max_articles_per_ticker)
+    if raw_alpaca:
+        source_used = "alpaca"
+        # Track per-ticker count to respect max_articles_per_ticker
+        ticker_counts: dict[str, int] = {}
+        for item in raw_alpaca:
+            # Alpaca returns a flat list; filter to only requested tickers
+            item_tickers = item.get("symbols", [])
+            for ticker in tickers:
+                if ticker not in item_tickers:
+                    continue
+                if ticker_counts.get(ticker, 0) >= max_articles_per_ticker:
+                    continue
+                title   = (item.get("headline") or item.get("title") or "").strip()
+                summary = (item.get("summary") or "").strip()
+                source  = item.get("source") or item.get("author") or "Alpaca"
+                raw_ts  = item.get("created_at") or item.get("updated_at") or ""
 
                 if not title:
                     continue
-
-                # Pre-filter: skip low-signal articles before running ML scorer
                 if not _is_important(title, summary):
                     filtered_out += 1
                     continue
 
                 published = None
-                if ts:
+                if raw_ts:
                     try:
-                        published = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-                    except (ValueError, TypeError, OSError):
+                        published = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
                         pass
 
                 articles.append(ScoredArticle(
-                    ticker=ticker,
-                    title=title,
-                    summary=summary,
-                    source=source,
-                    published_at=published,
+                    ticker=ticker, title=title, summary=summary,
+                    source=source, published_at=published,
                 ))
+                ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
 
-            logger.debug("[Sentiment] %s: fetched %d articles, kept %d after keyword filter",
-                         ticker, len(news), sum(1 for a in articles if a.ticker == ticker))
+    # ── Source 2: yfinance fallback ──────────────────────────────────────────
+    if not raw_alpaca:
+        try:
+            import yfinance as yf
+            source_used = "yfinance"
+            for ticker in tickers:
+                try:
+                    news = yf.Ticker(ticker).news or []
+                    for item in news[:max_articles_per_ticker]:
+                        title   = item.get("title", "").strip()
+                        summary = item.get("summary", "").strip()
+                        source  = item.get("source", "")
+                        ts      = item.get("providerPublishTime")
 
-        except Exception as exc:
-            logger.warning("[Sentiment] News fetch failed for %s: %s", ticker, exc)
+                        if not title:
+                            continue
+                        if not _is_important(title, summary):
+                            filtered_out += 1
+                            continue
+
+                        published = None
+                        if ts:
+                            try:
+                                published = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                            except (ValueError, TypeError, OSError):
+                                pass
+
+                        articles.append(ScoredArticle(
+                            ticker=ticker, title=title, summary=summary,
+                            source=source, published_at=published,
+                        ))
+                except Exception as exc:
+                    logger.warning("[Sentiment] yfinance news failed for %s: %s", ticker, exc)
+        except ImportError:
+            logger.warning("[Sentiment] yfinance not installed and Alpaca fetch failed")
 
     logger.info(
-        "[Sentiment] Fetched %d articles for %d tickers (%d dropped by keyword filter)",
-        len(articles), len(tickers), filtered_out,
+        "[Sentiment] Fetched %d articles for %d tickers via %s (%d dropped by keyword filter)",
+        len(articles), len(tickers), source_used, filtered_out,
     )
     return articles
 
