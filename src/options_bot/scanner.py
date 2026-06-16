@@ -116,6 +116,10 @@ class BullishScanner:
             self._cache[ticker] = (now, result)
         return result
 
+    def compute(self, ticker: str) -> "Optional[TechnicalScore]":
+        """Public wrapper — returns full TechnicalScore or None."""
+        return self.score(ticker)
+
     def is_entry_allowed(self, ticker: str) -> bool:
         """
         Returns True if the technical score allows a new short-put entry.
@@ -578,6 +582,43 @@ class TickerGate:
             len(allowed), len(tickers)
         )
         return allowed
+
+    def filter_ranked(
+        self,
+        tickers: list[str],
+        top_n: int = 10,
+    ) -> list[str]:
+        """
+        Score all tickers, return top_n sorted by technical score (desc).
+        Piotroski is still a hard gate. Chain fetching only runs on winners.
+        Logs: 'Shortlist: 10/20 tickers: SPY(5.8) QQQ(5.2)...'
+        """
+        scored: list[tuple[float, str]] = []
+        for t in tickers:
+            fund_ok = (not self.require_piotroski) or self.piotroski.is_entry_allowed(t)
+            if not fund_ok:
+                logger.info("[TickerGate] %s blocked: weak fundamentals", t)
+                continue
+            ts = self.scanner.compute(t) if self.require_bullish else None
+            if ts is None:
+                scored.append((0.0, t))
+                continue
+            if not ts.is_bullish:
+                logger.info(
+                    "[TickerGate] %s blocked: bearish technicals (score=%.1f)", t, ts.score
+                )
+                continue
+            scored.append((ts.score, t))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        shortlist = [t for _, t in scored[:top_n]]
+
+        logger.info(
+            "[TickerGate] Shortlist: %d/%d tickers (top %d by score): %s",
+            len(shortlist), len(tickers), top_n,
+            ", ".join(f"{t}({s:.1f})" for s, t in scored[:top_n]),
+        )
+        return shortlist
 
     def check_strike(
         self,
