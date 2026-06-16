@@ -131,6 +131,12 @@ class ZeroDTEConfig:
     # --- Monitor ---
     monitor_poll_seconds: int = 15
 
+    # --- VWAP stretch signal ---
+    vwap_stretch_threshold: float = 0.003   # 0.3%: price must be this far from VWAP to qualify
+    vwap_reclaim_threshold: float = 0.0021  # 0.21%: how close price must return to VWAP to confirm reclaim
+    vwap_require_reclaim: bool = False       # If True, only enter after a partial VWAP reclaim is detected
+    vwap_cooldown_seconds: int = 120         # Min seconds between VWAP stretch signals
+
     # --- Misc ---
     discord_webhook_url: str = ""
     paper: bool = True
@@ -800,6 +806,197 @@ def _expected_move_pct(spy_price: float, vix: float, hours: float = 2.0) -> floa
 # Main Strategy Class
 # ---------------------------------------------------------------------------
 
+class VWAPStretchFilter:
+    """
+    Intraday VWAP stretch/reclaim signal filter for 0DTE entries.
+
+    Computes a running VWAP from today's 1-minute SPY bars (fetched from
+    Alpaca) and detects whether price has stretched ≥ vwap_stretch_threshold
+    away from VWAP in a direction that aligns with the GEX-selected spread.
+
+    Optionally confirms a partial reclaim toward VWAP (the classic
+    "stretch and snap" entry pattern from vwap-reclaim strategy).
+
+    Fail-open: if Alpaca bar data is unavailable the filter returns
+    confirmed=True so the GEX+credit gates still control the trade.
+
+    Direction alignment:
+        BULLISH / NEUTRAL_BULL  →  price must be stretched *below* VWAP
+                                   (mean-reversion bounce expected)
+        BEARISH / NEUTRAL_BEAR  →  price must be stretched *above* VWAP
+                                   (mean-reversion fade expected)
+    """
+
+    def __init__(self, cfg: ZeroDTEConfig, broker: AlpacaBroker):
+        self.cfg    = cfg
+        self.broker = broker
+        self._last_signal_time: Optional[datetime] = None
+
+    def check(self, spot: float, direction: str) -> dict:
+        """
+        Returns a dict:
+            confirmed   bool   — True if entry is allowed
+            stretch_pct float  — % distance from VWAP (signed; negative = below)
+            vwap        float  — running VWAP at last bar
+            reason      str    — human-readable gate result
+        """
+        result = {
+            "confirmed": True,
+            "stretch_pct": 0.0,
+            "vwap": 0.0,
+            "reason": "vwap_data_unavailable_passthrough",
+        }
+
+        bars = self._fetch_today_bars()
+        if not bars:
+            logger.warning("[VWAPFilter] No intraday bars — filter bypassed")
+            return result
+
+        vwap = self._compute_vwap(bars)
+        if vwap <= 0:
+            logger.warning("[VWAPFilter] VWAP computed as 0 — filter bypassed")
+            return result
+
+        stretch_pct = (spot - vwap) / vwap  # positive = above VWAP, negative = below
+
+        result["vwap"]        = round(vwap, 4)
+        result["stretch_pct"] = round(stretch_pct * 100, 4)
+
+        # Determine required stretch direction for this trade
+        bullish = direction in ("BULLISH", "NEUTRAL_BULL")
+        bearish = direction in ("BEARISH", "NEUTRAL_BEAR")
+
+        threshold = self.cfg.vwap_stretch_threshold
+
+        if bullish:
+            # Need price stretched BELOW VWAP to buy put spread (mean-rev bounce)
+            if stretch_pct > -threshold:
+                result["confirmed"] = False
+                result["reason"] = (
+                    f"vwap_stretch_insufficient: spot {spot:.2f} is only "
+                    f"{stretch_pct*100:.3f}% below VWAP {vwap:.2f} "
+                    f"(need ≥ {threshold*100:.2f}% below)"
+                )
+                logger.info("[VWAPFilter] %s", result["reason"])
+                return result
+        elif bearish:
+            # Need price stretched ABOVE VWAP to sell call spread (mean-rev fade)
+            if stretch_pct < threshold:
+                result["confirmed"] = False
+                result["reason"] = (
+                    f"vwap_stretch_insufficient: spot {spot:.2f} is only "
+                    f"{stretch_pct*100:.3f}% above VWAP {vwap:.2f} "
+                    f"(need ≥ {threshold*100:.2f}% above)"
+                )
+                logger.info("[VWAPFilter] %s", result["reason"])
+                return result
+        else:
+            # Unknown direction — pass through
+            result["reason"] = f"vwap_direction_unknown({direction})_passthrough"
+            return result
+
+        # Cooldown: don't fire again within vwap_cooldown_seconds
+        now = datetime.now(tz=ET)
+        if self._last_signal_time is not None:
+            elapsed = (now - self._last_signal_time).total_seconds()
+            if elapsed < self.cfg.vwap_cooldown_seconds:
+                result["confirmed"] = False
+                result["reason"] = (
+                    f"vwap_cooldown: last signal {elapsed:.0f}s ago "
+                    f"(cooldown={self.cfg.vwap_cooldown_seconds}s)"
+                )
+                logger.info("[VWAPFilter] %s", result["reason"])
+                return result
+
+        # Optional reclaim confirmation
+        if self.cfg.vwap_require_reclaim:
+            reclaim = self._check_reclaim(bars, vwap, bullish)
+            if not reclaim:
+                result["confirmed"] = False
+                result["reason"] = "vwap_reclaim_not_detected"
+                logger.info("[VWAPFilter] Reclaim required but not detected — skip")
+                return result
+
+        self._last_signal_time = now
+        result["confirmed"] = True
+        result["reason"] = (
+            f"vwap_stretch_confirmed: {stretch_pct*100:+.3f}% from VWAP={vwap:.2f} "
+            f"direction={direction}"
+        )
+        logger.info("[VWAPFilter] %s", result["reason"])
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_today_bars(self) -> list[dict]:
+        """Fetch today's 1-minute SPY bars from Alpaca."""
+        if not _cb.is_available("alpaca_bars_vwap"):
+            return []
+        try:
+            today_str = date.today().isoformat()
+            bars = self.broker.get_bars(
+                "SPY",
+                timeframe="1Min",
+                start=today_str,
+                end=today_str,
+                limit=400,
+            )
+            _cb.record_success("alpaca_bars_vwap")
+            return bars if bars else []
+        except Exception as exc:
+            _cb.record_failure("alpaca_bars_vwap", str(exc))
+            logger.warning("[VWAPFilter] Bar fetch failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _compute_vwap(bars: list[dict]) -> float:
+        """
+        Running VWAP = cumsum(typical_price * volume) / cumsum(volume).
+        Typical price = (high + low + close) / 3.
+        Returns the VWAP at the most recent bar.
+        """
+        cum_tpv = 0.0
+        cum_vol = 0.0
+        for bar in bars:
+            try:
+                h = float(bar.get("h") or bar.get("high")  or 0)
+                l = float(bar.get("l") or bar.get("low")   or 0)
+                c = float(bar.get("c") or bar.get("close") or 0)
+                v = float(bar.get("v") or bar.get("volume") or 0)
+            except (TypeError, ValueError):
+                continue
+            if v <= 0:
+                continue
+            tp = (h + l + c) / 3.0
+            cum_tpv += tp * v
+            cum_vol  += v
+        return cum_tpv / cum_vol if cum_vol > 0 else 0.0
+
+    def _check_reclaim(self, bars: list[dict], vwap: float, bullish: bool) -> bool:
+        """
+        Detect if the most recent bars show a partial reclaim toward VWAP.
+        Looks at the last 3 bars (≈3 minutes) for the reclaim move.
+        """
+        reclaim_threshold = self.cfg.vwap_reclaim_threshold
+        recent = bars[-3:] if len(bars) >= 3 else bars
+        for bar in recent:
+            try:
+                c = float(bar.get("c") or bar.get("close") or 0)
+            except (TypeError, ValueError):
+                continue
+            if bullish:
+                # Price was below VWAP; reclaim = price moved back within threshold
+                if c >= vwap * (1.0 - reclaim_threshold):
+                    return True
+            else:
+                # Price was above VWAP; reclaim = price moved back within threshold
+                if c <= vwap * (1.0 + reclaim_threshold):
+                    return True
+        return False
+
+
 class ZeroDTEStrategy:
     """
     Orchestrates all 0DTE entry logic and returns an ApprovedOrder.
@@ -812,12 +1009,13 @@ class ZeroDTEStrategy:
         self.cfg      = cfg
         self.broker   = broker
         self.db       = db
-        self.calendar = EventCalendar()
-        self.session  = SessionClassifier()
-        self.gex      = GEXEngine(broker, cfg)
-        self.sizer    = KellySizer(cfg, db)
-        self.slippage = SlippageGuard(cfg)
-        self.gamma_adj = GammaAdjuster()
+        self.calendar    = EventCalendar()
+        self.session     = SessionClassifier()
+        self.gex         = GEXEngine(broker, cfg)
+        self.sizer       = KellySizer(cfg, db)
+        self.slippage    = SlippageGuard(cfg)
+        self.gamma_adj   = GammaAdjuster()
+        self.vwap_filter = VWAPStretchFilter(cfg, broker)
 
     def evaluate(self) -> Optional[ApprovedOrder]:
         """
@@ -898,6 +1096,19 @@ class ZeroDTEStrategy:
         if strikes is None:
             logger.info("[0DTE] No valid strike selection from GEX pin — skip")
             return None
+
+        # 5b. VWAP stretch confirmation
+        # Ensures price has actually stretched away from intraday VWAP in a
+        # direction consistent with the spread before committing to quotes/sizing.
+        # Fail-open: if Alpaca bars are unavailable the filter passes through.
+        vwap_check = self.vwap_filter.check(spy_price, strikes["direction"])
+        if not vwap_check["confirmed"]:
+            logger.info("[0DTE] VWAP filter blocked: %s", vwap_check["reason"])
+            return None
+        logger.info(
+            "[0DTE] VWAP filter passed: stretch=%.3f%% vwap=%.4f",
+            vwap_check["stretch_pct"], vwap_check["vwap"],
+        )
 
         # 6. Fetch option quotes for the selected strikes
         today_str    = today.strftime("%y%m%d")
@@ -1028,7 +1239,9 @@ class ZeroDTEStrategy:
                 "direction":    strikes["direction"],
                 "gap_pct":      gap_pct,
                 "consec_down":  consec_down,
-                "exp_move_pct": round(exp_move * 100, 3),
+                "exp_move_pct":   round(exp_move * 100, 3),
+                "vwap":           vwap_check["vwap"],
+                "vwap_stretch_pct": vwap_check["stretch_pct"],
             },
         )
 
