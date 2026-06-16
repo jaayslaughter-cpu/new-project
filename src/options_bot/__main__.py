@@ -74,6 +74,90 @@ def _start_boot_health(port: int = 8080) -> None:
 _start_boot_health(int(os.getenv("HEALTH_PORT", "8080")))
 
 
+def _live_preflight(config) -> None:
+    """
+    Interactive pre-flight checklist for live (real money) trading.
+
+    Runs once at process startup when ALPACA_PAPER=false or --live is passed.
+    Prints a mandatory checklist, requires the operator to confirm each item,
+    then demands they type a specific phrase before the bot is allowed to start.
+
+    If any step fails or the user does not confirm, the process exits immediately.
+    This is intentionally verbose — a moment of friction that prevents accidental
+    live launches.
+    """
+    import sys
+
+    CONFIRM_PHRASE = "I understand this is real money"
+
+    checks = [
+        ("ALPACA_PAPER env var is set to 'false'",
+         lambda: os.getenv("ALPACA_PAPER", "true").lower() == "false"),
+        ("ALPACA_API_KEY is set",
+         lambda: bool(os.getenv("ALPACA_API_KEY", ""))),
+        ("ALPACA_SECRET_KEY is set",
+         lambda: bool(os.getenv("ALPACA_SECRET_KEY", ""))),
+        ("Risk budget is 2% or less per trade",
+         lambda: config.risk_config.risk_budget_pct <= 0.02),
+        ("Max daily loss is 5% or less",
+         lambda: config.risk_config.max_daily_loss_pct <= 0.05),
+        ("Max contracts is 10 or less",
+         lambda: config.risk_config.max_contracts <= 10),
+        ("Discord webhook is set (for trade alerts)",
+         lambda: bool(config.discord_webhook_url)),
+    ]
+
+    print()
+    print("=" * 60)
+    print("  LIVE TRADING PRE-FLIGHT CHECKLIST")
+    print("  Real money will be at risk. Read every item carefully.")
+    print("=" * 60)
+    print()
+
+    all_pass = True
+    for label, check_fn in checks:
+        try:
+            passed = check_fn()
+        except Exception:
+            passed = False
+        status = "OK " if passed else "FAIL"
+        print(f"  [{status}] {label}")
+        if not passed:
+            all_pass = False
+
+    print()
+
+    if not all_pass:
+        print("ERROR: One or more pre-flight checks failed.")
+        print("Fix the issues above before switching to live trading.")
+        print()
+        sys.exit(1)
+
+    print("All checks passed.")
+    print()
+    print(f'Type exactly: {CONFIRM_PHRASE!r}')
+    print("(or press Ctrl-C to abort)")
+    print()
+
+    try:
+        response = input("Confirmation: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        print("Aborted.")
+        sys.exit(0)
+
+    if response != CONFIRM_PHRASE:
+        print()
+        print(f"Incorrect confirmation. Expected: {CONFIRM_PHRASE!r}")
+        print("Bot NOT started.")
+        sys.exit(1)
+
+    print()
+    print("Confirmation accepted. Starting LIVE trading bot...")
+    print("=" * 60)
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Options Bot — automated options trading via Alpaca",
@@ -220,6 +304,14 @@ def main() -> None:
     except Exception:
         scan_et = "?"
     print(f"  Scan:     {scan_pt} PT = {scan_et} ET daily")
+
+    # ── Live trading pre-flight ───────────────────────────────────────────────
+    # When ALPACA_PAPER=false (or --live flag), run an interactive checklist
+    # before constructing the Orchestrator. Aborts the process if any check
+    # fails or the user does not type the confirmation phrase.
+    if not paper:
+        _live_preflight(config)
+    # ─────────────────────────────────────────────────────────────────────────
 
     orch = Orchestrator(config)
 
