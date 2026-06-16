@@ -146,6 +146,7 @@ class RegimeDetector:
         yield_slope    = self._fetch_yield_curve_slope()
         hurst_val      = self._compute_hurst()
         vix_pct        = self._compute_vix_percentile(vix_level)
+        vix_term       = self._fetch_vix_term_structure()
 
         # AUDIT FIX: Real market breadth from 100-name constituent universe
         # Replaces: (1) SPY up/down day proxy (mislabeled as breadth)
@@ -163,6 +164,8 @@ class RegimeDetector:
             "hurst":              round(hurst_val,       4) if hurst_val      is not None else 0.5,
             "hurst_regime":       hurst_classify(hurst_val) if hurst_val is not None else "random_walk",
             "vix_percentile":     round(vix_pct,         1) if vix_pct        is not None else 50.0,
+            "vix_term_structure": vix_term.get("state", "unknown"),
+            "vix_term_ratio":     vix_term.get("ratio", 1.0),
             # Real breadth metrics (direct arithmetic, labeled)
             "breadth_composite":  round(breadth_data.get("composite_breadth", 0.5), 4),
             "pct_above_20ma":     round(breadth_data.get("pct_above_20ma",    0.5), 4),
@@ -259,6 +262,59 @@ class RegimeDetector:
             _cb.record_failure(src3, str(exc))
             logger.warning("[RegimeDetector] All 3 VIX sources failed: %s", exc)
         return None
+
+    def _fetch_vix_term_structure(self) -> dict:
+        """
+        Fetch VIX term structure using ^VIX (30-day) and ^VXV (3-month) as proxies.
+        Adapted from trading-main/src/options/vix_monitor.py.
+
+        Contango  (VXV > VIX, slope > 0): Normal market — IV expected to decay.
+                  Theta works in our favor. Mild boost to mean_reverting score.
+        Backwardation (VXV < VIX, slope < 0): Fear mode — volatility spike expected.
+                  Penalises mean_reverting, boosts high_volatility.
+
+        VXV/VIX ratio interpretation:
+          > 1.05  strong contango   (very favorable for short premium)
+          > 1.00  mild contango     (neutral-to-favorable)
+          < 1.00  backwardation     (caution — reduce size or skip)
+          < 0.95  strong backwardation (high_volatility regime signal)
+
+        Returns dict with keys: state, vix30, vxv3m, slope, ratio.
+        Non-fatal — returns {"state": "unknown"} on any failure.
+        """
+        cb_key = "vxv_term_structure"
+        if not _cb.is_available(cb_key):
+            return {"state": "unknown"}
+        try:
+            import yfinance as yf
+            vix_ticker = yf.Ticker("^VIX")
+            vxv_ticker = yf.Ticker("^VXV")
+            vix_data = vix_ticker.history(period="2d")
+            vxv_data = vxv_ticker.history(period="2d")
+            if vix_data.empty or vxv_data.empty:
+                _cb.record_failure(cb_key, "empty data")
+                return {"state": "unknown"}
+            vix30 = float(vix_data["Close"].iloc[-1])
+            vxv3m = float(vxv_data["Close"].iloc[-1])
+            slope = vxv3m - vix30
+            ratio = vxv3m / vix30 if vix30 > 0 else 1.0
+            if ratio > 1.0:
+                state = "contango"
+            elif ratio < 1.0:
+                state = "backwardation"
+            else:
+                state = "flat"
+            _cb.record_success(cb_key)
+            logger.debug(
+                "[RegimeDetector] VIX term structure: %s (VIX=%.1f VXV=%.1f ratio=%.3f)",
+                state.upper(), vix30, vxv3m, ratio,
+            )
+            return {"state": state, "vix30": vix30, "vxv3m": vxv3m,
+                    "slope": round(slope, 2), "ratio": round(ratio, 4)}
+        except Exception as exc:
+            _cb.record_failure(cb_key, str(exc))
+            logger.debug("[RegimeDetector] VIX term structure fetch failed: %s", exc)
+            return {"state": "unknown"}
 
     def _compute_vix_trend(self) -> Optional[str]:
         """
@@ -560,7 +616,26 @@ class RegimeDetector:
         if slope < 0:         scores["high_volatility"] += 0.15
         elif slope > 1.0:     scores["trending"]         += 0.05
 
-        # VIX percentile — 6th signal (where VIX sits in its own history)
+        # VIX term structure — 6th signal (adapted from trading-main VIXMonitor)
+        # Contango (VXV > VIX): IV term premium is normal — theta decay works.
+        # Backwardation (VXV < VIX): near-term fear spike — don't sell premium.
+        vix_term_state = indicators.get("vix_term_structure", "unknown")
+        vix_term_ratio = indicators.get("vix_term_ratio", 1.0)
+        if vix_term_state == "backwardation":
+            # Strong backwardation = high_vol signal; penalise mean_reverting
+            if vix_term_ratio < 0.95:
+                scores["high_volatility"] += 0.25   # Strong backwardation
+                scores["mean_reverting"]  -= 0.15   # Not safe to sell premium
+            else:
+                scores["high_volatility"] += 0.10   # Mild backwardation
+        elif vix_term_state == "contango":
+            # Contango = normal environment, mild mean-reverting boost
+            if vix_term_ratio > 1.05:
+                scores["mean_reverting"]  += 0.10   # Strong contango
+            else:
+                scores["mean_reverting"]  += 0.05   # Mild contango
+
+        # VIX percentile — 7th signal (where VIX sits in its own history)
         # High percentile = historically elevated vol = ideal for short premium
         # Low percentile = historically suppressed vol = avoid selling premium
         if vix_pct >= 80:
