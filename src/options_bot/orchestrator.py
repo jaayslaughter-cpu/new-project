@@ -127,7 +127,7 @@ class OrchestratorConfig:
     adaptive_tune_interval: int = 10  # min closed trades between tune cycles
 
     # --- 0DTE module ---
-    zero_dte_enabled: bool = False           # enable intraday 0DTE GEX scalper
+    zero_dte_enabled: bool = True            # enable intraday 0DTE GEX scalper
     zero_dte_config: ZeroDTEConfig = field(default_factory=ZeroDTEConfig)
 
     # --- Risk profile ---
