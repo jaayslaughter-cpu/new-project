@@ -69,9 +69,9 @@ def get_risk_free_rate() -> float:
     """
     Fetches the current 3-month US Treasury yield as the risk-free rate.
 
-    Caches the result for 24 hours. Falls back to FALLBACK_RISK_FREE_RATE
-    (env var, default 4.5%) if the request fails — but logs a warning so
-    you know it's using the fallback.
+    Caches the result for 24 hours. On failure, caches the fallback rate
+    for 1 hour so subsequent calls in the same scan return immediately
+    without hitting the network again (prevents 300+ timeout retries per scan).
 
     Returns
     -------
@@ -81,40 +81,41 @@ def get_risk_free_rate() -> float:
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m")
     cache_key = today
 
+    # Check cache — includes fallback entries (TTL 1hr) to prevent retry storms
     if cache_key in _RATE_CACHE:
         rate, fetched_at = _RATE_CACHE[cache_key]
-        if time.time() - fetched_at < _RATE_CACHE_TTL:
-            logger.debug("[RateCache] Using cached rate %.4f", rate)
+        age = time.time() - fetched_at
+        ttl = 3_600 if rate == _FALLBACK_RATE else _RATE_CACHE_TTL
+        if age < ttl:
+            logger.debug("[RateCache] Using cached rate %.4f (age=%ds)", rate, int(age))
             return rate
 
     try:
-        import urllib.request
+        import urllib.request as _ur
         url = _TREASURY_URL + today.replace("-", "")
-        req = urllib.request.Request(url, headers={"User-Agent": "options-bot/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        req = _ur.Request(url, headers={"User-Agent": "options-bot/1.0"})
+        with _ur.urlopen(req, timeout=5) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
-        # Parse 3-month rate from Treasury HTML table
-        # The table contains rows like: <td>4.32</td>
         import re
-        # Find the 3-month column value — it appears after "3 Mo" in the table
         matches = re.findall(r"3 Mo</th>.*?<td[^>]*>([\d.]+)</td>", html, re.DOTALL)
         if not matches:
-            # Try alternate format
             matches = re.findall(r"<td[^>]*>([\d.]+)</td>", html)
 
         if matches:
-            rate = float(matches[0]) / 100.0  # convert percent to decimal
+            rate = float(matches[0]) / 100.0
             _RATE_CACHE[cache_key] = (rate, time.time())
             logger.info("[RateFetcher] Treasury 3-month rate: %.4f (%.2f%%)", rate, rate * 100)
             return rate
         else:
-            raise ValueError("Could not parse rate from Treasury HTML")
+            raise ValueError("Could not parse 3-month rate from Treasury HTML")
 
     except Exception as exc:
+        # Cache the fallback for 1 hour so we don't retry on every options row
+        _RATE_CACHE[cache_key] = (_FALLBACK_RATE, time.time())
         logger.warning(
-            "[RateFetcher] Failed to fetch Treasury rate: %s — using fallback %.4f",
-            exc, _FALLBACK_RATE
+            "[RateFetcher] Treasury fetch failed — using fallback %.4f for 1hr: %s",
+            _FALLBACK_RATE, exc,
         )
         return _FALLBACK_RATE
 
