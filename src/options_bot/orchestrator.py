@@ -1963,17 +1963,70 @@ class Orchestrator:
     def _check_options_approved(self) -> None:
         """
         Verify options trading is enabled on the Alpaca account.
-        Alpaca requires options_approved_level >= 1 to trade options.
-        Raises PipelineConnectionError with a clear message if not approved.
+
+        Alpaca requires options_approved_level >= 1 for simple options and
+        >= 2 for spreads. This check runs at Orchestrator.__init__() so the
+        bot fails fast at startup rather than silently at order time.
+
+        Paper accounts always pass — Alpaca paper trading auto-enables options.
+        Live accounts must have applied for options approval in the Alpaca dashboard
+        at https://app.alpaca.markets → Account → Options Trading.
         """
+        # PaperBroker stub has no account info — skip
+        if isinstance(self.broker, PaperBroker):
+            return
+
         try:
             account = self.broker.get_account()
-            # PaperBroker doesn't have this field — skip check
-            if isinstance(self.broker, PaperBroker):
-                return
-        except Exception:
-            logger.warning("[Orchestrator] Could not verify options approval — proceeding")
+        except Exception as exc:
+            logger.warning(
+                "[Orchestrator] Could not verify options approval (%s) — proceeding. "
+                "Ensure options trading is enabled in your Alpaca account dashboard "
+                "before going live.", exc
+            )
             return
+
+        # Paper Alpaca accounts return is_paper=True — options always enabled
+        if getattr(self.broker, '_paper', True):
+            return
+
+        # For live accounts, check the options approval level
+        # Alpaca returns this as account.options_approved_level (int 0-4)
+        # 0 = not approved, 1 = covered calls/cash-secured puts, 2 = spreads
+        level = None
+        if hasattr(account, 'options_approved_level'):
+            level = account.options_approved_level
+        elif isinstance(account, dict):
+            level = account.get('options_approved_level')
+
+        if level is None:
+            logger.warning(
+                "[Orchestrator] options_approved_level not found in account data — "
+                "verify options trading is enabled at app.alpaca.markets before going live."
+            )
+            return
+
+        try:
+            level = int(level)
+        except (TypeError, ValueError):
+            logger.warning("[Orchestrator] Could not parse options_approved_level=%r", level)
+            return
+
+        strategy = self.config.strategy_name
+        # Spreads require level 2; CSP/covered calls require level 1
+        requires_level = 2 if strategy in ("short_put_spread", "short_strangle") else 1
+
+        if level < requires_level:
+            raise PipelineConnectionError(
+                f"Options trading approval insufficient for strategy '{strategy}'. "
+                f"Account options_approved_level={level}, need >={requires_level}. "
+                f"Apply for options approval at: https://app.alpaca.markets → Account → Options Trading"
+            )
+
+        logger.info(
+            "[Orchestrator] Options approval verified: level=%d (strategy=%s requires>=%d)",
+            level, strategy, requires_level
+        )
 
     def _safe_get_equity(self) -> float:
         """
