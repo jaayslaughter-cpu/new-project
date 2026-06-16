@@ -1347,14 +1347,21 @@ class Orchestrator:
             self.config.scan_hour, self.config.scan_minute,
             et_scan, self.config.scan_minute,
             self.config.monitor_interval_minutes,
-            self.config.close_hour, self.config.scan_minute,
-            et_eod, self.config.scan_minute,
+            self.config.close_hour, self.config.close_minute,
+            et_eod, self.config.close_minute,
         )
         send_discord(
             self.config.discord_webhook_url,
             f"🟢 **Options Bot started** — {self.config.strategy_name.upper()} "
             f"{'[PAPER]' if self.config.paper else '[LIVE]'}\n"
-            f"Tickers: {', '.join(self.config.tickers)}"
+            f"Tickers ({len(self.config.tickers)}): {', '.join(self.config.tickers)}\n"
+            f"Scan: {self.config.scan_hour:02d}:{self.config.scan_minute:02d} PT "
+            f"({et_scan:02d}:{self.config.scan_minute:02d} ET) daily\n"
+            f"EOD:  {self.config.close_hour:02d}:{self.config.close_minute:02d} PT "
+            f"({et_eod:02d}:{self.config.close_minute:02d} ET) daily\n"
+            f"Risk: {self.config.risk_config.risk_budget_pct:.1%}/trade | "
+            f"Max {self.config.risk_config.max_trades_per_day} trades/day | "
+            f"Halt at -{self.config.risk_config.max_daily_loss_pct:.0%} daily loss"
         )
 
         try:
