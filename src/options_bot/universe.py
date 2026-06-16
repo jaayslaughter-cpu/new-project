@@ -96,7 +96,7 @@ _FALLBACK_UNIVERSE = [
     "PANW","TTD","ZS","WDAY","OKTA","COIN","HOOD","RBLX","DKNG","RIVN",
     "LYFT","DASH","SHOP","SQ","ROKU","SPOT","PINS","SNAP","ARM",
     # Liquid ETFs (most optionable)
-    "SPY","QQQ","IWM","GLD","SLV","TLT","XLF","XLK","XLE","XLV","XLI",
+    "SPY","QQQ","IWM","DIA","MDY","GLD","SLV","TLT","XLF","XLK","XLE","XLV","XLI",
     "XLC","XLY","XLP","XLRE","XLU","XLB","SMH","ARKK","EEM","HYG","LQD",
 ]
 
