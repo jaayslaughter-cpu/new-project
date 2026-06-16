@@ -40,6 +40,8 @@ from .sec_signals import score_sec_signals, is_entry_confirmed
 
 logger = logging.getLogger(__name__)
 
+from .trendlines import analyze_trendlines, TrendlineResult
+
 # Cache TTLs
 _TECH_TTL_SECONDS   = 30 * 60      # 30 minutes
 _FUND_TTL_SECONDS   = 7 * 24 * 3600  # 7 days
@@ -52,13 +54,15 @@ _FUND_TTL_SECONDS   = 7 * 24 * 3600  # 7 days
 @dataclass
 class TechnicalScore:
     ticker:        str
-    score:         float          # 0.0 – 5.5 (higher = more bullish)
+    score:         float          # 0.0 – 7.0 (higher = more bullish; trendlines add up to 1.5)
     sma_score:     float          # 0–2: above SMA20 (+1), above SMA50 (+1)
     rsi_score:     float          # 0–1: RSI 50–70 (+1), 30–50 (+0.5)
     macd_score:    float          # 0–1.8: above signal (+1.0), histogram rising (+0.5), normalised magnitude (+0.3 max)
-    adx_score:     float          # 0–1.5: ADX>25 with +DI>-DI (+1.5)
+    adx_score:        float          # 0–1.5: ADX>25 with +DI>-DI (+1.5)
+    trendline_score:  float = 0.0   # 0–1.5: bullish pattern near support/breakout
     rsi:           Optional[float] = None
     adx:           Optional[float] = None
+    trendline:     Optional[TrendlineResult] = None
     is_bullish:    bool = False   # score >= threshold
     computed_at:   datetime = None
 
@@ -274,7 +278,27 @@ class BullishScanner:
             except Exception:
                 pass
 
-            total = sma_score + rsi_score + macd_score + adx_score
+            # Trendline analysis — uses same OHLCV bars already in memory
+            # Pure Python OLS on swing highs/lows — adds 0-1.5 to total score
+            tl_result = None
+            trendline_score = 0.0
+            try:
+                ohlcv = [
+                    {"high": float(high[i]), "low": float(low[i]),
+                     "close": float(close[i])}
+                    for i in range(len(close))
+                ]
+                tl_result = analyze_trendlines(ohlcv)
+                if tl_result is not None:
+                    trendline_score = tl_result.trendline_score
+                    logger.debug(
+                        "[BullishScanner] %s trendline: %s (score=%.1f)",
+                        ticker, tl_result.summary, trendline_score,
+                    )
+            except Exception as exc:
+                logger.debug("[BullishScanner] %s trendline failed: %s", ticker, exc)
+
+            total = sma_score + rsi_score + macd_score + adx_score + trendline_score
 
             return TechnicalScore(
                 ticker=ticker,
@@ -283,8 +307,10 @@ class BullishScanner:
                 rsi_score=rsi_score,
                 macd_score=macd_score,
                 adx_score=adx_score,
+                trendline_score=trendline_score,
                 rsi=round(rsi, 1),
                 adx=round(adx, 1) if adx is not None else None,
+                trendline=tl_result,
                 is_bullish=total >= self.threshold,
             )
 
