@@ -121,6 +121,11 @@ def main() -> None:
         help="Paper trading mode (default)",
     )
     parser.add_argument(
+        "--no-zero-dte", action="store_true", default=False,
+        dest="no_zero_dte",
+        help="Disable 0DTE intraday module (enabled by default)",
+    )
+    parser.add_argument(
         "--live", action="store_true",
         help="Live trading mode (overrides --paper)",
     )
@@ -175,6 +180,7 @@ def main() -> None:
         scan_minute=scan_m,
         max_positions_total=args.max_positions,
         paper=paper,
+        zero_dte_enabled=not args.no_zero_dte,
     )
 
     if args.dry_run:
