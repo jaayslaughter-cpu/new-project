@@ -80,7 +80,11 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--tickers", nargs="+", default=["SPY", "QQQ", "IWM"],
+        "--tickers", nargs="+", default=[
+            "SPY", "QQQ", "IWM", "DIA", "MDY",
+            "XLF", "XLK", "XLE", "XLV", "XLI", "XLC", "XLY", "XLP", "XLB", "XLRE",
+            "GLD", "TLT", "EEM", "HYG", "SMH",
+        ],
         help="Tickers to scan",
     )
     parser.add_argument(
