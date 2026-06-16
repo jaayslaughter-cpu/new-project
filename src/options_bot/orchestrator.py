@@ -85,7 +85,17 @@ class OrchestratorConfig:
     Override any field to customise the session.
     """
     # --- Tickers to scan ---
-    tickers: list[str] = field(default_factory=lambda: ["SPY", "QQQ", "IWM"])
+    # Full 20-ticker universe: index ETFs, sector ETFs, volatility-sensitive ETFs.
+    # All have liquid options markets on Alpaca. The bot ranks and filters daily
+    # and trades only the top candidates that pass all signal gates.
+    tickers: list[str] = field(default_factory=lambda: [
+        # Index ETFs (core)
+        "SPY", "QQQ", "IWM", "DIA", "MDY",
+        # Sector ETFs
+        "XLF", "XLK", "XLE", "XLV", "XLI", "XLC", "XLY", "XLP", "XLB", "XLRE",
+        # Volatility-sensitive
+        "GLD", "TLT", "EEM", "HYG", "SMH",
+    ])
 
     # --- Strategy ---
     strategy_name: str = "short_put_spread"   # csp | short_put_spread | short_strangle
