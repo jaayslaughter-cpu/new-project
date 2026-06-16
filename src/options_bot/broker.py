@@ -74,6 +74,7 @@ class AlpacaBroker:
         try:
             from alpaca.trading.client import TradingClient
             from alpaca.data.historical.option import OptionHistoricalDataClient
+            from alpaca.data.historical.stock import StockHistoricalDataClient
         except ImportError:
             raise PipelineConnectionError(
                 "alpaca-py not installed. Run: pip install alpaca-py"
@@ -96,6 +97,9 @@ class AlpacaBroker:
             api_key=resolved_key, secret_key=resolved_secret, paper=paper
         )
         self._data = OptionHistoricalDataClient(
+            api_key=resolved_key, secret_key=resolved_secret
+        )
+        self._stock_data = StockHistoricalDataClient(
             api_key=resolved_key, secret_key=resolved_secret
         )
 
@@ -513,6 +517,97 @@ class AlpacaBroker:
                 f"GET /v1beta1/options/quotes/latest failed: {exc}"
             ) from exc
 
+    def get_bars(
+        self,
+        symbol: str,
+        timeframe: str = "1Min",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        limit: int = 400,
+    ) -> list[dict]:
+        """
+        Fetch historical bars for a stock/ETF symbol via Alpaca's Stock Data API.
+
+        Used by VWAPStretchFilter to compute intraday VWAP from 1-minute SPY bars.
+
+        Parameters
+        ----------
+        symbol    : Ticker symbol (e.g. "SPY")
+        timeframe : Alpaca timeframe string — "1Min", "5Min", "1Hour", "1Day"
+        start     : ISO date string "YYYY-MM-DD" (defaults to today)
+        end       : ISO date string "YYYY-MM-DD" (defaults to today)
+        limit     : Max number of bars to return
+
+        Returns
+        -------
+        list of dicts with keys: t, o, h, l, c, v, vw
+          t  = timestamp (str)
+          o  = open
+          h  = high
+          l  = low
+          c  = close
+          v  = volume
+          vw = vwap (volume-weighted price for the bar)
+        """
+        try:
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        except ImportError:
+            raise PipelineConnectionError(
+                "alpaca-py not installed or outdated. Run: pip install alpaca-py>=0.26.0"
+            )
+
+        # Parse timeframe string into alpaca TimeFrame object
+        _tf_map = {
+            "1Min":  TimeFrame(1, TimeFrameUnit.Minute),
+            "5Min":  TimeFrame(5, TimeFrameUnit.Minute),
+            "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+            "1Hour": TimeFrame(1, TimeFrameUnit.Hour),
+            "1Day":  TimeFrame(1, TimeFrameUnit.Day),
+        }
+        tf = _tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Minute))
+
+        from datetime import date as _date, datetime as _datetime
+        today = _date.today().isoformat()
+        start_dt = start or today
+        end_dt   = end   or today
+
+        # Alpaca requires datetime objects with timezone for intraday requests
+        # Use market open (09:30 ET) to market close (16:00 ET) window
+        import pytz as _pytz
+        et = _pytz.timezone("US/Eastern")
+        start_aware = et.localize(_datetime.fromisoformat(f"{start_dt}T09:30:00"))
+        end_aware   = et.localize(_datetime.fromisoformat(f"{end_dt}T16:00:00"))
+
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                start=start_aware,
+                end=end_aware,
+                limit=limit,
+                feed="iex",  # IEX feed — free tier; switch to "sip" for paid data
+            )
+            resp = self._stock_data.get_stock_bars(req)
+            bars_obj = resp.data.get(symbol, [])
+            result = []
+            for bar in bars_obj:
+                result.append({
+                    "t":  str(bar.timestamp),
+                    "o":  float(bar.open),
+                    "h":  float(bar.high),
+                    "l":  float(bar.low),
+                    "c":  float(bar.close),
+                    "v":  float(bar.volume),
+                    "vw": float(bar.vwap) if bar.vwap is not None else float(bar.close),
+                })
+            logger.debug("[AlpacaBroker] get_bars(%s, %s): %d bars", symbol, timeframe, len(result))
+            return result
+        except Exception as exc:
+            raise PipelineConnectionError(
+                f"get_bars({symbol}, {timeframe}) failed: {exc}"
+            ) from exc
+
 
 # ---------------------------------------------------------------------------
 # Paper broker — same interface, no network
@@ -619,6 +714,17 @@ class PaperBroker:
     def get_latest_quotes(self, symbols: list[str]) -> dict:
         return {s: {"bid": None, "ask": None, "bid_size": None,
                     "ask_size": None, "timestamp": None} for s in symbols}
+
+    def get_bars(
+        self,
+        symbol: str,
+        timeframe: str = "1Min",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        limit: int = 400,
+    ) -> list[dict]:
+        """PaperBroker stub — returns empty list; VWAPStretchFilter will bypass gracefully."""
+        return []
 
 
 # ---------------------------------------------------------------------------
