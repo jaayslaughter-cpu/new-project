@@ -71,6 +71,7 @@ from .spread_math import (
 from .greeks import probability_of_profit, pop_spread, get_risk_free_rate
 from .earnings_calendar import EarningsFilter
 from .volume_profile import check_strike_safety, volume_profile_cache
+from .gex_analysis import analyze_gex, check_strike_gex_safety
 
 _earnings_filter = EarningsFilter(days_before=5, days_after=2)
 
@@ -267,6 +268,47 @@ class BaseStrategy(ABC):
             raise
         except Exception as exc:
             logger.debug("[%s] VP check skipped (data unavailable): %s", self.name, exc)
+
+    def _check_gex(
+        self,
+        enriched: list,
+        short_strike: float,
+        spot: float,
+        expiry,
+        dte: int,
+        atm_iv: float = 0.20,
+        min_distance_pct: float = 1.5,
+    ) -> None:
+        """
+        GEX strike safety check — raises LiquidityFilterError if the short
+        strike is too close to the put wall or above the pin strike.
+        Non-fatal if GEX data is unavailable.
+        """
+        try:
+            underlying = enriched[0].underlying if enriched else "unknown"
+            analysis = analyze_gex(
+                ticker=underlying,
+                enriched_rows=enriched,
+                expiry=expiry,
+                spot=spot,
+                dte_days=dte,
+                atm_iv=atm_iv,
+            )
+            safe, reason = check_strike_gex_safety(
+                analysis=analysis,
+                short_strike=short_strike,
+                min_distance_pct=min_distance_pct,
+            )
+            if not safe:
+                raise LiquidityFilterError(
+                    underlying,
+                    f"[{self.name}] GEX REJECT: {reason}"
+                )
+            logger.debug("[%s] GEX OK: %s — %s", self.name, underlying, reason)
+        except LiquidityFilterError:
+            raise
+        except Exception as exc:
+            logger.debug("[%s] GEX check skipped (non-fatal): %s", self.name, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +597,15 @@ class ShortPutSpread(BaseStrategy):
             short_put.underlying_price,
             spread_type="bull_put",
             min_hvn_distance_pct=cfg.vp_min_hvn_distance_pct,
+        )
+        # GEX gamma wall check — don't short near the put wall or above pin
+        self._check_gex(
+            enriched=enriched,
+            short_strike=short_put.strike,
+            spot=short_put.underlying_price,
+            expiry=short_put.expiry,
+            dte=short_put.dte,
+            atm_iv=short_put.iv or 0.20,
         )
 
         # Probability of profit + probability of touch validation
