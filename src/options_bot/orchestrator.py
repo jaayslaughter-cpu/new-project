@@ -137,6 +137,7 @@ class OrchestratorConfig:
     scanner_enabled: bool = True             # enable bullish + Piotroski pre-filter
     scanner_bullish_threshold: float = 3.0  # min composite score
     scanner_piotroski_threshold: int = 6    # min F-score (0–9)
+    scanner_shortlist_top_n: int = 10       # top N by score proceed to chain fetch
 
     # --- Dynamic universe ---
     universe_enabled: bool = False           # auto-rebuild ticker list weekly
@@ -1579,9 +1580,14 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("[Orchestrator] Universe rebuild failed (using config list): %s", exc)
 
-        # Apply ticker pre-screening gate (bullish technicals + Piotroski)
+        # Score all universe tickers, take top N by composite score.
+        # Chain fetching only runs on the shortlist — avoids 20 slow yfinance
+        # options chain calls when most tickers would be rejected anyway.
         if self.ticker_gate is not None:
-            scan_tickers = self.ticker_gate.filter(scan_tickers)
+            scan_tickers = self.ticker_gate.filter_ranked(
+                scan_tickers,
+                top_n=self.config.scanner_shortlist_top_n,
+            )
             if not scan_tickers:
                 logger.info("[Orchestrator] All tickers blocked by pre-screening gate — no scan")
                 return []
