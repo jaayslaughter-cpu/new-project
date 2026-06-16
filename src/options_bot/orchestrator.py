@@ -95,6 +95,39 @@ class OrchestratorConfig:
         "XLF", "XLK", "XLE", "XLV", "XLI", "XLC", "XLY", "XLP", "XLB", "XLRE",
         # Volatility-sensitive
         "GLD", "TLT", "EEM", "HYG", "SMH",
+
+        # ── Expansion tier — uncomment when ready to grow beyond 20 ──────────
+        # Add these only if: signal frequency is too low, win rate weakens on
+        # existing tickers, or you want more granular sector/asset exposure.
+        # Verify each has active options on Alpaca before enabling.
+        #
+        # Volatility instruments
+        # "VIXY",           # ProShares VIX Short-Term Futures ETF (VIX proxy)
+        #
+        # Bonds (broader fixed income)
+        # "AGG",            # iShares Core U.S. Aggregate Bond ETF
+        # "LQD",            # iShares iBoxx Investment Grade Corporate Bond ETF
+        # "BND",            # Vanguard Total Bond Market ETF
+        #
+        # International
+        # "VEA",            # Vanguard Developed Markets ETF
+        # "VWO",            # Vanguard Emerging Markets ETF
+        # "EWJ",            # iShares MSCI Japan ETF
+        #
+        # Sectors (granular industry)
+        # "XBI",            # SPDR S&P Biotech ETF (high vol, active options)
+        # "XRT",            # SPDR S&P Retail ETF
+        # "XHB",            # SPDR S&P Homebuilders ETF
+        #
+        # Commodities
+        # "USO",            # United States Oil Fund (crude oil proxy)
+        # "UNG",            # United States Natural Gas Fund
+        # "COPX",           # Global X Copper Miners ETF
+        # "SLV",            # iShares Silver Trust
+        #
+        # Tech / Semis (additional)
+        # "SOXX",           # iShares Semiconductor ETF (alongside SMH)
+        # ─────────────────────────────────────────────────────────────────────
     ])
 
     # --- Strategy ---
