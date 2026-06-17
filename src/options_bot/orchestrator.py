@@ -480,13 +480,19 @@ def send_discord(webhook_url: str, message: str) -> None:
     """
     POST a message to a Discord webhook.
     Fails silently — never let a notification failure crash the trading loop.
+
+    Normalises discordapp.com → discord.com automatically. Discord's old
+    domain (discordapp.com) redirects to discord.com, but Railway's egress
+    allowlist only permits discord.com, so the redirect is never followed.
     """
     if not webhook_url:
         return
+    # Normalise legacy discordapp.com → discord.com
+    url = webhook_url.replace("discordapp.com", "discord.com")
     try:
         payload = json.dumps({"content": message}).encode("utf-8")
         req = urllib.request.Request(
-            webhook_url,
+            url,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
