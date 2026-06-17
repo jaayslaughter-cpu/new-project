@@ -41,6 +41,7 @@ Extracted: get_cik(), get_company_filings(), get_insider_transactions(),
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 
 import json
 import logging
@@ -291,3 +292,247 @@ def is_entry_confirmed(ticker: str, require_score: int = 20) -> tuple[bool, str]
     if score >= require_score:
         return True, f"SEC confirmed: {sig['detail']} (score={score})"
     return False, f"no SEC confirmation (score={score}) — {sig['detail']}"
+
+
+# ---------------------------------------------------------------------------
+# Policy Intelligence Monitor
+# ---------------------------------------------------------------------------
+# Monitors upstream policy signals BEFORE they become congressional trades or
+# SEC filings. Four levels (highest urgency first):
+#   L1 — White House Fact Sheets + Federal Register EOs (immediate sector catalyst)
+#   L2 — DoD contract announcements (specific stock catalyst)
+#
+# Source: adapted from agentic-trading-system/execution/policy_monitor.py
+# Key changes: stdlib only (no requests/BeautifulSoup), integrated with our
+# circuit_breaker, sector map extended with ETF universe overlap.
+#
+# Returns PolicySignal objects. The orchestrator calls scan_policy_signals()
+# during the daily scan and logs findings to Discord + SEC signal score.
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+import xml.etree.ElementTree as _ET
+
+# Sector keyword → ticker mapping. Tickers must overlap with your universe
+# (SPY, QQQ, XLE, XLF, XLI, XLK, SMH, etc.) to produce actionable signals.
+POLICY_SECTOR_MAP: dict[str, dict] = {
+    "defense": {
+        "keywords": ["defense", "military", "pentagon", "armed forces", "weapon",
+                     "drone", "missile", "munition", "national security",
+                     "golden dome", "darpa"],
+        "etfs": ["XLI"],           # industrials — broad defense proxy in your universe
+        "watch_tickers": ["LMT", "RTX", "NOC", "GD", "LHX"],
+    },
+    "energy_fossil": {
+        "keywords": ["oil", "gas", "lng", "coal", "drill", "offshore leasing",
+                     "energy dominance", "pipeline", "permian"],
+        "etfs": ["XLE"],
+        "watch_tickers": ["XOM", "CVX", "COP"],
+    },
+    "semiconductors": {
+        "keywords": ["semiconductor", "chips act", "chip", "fab", "wafer",
+                     "domestic manufacturing", "advanced computing", "tsmc"],
+        "etfs": ["SMH", "XLK"],
+        "watch_tickers": [],
+    },
+    "financials": {
+        "keywords": ["bank", "deregulation", "interest rate", "federal reserve",
+                     "dodd-frank", "cfpb", "lending"],
+        "etfs": ["XLF"],
+        "watch_tickers": [],
+    },
+    "healthcare": {
+        "keywords": ["medicare", "medicaid", "drug pricing", "fda", "prescription",
+                     "healthcare", "pharma", "aca"],
+        "etfs": ["XLV"],
+        "watch_tickers": [],
+    },
+    "real_estate": {
+        "keywords": ["housing", "mortgage", "fannie mae", "freddie mac",
+                     "hud", "zoning", "real estate"],
+        "etfs": ["XLRE"],
+        "watch_tickers": [],
+    },
+    "materials_industrial": {
+        "keywords": ["reshoring", "made in america", "tariff", "steel",
+                     "aluminum", "infrastructure", "industrial"],
+        "etfs": ["XLI", "XLB"],
+        "watch_tickers": [],
+    },
+    "bonds_rates": {
+        "keywords": ["treasury", "federal reserve", "interest rate", "yield",
+                     "debt ceiling", "federal deficit", "monetary policy"],
+        "etfs": ["TLT", "HYG"],
+        "watch_tickers": [],
+    },
+    "commodities": {
+        "keywords": ["gold", "silver", "oil", "natural gas", "commodity",
+                     "strategic reserve", "critical mineral"],
+        "etfs": ["GLD", "XLE"],
+        "watch_tickers": [],
+    },
+    "emerging_markets": {
+        "keywords": ["china", "tariff", "trade war", "sanctions", "export control",
+                     "emerging market", "brics"],
+        "etfs": ["EEM"],
+        "watch_tickers": [],
+    },
+}
+
+_POLICY_SOURCES = [
+    {
+        "name": "White House Fact Sheets",
+        "url": "https://www.whitehouse.gov/fact-sheets/",
+        "level": 1,
+        "parse": "html_links",
+        "selector_hint": "wp-block-post-title",
+    },
+    {
+        "name": "Federal Register EOs",
+        "url": (
+            "https://www.federalregister.gov/api/v1/documents.json"
+            "?conditions[presidential_document_type]=executive_order"
+            "&per_page=20&order=newest&fields[]=title"
+        ),
+        "level": 1,
+        "parse": "json_results",
+    },
+    {
+        "name": "DoD Contract Announcements",
+        "url": "https://www.defense.gov/News/Contracts/",
+        "level": 2,
+        "parse": "html_links",
+        "selector_hint": "title",
+    },
+]
+
+# In-process seen-set — persists for the lifetime of the process.
+# Prevents refiring on repeated hourly scans within the same session.
+_policy_seen: set[str] = set()
+
+
+@dataclass
+class PolicySignal:
+    """One upstream policy signal from a government source."""
+    source:   str
+    headline: str
+    level:    int           # 1 = immediate catalyst, 2 = stock-specific
+    sectors:  list[str]
+    etfs:     list[str]     # ETFs in your universe affected
+    signal_id: str = ""
+
+    def __post_init__(self):
+        raw = f"{self.source}:{self.headline}"
+        self.signal_id = _hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _policy_classify(text: str) -> tuple[list[str], list[str]]:
+    """Map headline text to matched sectors and their ETFs."""
+    text_lower = text.lower()
+    sectors, etfs = [], []
+    for sector, cfg in POLICY_SECTOR_MAP.items():
+        if any(kw in text_lower for kw in cfg["keywords"]):
+            sectors.append(sector)
+            etfs.extend(cfg["etfs"])
+    return sectors, list(set(etfs))
+
+
+def _policy_fetch(source: dict) -> list[str]:
+    """Fetch headlines from one policy source. Stdlib only, no BeautifulSoup."""
+    cb_key = f"policy_{source['name'].lower().replace(' ', '_')}"
+    if not _cb.is_available(cb_key):
+        return []
+    try:
+        import urllib.request as _ur
+        import ssl as _ssl
+        ctx = _ssl.create_default_context()
+        req = _ur.Request(
+            source["url"],
+            headers={"User-Agent": "OptionsBot policy-monitor/1.0 research@localhost"}
+        )
+        with _ur.urlopen(req, timeout=12, context=ctx) as r:
+            body = r.read().decode("utf-8", errors="replace")
+        _cb.record_success(cb_key)
+
+        # JSON API path (Federal Register)
+        if source.get("parse") == "json_results":
+            import json as _json
+            data = _json.loads(body)
+            return [r["title"] for r in data.get("results", [])[:20] if r.get("title")]
+
+        # Simple HTML: extract text from <a> tags containing the selector hint
+        # Avoids BeautifulSoup dependency — good enough for headline extraction
+        import re as _re
+        hint = source.get("selector_hint", "title")
+        headlines = []
+        # Match anchor tag content near the hint class
+        for m in _re.finditer(r'<a[^>]*>([^<]{15,200})</a>', body):
+            text = m.group(1).strip()
+            if text and len(text) > 15:
+                headlines.append(text)
+        return headlines[:20]
+
+    except Exception as exc:
+        cb_key2 = f"policy_{source['name'].lower().replace(' ', '_')}"
+        _cb.record_failure(cb_key2, str(exc))
+        logger.debug("[Policy] Fetch failed %s: %s", source["name"], exc)
+        return []
+
+
+def scan_policy_signals() -> list[PolicySignal]:
+    """
+    Scan all policy sources for new headlines that match sector keywords.
+
+    Returns only NEW signals not seen in this process lifetime.
+    Called by the orchestrator during the daily scan.
+    Fail-open: any source failure is logged and skipped.
+
+    ETF signals map directly to your 20-ticker universe (XLE, XLF, SMH, etc.)
+    so the orchestrator can flag affected tickers for the day's scan.
+    """
+    new_signals: list[PolicySignal] = []
+
+    for source in _POLICY_SOURCES:
+        headlines = _policy_fetch(source)
+        for headline in headlines:
+            sectors, etfs = _policy_classify(headline)
+            if not sectors:
+                continue
+
+            sig = PolicySignal(
+                source=source["name"],
+                headline=headline,
+                level=source["level"],
+                sectors=sectors,
+                etfs=etfs,
+            )
+
+            if sig.signal_id in _policy_seen:
+                continue
+
+            _policy_seen.add(sig.signal_id)
+            new_signals.append(sig)
+            logger.info(
+                "[Policy L%d] %s: %s | sectors=%s etfs=%s",
+                sig.level, sig.source, sig.headline[:80],
+                ",".join(sig.sectors), ",".join(sig.etfs),
+            )
+
+    return new_signals
+
+
+def policy_etf_boost(ticker: str, signals: list[PolicySignal]) -> int:
+    """
+    Return a score boost (+15 per L1 signal, +8 per L2) if a ticker is in the
+    ETF list of any active policy signal.
+
+    Pass the result of scan_policy_signals() for the day. Used by
+    score_sec_signals() callers to layer policy intelligence on top of
+    insider-buying scores.
+    """
+    boost = 0
+    ticker_upper = ticker.upper().strip()
+    for sig in signals:
+        if ticker_upper in sig.etfs:
+            boost += 15 if sig.level == 1 else 8
+    return boost
