@@ -1763,10 +1763,14 @@ class Orchestrator:
 
         if options_weight < self.config.regime_min_options_weight:
             msg = (
-                f"⚠️ **REGIME GATE: No new trades** — "
-                f"regime={regime_name} options_weight={options_weight:.0%} "
-                f"(min={self.config.regime_min_options_weight:.0%}) "
-                f"VIX={indicators.get('vix_level', 0):.1f}"
+                f"⚠️ **REGIME GATE: No new trades today** — "
+                f"regime={regime_name.upper()} | "
+                f"options_weight={options_weight:.0%} "
+                f"(min={self.config.regime_min_options_weight:.0%}) | "
+                f"VIX={indicators.get('vix_level', 0):.1f} | "
+                f"curve={indicators.get('yield_curve_slope', 0):.2f} | "
+                f"Hurst={indicators.get('hurst', 0):.3f}\n"
+                f"_Bot is protecting capital — will resume when conditions improve._"
             )
             logger.warning("[Orchestrator] %s", msg)
             send_discord(self.config.discord_webhook_url, msg)
