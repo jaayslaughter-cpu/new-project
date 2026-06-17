@@ -514,9 +514,21 @@ class RegimeDetector:
         return None
 
     def _fetch_yield_curve_slope(self) -> Optional[float]:
-        """10Y - 2Y Treasury spread from FRED, falling back to yfinance TNX/IRX."""
+        """
+        10Y - 2Y Treasury spread. Three-tier fallback chain:
+
+          1. FRED API (most accurate, requires FRED_API_KEY env var)
+          2. US Treasury par yield curve XML (free, no key, daily updates)
+             Source: https://home.treasury.gov/resource-center/data-chart-center/
+                     interest-rates/ — same data FRED publishes, direct from source.
+             Adapted from: OpenTrading/tools/macro/macro.py (_yield_rows / get_yields)
+          3. yfinance ^TNX / ^IRX (last resort — delayed, less precise)
+        """
+        from datetime import datetime as _dt, timezone as _tz
+
         fred_key = os.getenv("FRED_API_KEY", "")
 
+        # ── Tier 1: FRED API ──────────────────────────────────────────
         if fred_key and _cb.is_available("fred"):
             try:
                 from fredapi import Fred
@@ -525,13 +537,74 @@ class RegimeDetector:
                 dgs2  = fred.get_series("DGS2").dropna()
                 if len(dgs10) > 0 and len(dgs2) > 0:
                     _cb.record_success("fred")
-                    return float(dgs10.iloc[-1]) - float(dgs2.iloc[-1])
+                    slope = float(dgs10.iloc[-1]) - float(dgs2.iloc[-1])
+                    logger.debug("[RegimeDetector] Yield curve via FRED: %.3f", slope)
+                    return slope
                 _cb.record_failure("fred", "empty series")
             except Exception as exc:
                 _cb.record_failure("fred", str(exc))
                 logger.warning("[RegimeDetector] FRED yield curve failed: %s", exc)
 
-        # Fallback: yfinance ^TNX / ^IRX
+        # ── Tier 2: Treasury XML (free, no key) ───────────────────────
+        if _cb.is_available("treasury_yield_xml"):
+            try:
+                import urllib.request as _ur
+                import ssl as _ssl
+                import xml.etree.ElementTree as _ET
+
+                year = _dt.now(_tz.utc).year
+                _YIELD_URL = (
+                    "https://home.treasury.gov/resource-center/data-chart-center/"
+                    "interest-rates/pages/xml?data=daily_treasury_yield_curve"
+                    "&field_tdr_date_value={year}"
+                )
+                ctx = _ssl.create_default_context()
+                req = _ur.Request(
+                    _YIELD_URL.format(year=year),
+                    headers={"User-Agent": "OptionsBot yield-curve/1.0 research@localhost"}
+                )
+                with _ur.urlopen(req, timeout=15, context=ctx) as r:
+                    body = r.read().decode("utf-8", errors="replace")
+
+                root = _ET.fromstring(body)
+
+                def _local(tag: str) -> str:
+                    return tag.rsplit("}", 1)[-1]
+
+                rows = []
+                for props in root.iter():
+                    if _local(props.tag) != "properties":
+                        continue
+                    d = {_local(c.tag): (c.text or "").strip() for c in props}
+                    if d.get("NEW_DATE") and d.get("BC_2YEAR") and d.get("BC_10YEAR"):
+                        try:
+                            rows.append({
+                                "date": d["NEW_DATE"],
+                                "y2":  float(d["BC_2YEAR"]),
+                                "y10": float(d["BC_10YEAR"]),
+                            })
+                        except (ValueError, KeyError):
+                            continue
+
+                if rows:
+                    rows.sort(key=lambda r: r["date"])
+                    latest = rows[-1]
+                    slope = latest["y10"] - latest["y2"]
+                    _cb.record_success("treasury_yield_xml")
+                    logger.debug(
+                        "[RegimeDetector] Yield curve via Treasury XML: "
+                        "2Y=%.2f 10Y=%.2f slope=%.3f (%s)",
+                        latest["y2"], latest["y10"], slope, latest["date"],
+                    )
+                    return slope
+
+                _cb.record_failure("treasury_yield_xml", "no valid rows parsed")
+
+            except Exception as exc:
+                _cb.record_failure("treasury_yield_xml", str(exc))
+                logger.warning("[RegimeDetector] Treasury XML yield curve failed: %s", exc)
+
+        # ── Tier 3: yfinance ^TNX / ^IRX (last resort) ────────────────
         if not _cb.is_available("yfinance_rates"):
             return None
         try:
@@ -540,7 +613,9 @@ class RegimeDetector:
             t2  = yf.Ticker("^IRX").fast_info.get("lastPrice")
             if t10 and t2:
                 _cb.record_success("yfinance_rates")
-                return float(t10) - float(t2)
+                slope = float(t10) - float(t2)
+                logger.debug("[RegimeDetector] Yield curve via yfinance: %.3f", slope)
+                return slope
             _cb.record_failure("yfinance_rates", "missing TNX/IRX")
         except Exception as exc:
             _cb.record_failure("yfinance_rates", str(exc))
