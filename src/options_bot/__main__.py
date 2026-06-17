@@ -241,6 +241,8 @@ def main() -> None:
             )
             sys.exit(1)
 
+    paper = not args.live
+
     # ── System validation — boot-sequence firewall ───────────────────────────
     # Runs all 4 checks (env, broker, market data, internal modules) before
     # constructing anything. Raises SystemValidationError and exits on failure.
@@ -254,7 +256,7 @@ def main() -> None:
             discord_webhook=os.getenv("DISCORD_WEBHOOK_URL"),
         )
     except SystemValidationError as sv_exc:
-        logger.critical("Boot aborted — system validation failed: %s", sv_exc)
+        logging.getLogger(__name__).critical("Boot aborted — system validation failed: %s", sv_exc)
         # Send Discord alert if webhook is available
         _webhook = os.getenv("DISCORD_WEBHOOK_URL")
         if _webhook:
@@ -282,8 +284,6 @@ def main() -> None:
     except ValueError:
         print(f"ERROR: Invalid --scan-time '{args.scan_time}'. Use HH:MM format.")
         sys.exit(1)
-
-    paper = not args.live
 
     config = OrchestratorConfig(
         tickers=args.tickers,
