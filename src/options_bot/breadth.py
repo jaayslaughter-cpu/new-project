@@ -126,6 +126,47 @@ _ALL_TICKERS = [t for sector in _UNIVERSE.values() for t in sector]   # 100 name
 
 # Alpha Vantage sector endpoint (free, 25 req/day)
 _AV_SECTOR_URL = "https://www.alphavantage.co/query?function=SECTOR&apikey={key}"
+_AV_PCR_URL    = "https://www.alphavantage.co/query?function=REALTIME_PUT_CALL_RATIO&symbol={sym}&apikey={key}"
+
+
+def get_market_put_call_ratio(tickers: Optional[list] = None) -> Optional[float]:
+    """
+    Fetch average put/call ratio across a basket of tickers from Alpha Vantage.
+    Used as a market breadth signal in regime detection.
+
+    A PCR > 1.0 means more puts than calls are trading — bearish hedging activity.
+    For short-premium strategies this is a positive signal: elevated put demand
+    means higher put premiums, better credits on put spreads.
+
+    Returns average PCR across sampled tickers, or None if unavailable.
+    Cached for 30 minutes — PCR is a slow-moving signal.
+    """
+    av_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+    if not av_key or not _cb.is_available("av_pcr_breadth"):
+        return None
+
+    sample = (tickers or ["SPY", "QQQ", "IWM"])[:3]  # max 3 calls to conserve quota
+    ratios = []
+    for sym in sample:
+        try:
+            url = _AV_PCR_URL.format(sym=sym.upper(), key=av_key)
+            req = urllib.request.Request(url, headers={"User-Agent": "OptionsBot/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace"))
+            pcr = data.get("put_call_ratio") or data.get("ratio")
+            if pcr:
+                ratios.append(float(pcr))
+        except Exception as exc:
+            logger.debug("[Breadth] PCR fetch failed for %s: %s", sym, exc)
+
+    if not ratios:
+        _cb.record_failure("av_pcr_breadth", "no valid PCR data")
+        return None
+
+    avg_pcr = round(sum(ratios) / len(ratios), 3)
+    _cb.record_success("av_pcr_breadth")
+    logger.debug("[Breadth] Market PCR (avg %d tickers): %.3f", len(ratios), avg_pcr)
+    return avg_pcr
 
 # Cache
 _breadth_cache: Optional[dict] = None
