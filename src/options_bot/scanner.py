@@ -397,14 +397,34 @@ class PiotroskiScorer:
         self._cache[ticker] = (now, result)
         return result
 
+    # Hard ETF bypass list — Piotroski requires income statements and
+    # balance sheets that ETFs don't have. yfinance sometimes returns
+    # partial data for ETFs that computes to a low F-score and blocks entry.
+    # All ETFs in the universe plus common expansion tickers are listed here.
+    _ETF_PASS = {
+        "SPY","QQQ","IWM","DIA","MDY",
+        "XLF","XLK","XLE","XLV","XLI","XLC","XLY","XLP","XLB","XLRE",
+        "GLD","TLT","EEM","HYG","SMH",
+        "VIXY","AGG","LQD","BND","VEA","VWO","EWJ",
+        "XBI","XRT","XHB","USO","UNG","COPX","SLV","SOXX",
+        "GDX","GDXJ","ARKK","ARKG","IAU","UVXY","VXX","TQQQ","SQQQ",
+    }
+
     def is_entry_allowed(self, ticker: str) -> bool:
         """
         Returns True if Piotroski score allows a new position.
-        Allows through if ticker is an ETF or data is unavailable.
+
+        ETFs are always allowed — they have no financial statements and
+        any F-score computed from partial yfinance data is meaningless.
         """
+        # Explicit ETF bypass — never block on Piotroski
+        if ticker.upper().strip() in self._ETF_PASS:
+            logger.debug("[Piotroski] %s: ETF — Piotroski bypassed", ticker)
+            return True
+
         s = self.score(ticker)
         if s is None:
-            return True   # ETF or unavailable — allow
+            return True   # no data — fail open
         if not s.is_quality:
             logger.info(
                 "[Piotroski] %s: F-score=%d < %d — blocking entry "
@@ -551,13 +571,16 @@ class TickerGate:
 
     def __init__(
         self,
-        bullish_threshold: float = 3.0,
+        bullish_threshold: float = 2.0,  # lowered from 3.0 for ETF universe
         piotroski_threshold: int = 6,
         require_bullish: bool = True,
         require_piotroski: bool = True,
         require_iv_quality: bool = True,
         iv_block_on_caution: bool = False,
     ):
+        # ETF universe uses 2.0 threshold — ETFs rarely score above 3.0
+        # because broad-market funds have mixed sector technicals by design.
+        # 2.0 means: price above at least one SMA + one bullish momentum signal.
         self.scanner   = BullishScanner(bullish_threshold)
         self.piotroski = PiotroskiScorer(piotroski_threshold)
         self.require_bullish    = require_bullish
