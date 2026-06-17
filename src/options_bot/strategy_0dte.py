@@ -88,10 +88,10 @@ class ZeroDTEConfig:
     vix_ceiling: float = 35.0        # Skip if VIX above this (too dangerous)
     rsi_min: float = 40.0            # SPY RSI must be above this
     rsi_max: float = 80.0            # SPY RSI must be below this
-    max_gap_pct: float = 0.5         # Skip if overnight gap > 0.5%
+    max_gap_pct: float = 1.5         # Skip if overnight gap > 1.5% (SPY gaps >0.5% on ~40% of days)
     max_consec_down_days: int = 5    # Skip if N+ consecutive red days
     skip_friday: bool = False        # SPY 0DTE trades every day
-    min_expected_move_pct: float = 0.15  # Min expected 2-hr move as % of price
+    min_expected_move_pct: float = 0.08  # Min expected 2-hr move as % of price (lowered from 0.15)
 
     # --- Credit filters ---
     min_credit_morning: float = 0.30  # Before 11 AM ET
