@@ -327,7 +327,8 @@ def main() -> None:
     mode_label = "LIVE" if not paper else "PAPER"
     print(f"Starting Options Bot [{mode_label}]")
     print(f"  Tickers:  {config.tickers}")
-    print(f"  Strategy: {config.strategy_name}")
+    strategies_active = [config.strategy_name] + (config.extra_strategies or [])
+    print(f"  Strategies: {', '.join(s.upper() for s in strategies_active)}")
     print(f"  Risk:     {config.risk_config.risk_budget_pct:.1%} per trade")
     scan_pt = args.scan_time
     try:
