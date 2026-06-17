@@ -188,7 +188,7 @@ MEDIUM = RiskProfile(
     min_iv_rank   = 0.25,
     min_delta     = -0.30,
     max_delta     = -0.10,
-    min_credit    = 0.50,
+    min_credit    = 0.25,
 
     # DTE: standard 21-45 window
     min_dte = 21,
