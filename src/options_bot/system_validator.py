@@ -164,12 +164,16 @@ class SystemValidator:
             raise SystemValidationError(1, "Environment", detail)
 
         # Soft warnings — not failures
-        if not os.getenv("DISCORD_WEBHOOK_URL"):
+        # Accept both discord.com and discordapp.com (legacy redirect domain)
+        _discord = os.getenv("DISCORD_WEBHOOK_URL", "")
+        if not _discord:
             logger.warning(
                 "⚠  DISCORD_WEBHOOK_URL not set — trade alerts and EOD summaries "
                 "will be suppressed. Set it in Railway Variables to enable."
             )
-        if not os.getenv("DATABASE_URL"):
+        # Railway injects DATABASE_PUBLIC_URL; also accept DATABASE_URL
+        _has_db = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+        if not _has_db:
             logger.warning(
                 "⚠  DATABASE_URL not set — bot will fall back to local SQLite. "
                 "Add a Railway PostgreSQL plugin for persistent trade history."
@@ -247,7 +251,19 @@ class SystemValidator:
             raise SystemValidationError(2, "BrokerConnection", detail) from exc
 
         # Validate account health
-        status   = str(getattr(account, "status", "")).upper()
+        # account.status is an AccountStatus enum in alpaca-py — extract
+        # .value to get the plain string ("ACTIVE") rather than the repr
+        # ("ACCOUNTSTATUS.ACTIVE") that str() produces on some SDK versions.
+        raw_status = getattr(account, "status", "")
+        status = (
+            raw_status.value.upper()
+            if hasattr(raw_status, "value")
+            else str(raw_status).upper()
+        )
+        # Normalise: strip "ACCOUNTSTATUS." prefix if still present
+        if "." in status:
+            status = status.split(".")[-1]
+
         currency = str(getattr(account, "currency", ""))
         equity   = getattr(account, "equity", None)
         bp       = getattr(account, "buying_power", None)
