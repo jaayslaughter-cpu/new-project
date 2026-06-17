@@ -69,7 +69,8 @@ from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profi
 from .universe import UniverseBuilder
 from .volume_profile import volume_profile_cache
 from .stress_testing import run_stress_suite, positions_from_broker
-from .sec_signals import is_entry_confirmed
+from .sec_signals import is_entry_confirmed, score_sec_signals
+from .confidence_score import ConfidenceScorer
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +589,25 @@ class TradeDatabase:
         finally:
             conn.close()
 
+    def get_all_closed_pnls(self) -> list[float]:
+        """Return all realized_pnl values for closed trades.
+        Used by ConfidenceScorer track record section."""
+        conn = self._get_conn()
+        try:
+            cur = self._execute(
+                conn,
+                "SELECT realized_pnl FROM trades "
+                "WHERE status IN ('closed','closed_expiry',"
+                "'profit_target','stop_hit') "
+                "AND realized_pnl IS NOT NULL"
+            )
+            return [float(row[0]) for row in cur.fetchall()]
+        except Exception as exc:
+            logger.error("[TradeDB] get_all_closed_pnls failed: %s", exc)
+            return []
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Discord notifier
@@ -733,6 +753,11 @@ class TradingPipeline:
         self.enricher   = GreeksEnricher()   # fetches Treasury rate on init
         self.strategy   = get_strategy(config.strategy_name, config.strategy_config)
         self._sentiment = SentimentAnalyzer(config=SentimentConfig())
+        self._confidence = ConfidenceScorer(
+            regime_detector=self._regime,
+            db=db,
+            risk_manager=rm,
+        )
 
     def run_for_ticker(
         self,
@@ -874,6 +899,37 @@ class TradingPipeline:
             logger.info("[Pipeline] %s risk veto: %s", ticker, decision.rejection_reason)
             return None
 
+        # --- Step 4b: Confidence scoring ---
+        try:
+            _sig_obj = None
+            try:
+                _sig_obj = sentiment_signals.get(ticker)
+            except Exception:
+                pass
+            _sec_data_full = score_sec_signals(ticker)
+            _confidence_report = self._confidence.score(
+                signal=signal,
+                ticker=ticker,
+                sec_data=_sec_data_full,
+                open_trades=open_trades,
+                sentiment_allowed=_sig_obj.signal != "SELL" if _sig_obj else True,
+                sentiment_compound=_sig_obj.weighted_score if _sig_obj else 0.0,
+            )
+            if not _confidence_report.should_trade:
+                logger.info(
+                    "[Pipeline] %s confidence too low: %.0f [%s] — skip  %s",
+                    ticker, _confidence_report.overall, _confidence_report.grade,
+                    _confidence_report.short_line(),
+                )
+                return None
+            logger.info(
+                "[Pipeline] %s confidence %.0f [%s]",
+                ticker, _confidence_report.overall, _confidence_report.grade,
+            )
+        except Exception as _conf_exc:
+            logger.debug("[Pipeline] Confidence scoring non-fatal: %s", _conf_exc)
+            _confidence_report = None
+
         # --- Step 5: Build order ---
         order = self.rm.build_approved_order(
             legs=signal.legs,
@@ -910,7 +966,10 @@ class TradingPipeline:
         with self.state._lock:
             self.state.filled_today.append(filled)
 
+        _conf_line = _confidence_report.short_line() if _confidence_report else ""
         msg = _format_signal_message(signal, filled, regime_name, regime_options_weight)
+        if _conf_line:
+            msg = msg + "\n" + _conf_line
         logger.info("[Pipeline] Trade entered: %s", msg.replace("\n", " | "))
         send_discord(self.config.discord_webhook_url, msg)
 
@@ -1955,6 +2014,36 @@ class Orchestrator:
         wtd_pnls   = self._query_pnls_since(week_start)
         wtd_pnl    = sum(wtd_pnls)
         n_total    = len(self._query_all_pnls())
+        _eod_conf_line = ""
+        try:
+            from .confidence_score import _score_regime, _score_risk_posture, _score_track_record
+            _s_r = _score_regime(regime)
+            _dpnl = self.state.daily_realized_pnl / max(self.state.equity or 1.0, 1.0)
+            _s_rp = _score_risk_posture(
+                daily_pnl_pct=_dpnl,
+                max_daily_loss_pct=getattr(self.config.risk_config, "max_daily_loss_pct", 0.05),
+                open_positions=len(open_trades),
+                max_positions=getattr(self.config, "max_positions_total", 5),
+                risk_budget_used=len(self.state.filled_today) / max(
+                    getattr(self.config.risk_config, "max_trades_per_day", 5), 1),
+            )
+            _wins_e  = [p for p in all_pnls if p > 0]
+            _losses_e = [abs(p) for p in all_pnls if p < 0]
+            _wr_e = (len(_wins_e) / len(all_pnls)) if len(all_pnls) >= 10 else None
+            _pf_e = (sum(_wins_e) / sum(_losses_e)) if _losses_e else None
+            _s_tr = _score_track_record(_wr_e, _pf_e, len(all_pnls))
+            _sys = round(_s_r.score*0.40 + _s_rp.score*0.40 + _s_tr.score*0.20, 1)
+            _grd = ("VERY HIGH" if _sys>=90 else "HIGH" if _sys>=75 else
+                    "MODERATE" if _sys>=60 else "LOW" if _sys>=45 else "VERY LOW")
+            _em = "\U0001f7e2" if _sys>=75 else "\U0001f7e1" if _sys>=60 else "\U0001f534"
+            _eod_conf_line = (
+                f"{_em} System confidence: `{_sys:.0f}/100` [{_grd}]"
+                f"  regime={_s_r.score:.0f}  risk={_s_rp.score:.0f}"
+                f"  track={_s_tr.score:.0f}\n"
+            )
+        except Exception as _eod_ce:
+            logger.debug("[EOD] Confidence snapshot non-fatal: %s", _eod_ce)
+
         summary = (
             f"Daily Summary - {date.today()}\n"
             f"Strategy: {self.config.strategy_name.upper()}  "
@@ -1967,6 +2056,7 @@ class Orchestrator:
             f"{metrics_line}"
             f"{stress_line}"
             f"{tuning_line}"
+            f"{_eod_conf_line}"
             f"Regime: {regime['regime'].upper()} "
             f"(conf={regime['confidence']:.0%}, "
             f"VIX={regime['indicators'].get('vix_level',0):.1f}, "
