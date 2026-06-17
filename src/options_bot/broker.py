@@ -52,6 +52,112 @@ logger = logging.getLogger(__name__)
 _DEFAULT_LIMIT_BUFFER_PCT = 0.02   # 2% buffer on limit price to improve fill rate
 
 
+# ---------------------------------------------------------------------------
+# OCC symbol formatting
+# ---------------------------------------------------------------------------
+
+def format_option_symbol(
+    ticker: str,
+    expiry_yymmdd: str,
+    option_type: str,
+    strike: float,
+) -> str:
+    """
+    Format an option contract symbol in strict Alpaca OCC format (no spaces).
+
+    Pattern: {TICKER}{YYMMDD}{C|P}{strike_8digit}
+
+    Strike encoding: integer cents × 10, zero-padded to 8 digits.
+    e.g. SPY $580.00 call expiring 2026-06-20 → SPY260620C00580000
+         SPY $522.50 put  expiring 2026-06-20 → SPY260620P00522500
+
+    Args:
+        ticker:       Underlying symbol, e.g. "SPY"
+        expiry_yymmdd: 6-digit string "YYMMDD", e.g. "260620"
+        option_type:  "C" or "call", "P" or "put" (case-insensitive)
+        strike:       Strike price as a float, e.g. 580.0 or 522.5
+
+    Returns:
+        OCC-formatted symbol string, e.g. "SPY260620C00580000"
+
+    Raises:
+        ValueError: if option_type is not C/P or strike is non-positive.
+    """
+    ot = option_type.upper()
+    if ot not in ("C", "P", "CALL", "PUT"):
+        raise ValueError(f"option_type must be C/P/CALL/PUT, got {option_type!r}")
+    ot_char = "C" if ot in ("C", "CALL") else "P"
+
+    if strike <= 0:
+        raise ValueError(f"Strike must be positive, got {strike}")
+
+    padded_strike = f"{int(round(strike * 1000)):08d}"
+    return f"{ticker.upper()}{expiry_yymmdd}{ot_char}{padded_strike}"
+
+
+# ---------------------------------------------------------------------------
+# Live midpoint fetcher (Alpaca OptionLatestQuoteRequest)
+# ---------------------------------------------------------------------------
+
+def _get_live_midpoint(
+    data_client,
+    symbol: str,
+    fallback: Optional[float] = None,
+) -> Optional[float]:
+    """
+    Fetch the live bid/ask midpoint for a single option contract from Alpaca.
+
+    Used by _submit_single and _submit_mleg to replace the strategy-layer
+    estimated_fill_price with a real-time midpoint at the moment of order
+    submission — tighter pricing, better fills.
+
+    Fallback chain:
+        1. Live (bid + ask) / 2 from OptionLatestQuoteRequest
+        2. ask_price alone if bid is zero (deep OTM / wide market)
+        3. fallback argument (strategy-layer mid estimate)
+        4. None → caller must abort the order
+
+    Zero bids are common in illiquid options — asking for the ask is correct
+    because it represents the actual market offer.
+
+    Args:
+        data_client: OptionHistoricalDataClient instance (from AlpacaBroker._data)
+        symbol:      OCC symbol string e.g. "SPY260620C00580000"
+        fallback:    Strategy-layer estimated mid, used if Alpaca quote fails.
+
+    Returns:
+        Midpoint as float rounded to 2dp, or None if all sources fail.
+    """
+    try:
+        from alpaca.data.requests import OptionLatestQuoteRequest
+        req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+        result = data_client.get_option_latest_quote(req)
+        if symbol not in result:
+            logger.warning("[Broker] Live quote missing for %s — using fallback", symbol)
+            return fallback
+
+        q = result[symbol]
+        bid = float(q.bid_price) if q.bid_price is not None else 0.0
+        ask = float(q.ask_price) if q.ask_price is not None else 0.0
+
+        if ask == 0:
+            logger.warning("[Broker] Zero ask for %s — using fallback", symbol)
+            return fallback
+
+        if bid == 0:
+            # Deep OTM / illiquid: use ask as the price to pay/receive
+            logger.debug("[Broker] Zero bid for %s — using ask %.2f", symbol, ask)
+            return round(ask, 2)
+
+        mid = round((bid + ask) / 2.0, 2)
+        logger.debug("[Broker] Live mid for %s: bid=%.2f ask=%.2f mid=%.2f", symbol, bid, ask, mid)
+        return mid
+
+    except Exception as exc:
+        logger.warning("[Broker] Live quote fetch failed for %s (%s) — using fallback", symbol, exc)
+        return fallback
+
+
 class AlpacaBroker:
     """
     Alpaca broker adapter for options order submission.
@@ -199,17 +305,40 @@ class AlpacaBroker:
           time_in_force = day  (only valid TIF for options per spec)
           position_intent = sell_to_open | buy_to_open | etc.
           stop_loss.stop_price = hard stop level (exchange-managed)
+
+        Limit price: fetched live from Alpaca OptionLatestQuoteRequest at
+        submission time. Fallback to strategy-layer estimated_fill_price if
+        the live quote is unavailable (e.g. pre-market, network hiccup).
+
+        client_order_id includes int(time.time()) so Railway container
+        restarts cannot accidentally re-submit a duplicate order.
         """
         from alpaca.trading.requests import LimitOrderRequest, StopLossRequest
         from alpaca.trading.enums import TimeInForce, OrderClass
+        from alpaca.common.exceptions import APIError
 
         leg = order.legs[0]
         qty = order.position_size_contracts
-        limit_price = _limit_price_single(order.estimated_fill_price, leg.side)
+
+        # Live midpoint — tighter than strategy-layer estimate
+        live_mid = _get_live_midpoint(
+            self._data, leg.symbol, fallback=order.estimated_fill_price
+        )
+        if live_mid is None:
+            raise PipelineConnectionError(
+                f"Cannot submit order for {leg.symbol}: "
+                f"live midpoint unavailable and no fallback price."
+            )
+        limit_price = _limit_price_single(live_mid, leg.side)
 
         stop = StopLossRequest(stop_price=round(order.hard_stop_price, 2))
 
-        client_id = f"optbot-{order.strategy_name}-{uuid.uuid4().hex[:8]}"
+        # Timestamp + uuid4 suffix: Railway container restarts get a new
+        # timestamp, preventing duplicate orders from identical restarts.
+        client_id = (
+            f"opt_{order.underlying}_{order.strategy_name}"
+            f"_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        )
 
         req = LimitOrderRequest(
             symbol=leg.symbol,
@@ -222,8 +351,8 @@ class AlpacaBroker:
             client_order_id=client_id,
         )
         logger.debug(
-            "[AlpacaBroker] single-leg: %s qty=%d limit=%.2f stop=%.2f",
-            leg.symbol, qty, limit_price, order.hard_stop_price
+            "[AlpacaBroker] single-leg: %s qty=%d live_mid=%.2f limit=%.2f stop=%.2f",
+            leg.symbol, qty, live_mid, limit_price, order.hard_stop_price
         )
         return self._post_order(req, order, client_id)
 
@@ -240,13 +369,41 @@ class AlpacaBroker:
           legs         = [{symbol, ratio_qty, position_intent}]
 
         IMPORTANT per spec: stop_loss is NOT supported on mleg orders.
-        Stops must be managed externally — monitor positions and submit
-        separate closing orders when stop level is reached.
+        Stops must be managed externally — the PositionMonitor submits
+        separate closing orders when the stop level is reached.
+
+        Live midpoint: each leg's midpoint is fetched from Alpaca at
+        submission time. The net is recomputed from live quotes. This
+        replaces the strategy-layer estimated net, which may be stale
+        by the time the order reaches execution. Falls back to
+        net_debit_credit from the ApprovedOrder if live quotes fail.
+
+        client_order_id includes int(time.time()) for Railway restart safety.
         """
         from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
         from alpaca.trading.enums import TimeInForce, OrderClass
+        from alpaca.common.exceptions import APIError
 
         qty = order.position_size_contracts
+
+        # ── Live net price from per-leg midpoints ──────────────────────────
+        # For a credit spread: short leg receives premium (positive mid),
+        # long leg costs premium (negative mid). Net = short_mid - long_mid.
+        # Sign convention: negative net = credit (we receive), per Alpaca spec.
+        live_net = self._compute_live_net(order)
+        if live_net is None:
+            logger.warning(
+                "[AlpacaBroker] mleg live net unavailable for %s — "
+                "falling back to estimated net %.2f",
+                order.underlying, order.net_debit_credit,
+            )
+            live_net = order.net_debit_credit
+
+        # Buffer: accept slightly less credit / pay slightly more debit
+        if live_net < 0:
+            limit_price = live_net * (1 - _DEFAULT_LIMIT_BUFFER_PCT)  # e.g. -1.50 → -1.47
+        else:
+            limit_price = live_net * (1 + _DEFAULT_LIMIT_BUFFER_PCT)
 
         # Build legs — ratio_qty=1 for standard 1:1 spreads
         alpaca_legs = [
@@ -258,16 +415,10 @@ class AlpacaBroker:
             for leg in order.legs
         ]
 
-        # mleg limit_price: negative = credit (spec-verified)
-        # net_debit_credit is already negative for credit strategies
-        net = order.net_debit_credit
-        # Buffer: accept slightly less credit / pay slightly more debit
-        if net < 0:
-            limit_price = net * (1 - _DEFAULT_LIMIT_BUFFER_PCT)   # e.g. -1.50 → -1.47
-        else:
-            limit_price = net * (1 + _DEFAULT_LIMIT_BUFFER_PCT)
-
-        client_id = f"optbot-{order.strategy_name}-{uuid.uuid4().hex[:8]}"
+        client_id = (
+            f"opt_{order.underlying}_{order.strategy_name}"
+            f"_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        )
 
         req = LimitOrderRequest(
             qty=qty,
@@ -279,8 +430,8 @@ class AlpacaBroker:
         )
 
         logger.debug(
-            "[AlpacaBroker] mleg: %d legs qty=%d limit_price=%.2f (credit=%.2f)",
-            len(alpaca_legs), qty, limit_price, abs(net)
+            "[AlpacaBroker] mleg: %d legs qty=%d live_net=%.2f limit=%.2f (credit=%.2f)",
+            len(alpaca_legs), qty, live_net, limit_price, abs(live_net),
         )
         logger.debug(
             "[AlpacaBroker] mleg: stop managed by PositionMonitor at %.2f",
@@ -288,14 +439,48 @@ class AlpacaBroker:
         )
         return self._post_order(req, order, client_id)
 
+    def _compute_live_net(self, order: ApprovedOrder) -> Optional[float]:
+        """
+        Recompute the spread's net credit/debit from live per-leg midpoints.
+
+        For each leg: sell_to_open = receive premium (positive contribution),
+        buy_to_open = pay premium (negative contribution).
+        Returns None if any leg's midpoint cannot be fetched.
+        """
+        net = 0.0
+        for leg in order.legs:
+            mid = _get_live_midpoint(self._data, leg.symbol)
+            if mid is None:
+                logger.warning(
+                    "[AlpacaBroker] No live mid for leg %s — aborting live net calc",
+                    leg.symbol,
+                )
+                return None
+            # sell_to_open / sell_to_close → receive → positive credit
+            # buy_to_open  / buy_to_close  → pay     → negative contribution
+            if leg.side in ("sell_to_open", "sell_to_close"):
+                net -= mid   # Alpaca mleg spec: net negative = credit received
+            else:
+                net += mid
+        return round(net, 2)
+
     def _post_order(self, req, order: ApprovedOrder, client_id: str) -> FilledOrder:
         """POST /v2/orders — shared submission path."""
+        from alpaca.common.exceptions import APIError
         submit_time = datetime.now(tz=timezone.utc)
         try:
             resp = self._trading.submit_order(order_data=req)
+        except APIError as api_err:
+            # APIError carries a structured .message from Alpaca's JSON body.
+            # Raise as PipelineConnectionError so the orchestrator can log and
+            # record the rejection without crashing the full scan loop.
+            err_msg = getattr(api_err, "message", str(api_err))
+            raise PipelineConnectionError(
+                f"Alpaca API rejected order (client_id={client_id}): {err_msg}"
+            ) from api_err
         except Exception as exc:
             raise PipelineConnectionError(
-                f"POST /v2/orders failed: {exc}"
+                f"POST /v2/orders failed (client_id={client_id}): {exc}"
             ) from exc
 
         order_id = str(resp.id)
