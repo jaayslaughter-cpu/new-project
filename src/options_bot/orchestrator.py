@@ -1421,10 +1421,10 @@ class Orchestrator:
             risk_manager=self.rm,
         )
 
-        # Sentiment analyzer — FinBERT news signal layer
-        self.sentiment_analyzer = SentimentAnalyzer(
-            config=config.sentiment_config
-        ) if config.sentiment_enabled else None
+        # Sentiment analyzer — owned by TradingPipeline._sentiment to avoid
+        # double-initialisation. Expose as property for external callers.
+        # (TradingPipeline.__init__ already creates SentimentAnalyzer above)
+        self.sentiment_analyzer = self.pipeline._sentiment
 
         # Adaptive tuner — self-tunes strategy parameters from closed trade history
         self.tuner = AdaptiveTuner(
