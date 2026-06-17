@@ -1883,6 +1883,67 @@ class Orchestrator:
             len(filled_orders)
         )
 
+        # Multi-strategy pass — run extra_strategies against same shortlist
+        # Each extra strategy uses its own default config, independent of the
+        # main strategy. Respects daily position caps across all strategies.
+        for extra_name in (self.config.extra_strategies or []):
+            if extra_name == self.config.strategy_name:
+                continue  # already ran this one above
+
+            # Check positions cap before starting next strategy pass
+            positions = self.broker.get_positions()
+            current_count = len([p for p in positions if p.get("asset_class") == "us_option"])
+            if current_count >= self.config.max_positions_total:
+                logger.info(
+                    "[Orchestrator] Max positions reached — skipping extra strategy %s",
+                    extra_name,
+                )
+                break
+
+            logger.info("[Orchestrator] === EXTRA STRATEGY PASS: %s ===", extra_name.upper())
+            try:
+                # Build a fresh pipeline using the extra strategy
+                extra_cfg = get_strategy(extra_name, None).config                     if hasattr(get_strategy(extra_name, None), "config") else None
+                self.pipeline.strategy = get_strategy(extra_name, extra_cfg)
+
+                for ticker in scan_tickers:
+                    positions = self.broker.get_positions()
+                    current_count = len([
+                        p for p in positions if p.get("asset_class") == "us_option"
+                    ])
+                    if current_count >= self.config.max_positions_total:
+                        break
+
+                    try:
+                        filled = self.pipeline.run_for_ticker(
+                            ticker=ticker,
+                            regime=regime,
+                            regime_name=regime_name,
+                            regime_options_weight=options_weight,
+                            open_trades=self.db.get_open_trades(),
+                            sentiment_signals=sentiment_signals,
+                        )
+                        if filled:
+                            filled_orders.append(filled)
+                            logger.info(
+                                "[Orchestrator] %s (%s) → FILLED",
+                                ticker, extra_name,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "[Orchestrator] %s (%s) pipeline error: %s",
+                            ticker, extra_name, exc,
+                        )
+                        self.state.record_error(str(exc))
+
+            except Exception as exc:
+                logger.warning("[Orchestrator] Extra strategy %s failed: %s", extra_name, exc)
+            finally:
+                # Restore primary strategy
+                self.pipeline.strategy = get_strategy(
+                    self.config.strategy_name, self.config.strategy_config
+                )
+
         # Adaptive tuning — run after scan, update strategy config for next cycle
         if self.tuner and self.tuner.should_evaluate(self.config.strategy_name):
             logger.info("[Orchestrator] Running adaptive tuning cycle...")
