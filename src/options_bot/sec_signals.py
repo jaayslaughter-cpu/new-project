@@ -270,6 +270,13 @@ def _score_sec_signals_impl(ticker: str, use_cache: bool = True) -> dict:
               'has_activist': has_activist, 'is_activist': is_activist,
               'last_insider_buy_date': last_buy_date, 'signal': signal,
               'detail': '; '.join(parts)}
+    # Boost score with Alpha Vantage insider data (faster updates than EDGAR)
+    av_boost = get_av_insider_score(ticker)
+    if av_boost > 0:
+        result["score"] = result.get("score", 0) + av_boost
+        result["detail"] = result.get("detail", "") + f"; AV insider boost=+{av_boost}"
+        logger.debug("[SEC] %s: AV insider boost +%d → total score=%d", ticker, av_boost, result["score"])
+
     _results_cache[ticker] = (now, result)
     return result
 
