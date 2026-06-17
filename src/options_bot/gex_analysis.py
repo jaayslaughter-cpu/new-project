@@ -310,3 +310,146 @@ def check_strike_gex_safety(
         f"pin=${analysis.pin_strike.strike if analysis.pin_strike else 'N/A':.1f} "
         f"regime={analysis.gamma_regime}{regime_note}"
     )
+
+
+# ---------------------------------------------------------------------------
+# CBOE Free GEX Fallback
+# ---------------------------------------------------------------------------
+# Uses CBOE's public delayed options JSON endpoint (no API key required) to
+# compute GEX, put/call ratios, and gamma walls as a fallback when the bot's
+# primary enriched chain is unavailable (e.g. pre-market, Alpaca data outage).
+#
+# Source: adapted from OpenTrading/tools/options/opt.py
+# Key changes: integrated with circuit_breaker, returns GEXAnalysis-compatible
+# dict rather than printing, stdlib only (no requests).
+#
+# Usage in GEXEngine:
+#   if primary_analysis is None:
+#       fallback = fetch_cboe_gex(ticker, dte_max=7)
+#       if fallback:
+#           # use fallback["pin_strike"], fallback["put_wall"], etc.
+# ---------------------------------------------------------------------------
+
+_CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json"
+_CBOE_UA  = "Mozilla/5.0 (OptionsBot gex-fallback/1.0)"
+
+
+def fetch_cboe_gex(
+    ticker: str,
+    dte_max: int = 7,
+) -> Optional[dict]:
+    """
+    Fetch GEX, put/call ratios, and gamma walls from CBOE's free delayed chain.
+
+    No API key required. Data is delayed ~15 minutes — suitable as a fallback
+    when live Alpaca chain data is unavailable, not as a primary signal.
+
+    Returns a dict with keys:
+        spot          float   — current underlying price
+        net_gex_usd   float   — net $ GEX per 1% move (positive = vol-suppressing)
+        gex_sign      str     — 'positive' | 'negative' | 'flat'
+        pc_oi         float   — put/call open interest ratio
+        pc_vol        float   — put/call volume ratio
+        call_wall     float   — strike with highest positive gamma (resistance)
+        put_wall      float   — strike with most negative gamma (support)
+        negative_gamma bool   — True if net GEX is negative (vol-amplifying)
+        source        str     — 'cboe_delayed'
+
+    Returns None if the fetch fails or the chain is empty.
+    """
+    from .circuit_breaker import data_circuit_breaker as _cb_gex
+    cb_key = "cboe_gex_fallback"
+
+    if not _cb_gex.is_available(cb_key):
+        logger.debug("[GEX-CBOE] Circuit breaker OPEN — skipping fallback")
+        return None
+
+    try:
+        import urllib.request as _ur
+        import ssl as _ssl
+        import json as _json
+        from datetime import date as _date, datetime as _dt
+
+        ctx = _ssl.create_default_context()
+        url = _CBOE_URL.format(sym=ticker.upper().strip())
+        req = _ur.Request(url, headers={"User-Agent": _CBOE_UA})
+
+        with _ur.urlopen(req, timeout=20, context=ctx) as r:
+            raw = _json.loads(r.read().decode("utf-8", errors="replace"))
+
+        data = raw.get("data", {})
+        spot = data.get("current_price") or data.get("close")
+        rows = data.get("options", [])
+
+        if not spot or not rows:
+            _cb_gex.record_failure(cb_key, "empty chain")
+            return None
+
+        today = _date.today()
+        call_oi = put_oi = call_vol = put_vol = 0
+        net_gamma = 0.0
+        by_strike: dict[float, float] = {}
+
+        for o in rows:
+            try:
+                sym = o.get("option", "")
+                if len(sym) < 15:
+                    continue
+                # Parse OCC symbol: SPY260615C00500000
+                strike = int(sym[-8:]) / 1000.0
+                cp     = sym[-9]
+                exp    = f"20{sym[-15:-13]}-{sym[-13:-11]}-{sym[-11:-9]}"
+                dte    = (_dt.strptime(exp, "%Y-%m-%d").date() - today).days
+            except Exception:
+                continue
+
+            if dte < 0 or dte > dte_max:
+                continue
+
+            oi    = o.get("open_interest") or 0
+            vol   = o.get("volume") or 0
+            gamma = o.get("gamma") or 0.0
+            # Dealer convention: long calls (positive gamma), short puts (negative)
+            signed_g = gamma * oi * (1 if cp == "C" else -1)
+            net_gamma += signed_g
+            by_strike[strike] = by_strike.get(strike, 0.0) + signed_g
+
+            if cp == "C":
+                call_oi  += oi;  call_vol  += vol
+            else:
+                put_oi   += oi;  put_vol   += vol
+
+        if not by_strike:
+            _cb_gex.record_failure(cb_key, "no valid contracts after DTE filter")
+            return None
+
+        # $ GEX per 1% move = Σ(signed gamma * OI) * 100 * spot² * 0.01
+        dollar_gex = net_gamma * 100 * spot * spot * 0.01
+        call_wall = max(by_strike, key=by_strike.get)
+        put_wall  = min(by_strike, key=by_strike.get)
+
+        _cb_gex.record_success(cb_key)
+        result = {
+            "spot":          float(spot),
+            "net_gex_usd":   round(dollar_gex, 2),
+            "gex_sign":      "positive" if dollar_gex > 0 else "negative" if dollar_gex < 0 else "flat",
+            "pc_oi":         round(put_oi  / call_oi,  3) if call_oi  else None,
+            "pc_vol":        round(put_vol / call_vol, 3) if call_vol else None,
+            "call_wall":     call_wall,
+            "put_wall":      put_wall,
+            "negative_gamma": dollar_gex < 0,
+            "source":        "cboe_delayed",
+        }
+        logger.info(
+            "[GEX-CBOE] %s: spot=%.2f net_gex=$%.1fbn sign=%s "
+            "put_wall=%.1f call_wall=%.1f pc_oi=%.2f",
+            ticker, spot, dollar_gex / 1e9, result["gex_sign"],
+            put_wall, call_wall, result["pc_oi"] or 0,
+        )
+        return result
+
+    except Exception as exc:
+        from .circuit_breaker import data_circuit_breaker as _cb_gex2
+        _cb_gex2.record_failure(cb_key, str(exc))
+        logger.warning("[GEX-CBOE] Fallback fetch failed for %s: %s", ticker, exc)
+        return None
