@@ -473,7 +473,7 @@ class ShortPutSpreadConfig:
     max_spread_pct: float = 0.25
     min_spread_width: float = 2.0       # minimum strike width in dollars
     max_spread_width: float = 20.0      # maximum strike width
-    min_credit: float = 0.50            # minimum credit to bother with the trade
+    min_credit: float = 0.25            # minimum credit to bother with the trade
     stop_multiplier: float = 2.0        # stop at 2x credit received
     profit_target_pct: float = 0.50     # close at 50% of max profit
     min_pop: float = 0.65               # minimum probability of profit (65%)
@@ -714,7 +714,7 @@ class ShortStrangleConfig:
     max_dte: int = 60
     min_open_interest: int = 200
     max_spread_pct: float = 0.20
-    min_total_credit: float = 1.50      # minimum combined credit
+    min_total_credit: float = 0.75      # minimum combined credit (two sides ~$0.38 each)
     stop_multiplier: float = 3.0        # stop at 3x total credit received (wider than spread)
     profit_target_pct: float = 0.50
     min_iv_rank: Optional[float] = None  # e.g. 0.30 = only trade when IVR >= 30%
