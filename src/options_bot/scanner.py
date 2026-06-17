@@ -41,6 +41,7 @@ from .sec_signals import score_sec_signals, is_entry_confirmed
 logger = logging.getLogger(__name__)
 
 from .trendlines import analyze_trendlines, TrendlineResult
+from .iv_quality import IVQualityGate, IVQualityReport
 
 # Cache TTLs
 _TECH_TTL_SECONDS   = 30 * 60      # 30 minutes
@@ -554,23 +555,60 @@ class TickerGate:
         piotroski_threshold: int = 6,
         require_bullish: bool = True,
         require_piotroski: bool = True,
+        require_iv_quality: bool = True,
+        iv_block_on_caution: bool = False,
     ):
         self.scanner   = BullishScanner(bullish_threshold)
         self.piotroski = PiotroskiScorer(piotroski_threshold)
-        self.require_bullish   = require_bullish
-        self.require_piotroski = require_piotroski
+        self.require_bullish    = require_bullish
+        self.require_piotroski  = require_piotroski
+        self.require_iv_quality = require_iv_quality
+        self.iv_gate = IVQualityGate(
+            block_on_block=require_iv_quality,
+            block_on_caution=iv_block_on_caution,
+        )
 
     def filter(self, tickers: list[str]) -> list[str]:
         """
         Returns the subset of tickers that pass all screens.
         Logs why each ticker was blocked.
+
+        Screens (in order):
+          1. IV quality gate — BLOCK tickers excluded (spike contamination,
+             structural break, or insufficient history).
+          2. BullishScanner  — bearish technicals excluded.
+          3. PiotroskiScorer — weak fundamentals excluded.
+
+        IV quality is checked first because it is the cheapest (cached 4h)
+        and most likely to catch a data-integrity issue before we spend time
+        on the options chain.
         """
         allowed = []
         for t in tickers:
+            iv_ok, iv_report = self.iv_gate.check(t)
+            if not iv_ok:
+                logger.info(
+                    "[TickerGate] %s blocked: IV quality BLOCK "
+                    "(score=%d contamination=%s divergence=%.1f)",
+                    t,
+                    iv_report.quality_score if iv_report else 0,
+                    iv_report.contamination.value if iv_report else "unknown",
+                    iv_report.divergence if iv_report else 0.0,
+                )
+                continue
+
             tech_ok = (not self.require_bullish)   or self.scanner.is_entry_allowed(t)
             fund_ok = (not self.require_piotroski)  or self.piotroski.is_entry_allowed(t)
+
             if tech_ok and fund_ok:
                 allowed.append(t)
+                if iv_report and iv_report.recommendation == "CAUTION":
+                    logger.warning(
+                        "[TickerGate] %s passed but IV quality is CAUTION "
+                        "(score=%d): %s",
+                        t, iv_report.quality_score,
+                        " | ".join(iv_report.warnings),
+                    )
             else:
                 reason = []
                 if not tech_ok: reason.append("bearish technicals")
@@ -590,11 +628,20 @@ class TickerGate:
     ) -> list[str]:
         """
         Score all tickers, return top_n sorted by technical score (desc).
-        Piotroski is still a hard gate. Chain fetching only runs on winners.
+        Piotroski and IV quality are hard gates. Chain fetching only runs on winners.
         Logs: 'Shortlist: 10/20 tickers: SPY(5.8) QQQ(5.2)...'
         """
         scored: list[tuple[float, str]] = []
         for t in tickers:
+            # IV quality hard gate
+            iv_ok, iv_report = self.iv_gate.check(t)
+            if not iv_ok:
+                logger.info(
+                    "[TickerGate] %s blocked: IV quality BLOCK (score=%d)",
+                    t, iv_report.quality_score if iv_report else 0,
+                )
+                continue
+
             fund_ok = (not self.require_piotroski) or self.piotroski.is_entry_allowed(t)
             if not fund_ok:
                 logger.info("[TickerGate] %s blocked: weak fundamentals", t)
