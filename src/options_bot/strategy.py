@@ -78,6 +78,18 @@ _earnings_filter = EarningsFilter(days_before=5, days_after=2)
 logger = logging.getLogger(__name__)
 
 
+def _clean_ticker(value: str) -> str:
+    """
+    Normalise a ticker/underlying string: strip whitespace and upper-case.
+
+    Applied to every underlying value extracted from EnrichedOptionRow before
+    it is passed to the execution layer or used in OCC symbol formatting.
+    Prevents silent data integrity failures from mixed-case or padded strings
+    from yfinance or other data sources.
+    """
+    return value.strip().upper() if value else value
+
+
 # ---------------------------------------------------------------------------
 # Strategy signal — output of every strategy, input to RiskManager
 # ---------------------------------------------------------------------------
@@ -285,7 +297,7 @@ class BaseStrategy(ABC):
         Non-fatal if GEX data is unavailable.
         """
         try:
-            underlying = enriched[0].underlying if enriched else "unknown"
+            underlying = _clean_ticker(enriched[0].underlying) if enriched else "unknown"
             analysis = analyze_gex(
                 ticker=underlying,
                 enriched_rows=enriched,
@@ -366,7 +378,7 @@ class CashSecuredPut(BaseStrategy):
 
         if not candidates:
             raise LiquidityFilterError(
-                f"{valid[0].underlying if valid else 'unknown'} chain",
+                f"{_clean_ticker(valid[0].underlying) if valid else 'unknown'} chain",
                 f"[{self.name}] No puts pass filters: "
                 f"DTE {cfg.min_dte}-{cfg.max_dte}, "
                 f"OI>={cfg.min_open_interest}, spread<={cfg.max_spread_pct:.0%}"
@@ -506,7 +518,7 @@ class ShortPutSpread(BaseStrategy):
 
         if len(put_candidates) < 2:
             raise LiquidityFilterError(
-                f"{valid[0].underlying if valid else '?'} chain",
+                f"{_clean_ticker(valid[0].underlying) if valid else '?'} chain",
                 f"[{self.name}] Need >= 2 liquid puts, found {len(put_candidates)}"
             )
 
@@ -749,7 +761,7 @@ class ShortStrangle(BaseStrategy):
 
         if not liquid:
             raise LiquidityFilterError(
-                f"{valid[0].underlying if valid else '?'} chain",
+                f"{_clean_ticker(valid[0].underlying) if valid else '?'} chain",
                 f"[{self.name}] No liquid contracts in DTE "
                 f"{cfg.min_dte}-{cfg.max_dte}"
             )
@@ -766,7 +778,7 @@ class ShortStrangle(BaseStrategy):
 
         if not call_candidates:
             raise LiquidityFilterError(
-                liquid[0].underlying,
+                _clean_ticker(liquid[0].underlying),
                 f"[{self.name}] No calls in chain"
             )
 
@@ -786,7 +798,7 @@ class ShortStrangle(BaseStrategy):
 
         if not put_candidates:
             raise LiquidityFilterError(
-                liquid[0].underlying,
+                _clean_ticker(liquid[0].underlying),
                 f"[{self.name}] No puts in chain"
             )
 
