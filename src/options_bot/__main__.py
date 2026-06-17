@@ -262,11 +262,12 @@ def main() -> None:
         if _webhook:
             try:
                 import urllib.request, json as _json
+                _url = _webhook.replace("discordapp.com", "discord.com")
                 _payload = _json.dumps({
                     "content": f"🔴 **Options Bot failed to start**\n```{sv_exc}```"
                 }).encode()
                 _req = urllib.request.Request(
-                    _webhook, data=_payload,
+                    _url, data=_payload,
                     headers={"Content-Type": "application/json"}, method="POST"
                 )
                 urllib.request.urlopen(_req, timeout=5)
