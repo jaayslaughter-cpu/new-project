@@ -197,7 +197,7 @@ class OrchestratorConfig:
 
     # --- Database ---
     database_url: str = field(
-        default_factory=lambda: os.getenv("DATABASE_URL", "")
+        default_factory=lambda: os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL", "")
     )
     sqlite_path: str = "options_bot.db"
 
