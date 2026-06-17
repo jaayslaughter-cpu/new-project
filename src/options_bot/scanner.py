@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 from .trendlines import analyze_trendlines, TrendlineResult
 from .iv_quality import IVQualityGate, IVQualityReport
+from .circuit_breaker import data_circuit_breaker as _cb_bb
+
+import os
+import json
 
 # Cache TTLs
 _TECH_TTL_SECONDS   = 30 * 60      # 30 minutes
