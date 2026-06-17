@@ -286,8 +286,14 @@ class SessionState:
 
 class TradeDatabase:
     """
-    Persists FilledOrders to SQLite (local) or PostgreSQL (Railway).
-    Schema is intentionally flat for simplicity — one row per leg per order.
+    Persists FilledOrders to SQLite (local dev) or PostgreSQL (Railway).
+
+    Dual-backend design:
+      - SQLite  — uses connection.execute() directly, ? placeholders
+      - psycopg2 — requires a cursor, %s placeholders, different introspection
+
+    All SQL is routed through _execute() and _executemany() helpers that
+    abstract the cursor/placeholder differences between the two backends.
     """
 
     def __init__(self, database_url: str = "", sqlite_path: str = "options_bot.db"):
@@ -296,47 +302,122 @@ class TradeDatabase:
         self._sqlite_path = sqlite_path
         self._init_schema()
 
+    # ------------------------------------------------------------------
+    # Backend abstraction helpers
+    # ------------------------------------------------------------------
+
     def _get_conn(self):
+        """Open and return a raw DB connection (caller must close/commit)."""
         if self._use_pg:
             import psycopg2
             return psycopg2.connect(self._database_url)
         return sqlite3.connect(self._sqlite_path)
 
-    def _init_schema(self) -> None:
-        with self._get_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id               TEXT PRIMARY KEY,
-                    trade_date       TEXT NOT NULL,
-                    strategy         TEXT,
-                    underlying       TEXT,
-                    legs_json        TEXT,
-                    fill_price       REAL,
-                    slippage         REAL,
-                    max_loss         REAL,
-                    hard_stop        REAL,
-                    contracts        INTEGER,
-                    net_credit       REAL,
-                    status           TEXT DEFAULT 'open',
-                    close_price      REAL,
-                    realized_pnl     REAL,
-                    broker           TEXT,
-                    created_at       TEXT,
-                    updated_at       TEXT,
-                    delta                REAL,
-                    vega                 REAL,
-                    theta                REAL,
-                    underlying_price     REAL,
-                    expiry               TEXT,
-                    profit_target_price  REAL,
-                    profit_target_pct    REAL
-                )
+    def _ph(self) -> str:
+        """Return the placeholder character for this backend: %s (pg) or ? (sqlite)."""
+        return "%s" if self._use_pg else "?"
+
+    def _execute(self, conn, sql: str, params=()) -> "Any":
+        """
+        Execute a single SQL statement, returning the cursor.
+
+        Abstracts the psycopg2 cursor vs SQLite direct-execute difference.
+        SQL must use ? placeholders — they are rewritten to %s for psycopg2.
+        """
+        if self._use_pg:
+            sql = sql.replace("?", "%s")
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur
+        # SQLite: connection.execute() returns a cursor directly
+        return conn.execute(sql, params)
+
+    def _get_existing_columns(self, conn) -> set:
+        """
+        Return the set of column names in the trades table.
+        Uses information_schema for PostgreSQL, PRAGMA for SQLite.
+        """
+        if self._use_pg:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'trades'
             """)
+            return {row[0] for row in cur.fetchall()}
+        return {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+
+    # ------------------------------------------------------------------
+    # Schema init + migration
+    # ------------------------------------------------------------------
+
+    def _init_schema(self) -> None:
+        conn = self._get_conn()
+        try:
+            # PostgreSQL uses TEXT for primary key (same as SQLite).
+            # INSERT OR REPLACE is SQLite-only — PostgreSQL uses
+            # INSERT ... ON CONFLICT DO UPDATE (upsert syntax).
+            if self._use_pg:
+                self._execute(conn, """
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id               TEXT PRIMARY KEY,
+                        trade_date       TEXT NOT NULL,
+                        strategy         TEXT,
+                        underlying       TEXT,
+                        legs_json        TEXT,
+                        fill_price       REAL,
+                        slippage         REAL,
+                        max_loss         REAL,
+                        hard_stop        REAL,
+                        contracts        INTEGER,
+                        net_credit       REAL,
+                        status           TEXT DEFAULT 'open',
+                        close_price      REAL,
+                        realized_pnl     REAL,
+                        broker           TEXT,
+                        created_at       TEXT,
+                        updated_at       TEXT,
+                        delta                REAL,
+                        vega                 REAL,
+                        theta                REAL,
+                        underlying_price     REAL,
+                        expiry               TEXT,
+                        profit_target_price  REAL,
+                        profit_target_pct    REAL
+                    )
+                """)
+            else:
+                self._execute(conn, """
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id               TEXT PRIMARY KEY,
+                        trade_date       TEXT NOT NULL,
+                        strategy         TEXT,
+                        underlying       TEXT,
+                        legs_json        TEXT,
+                        fill_price       REAL,
+                        slippage         REAL,
+                        max_loss         REAL,
+                        hard_stop        REAL,
+                        contracts        INTEGER,
+                        net_credit       REAL,
+                        status           TEXT DEFAULT 'open',
+                        close_price      REAL,
+                        realized_pnl     REAL,
+                        broker           TEXT,
+                        created_at       TEXT,
+                        updated_at       TEXT,
+                        delta                REAL,
+                        vega                 REAL,
+                        theta                REAL,
+                        underlying_price     REAL,
+                        expiry               TEXT,
+                        profit_target_price  REAL,
+                        profit_target_pct    REAL
+                    )
+                """)
             conn.commit()
-            # Migration: add columns to existing DBs that predate this schema version.
-            # ALTER TABLE IF NOT EXISTS column is not supported in all SQLite versions,
-            # so we check the column list first and add only if missing.
-            existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+
+            # Migration: add columns to existing DBs that predate this schema version
+            existing = self._get_existing_columns(conn)
             for col, typedef in [
                 ("delta",               "REAL"),
                 ("vega",                "REAL"),
@@ -347,10 +428,16 @@ class TradeDatabase:
                 ("profit_target_pct",   "REAL"),
             ]:
                 if col not in existing:
-                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
+                    self._execute(conn, f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
                     logger.info("[TradeDB] Migration: added column %s %s", col, typedef)
             conn.commit()
+        finally:
+            conn.close()
         logger.debug("[TradeDB] Schema ready (%s)", "PostgreSQL" if self._use_pg else "SQLite")
+
+    # ------------------------------------------------------------------
+    # Strategy name map
+    # ------------------------------------------------------------------
 
     # Map BaseStrategy class names → OrchestratorConfig strategy keys
     # so AdaptiveTuner WHERE strategy=? queries match DB records.
@@ -361,6 +448,10 @@ class TradeDatabase:
         "ZeroDTEStrategy": "zero_dte",
     }
 
+    # ------------------------------------------------------------------
+    # Write operations
+    # ------------------------------------------------------------------
+
     def save_fill(self, filled: FilledOrder) -> None:
         order = filled.approved_order
         legs_json = json.dumps([
@@ -369,53 +460,66 @@ class TradeDatabase:
              "expiry": l.expiry.isoformat() if l.expiry else None}
             for l in order.legs
         ])
-        # Store profit_target_price and profit_target_pct for the monitor
         _profit_target_price = order.profit_target_price
         _profit_target_pct   = order.profit_target_pct
         now = datetime.now(tz=timezone.utc).isoformat()
-        try:
-            with self._get_conn() as conn:
-                # Extract Greeks from the first source contract if available
-                # These are stored so stress_testing.py can use real deltas
-                src = order.legs[0] if order.legs else None
-                _delta = _vega = _theta = _spot = None
-                _expiry_str = None
-                if src:
-                    _expiry_str = src.expiry.isoformat() if hasattr(src, "expiry") and src.expiry else None
-                # Greeks are on the signal, not the order — pull from notes or default to None
-                # (GreeksEnricher stores them on EnrichedOptionRow, not propagated to ApprovedOrder)
-                # They will be backfilled by a mark-to-market update on the next monitor cycle
+        src = order.legs[0] if order.legs else None
+        _delta = _vega = _theta = _spot = None
+        _expiry_str = None
+        if src:
+            _expiry_str = src.expiry.isoformat() if hasattr(src, "expiry") and src.expiry else None
 
-                conn.execute("""
-                    INSERT OR REPLACE INTO trades
-                    (id, trade_date, strategy, underlying, legs_json,
-                     fill_price, slippage, max_loss, hard_stop, contracts,
-                     net_credit, status, broker, created_at, updated_at,
-                     delta, vega, theta, underlying_price, expiry,
-                     profit_target_price, profit_target_pct)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    filled.order_id,
-                    date.today().isoformat(),
-                    self._STRATEGY_NAME_MAP.get(order.strategy_name, order.strategy_name),
-                    order.underlying,
-                    legs_json,
-                    filled.fill_price,
-                    filled.slippage_actual,
-                    order.max_loss_dollars,
-                    order.hard_stop_price,
-                    order.position_size_contracts,
-                    order.net_debit_credit,
-                    filled.status,
-                    filled.broker,
-                    now, now,
-                    _delta, _vega, _theta, _spot, _expiry_str,
-                    _profit_target_price, _profit_target_pct,
-                ))
-                conn.commit()
+        # PostgreSQL uses INSERT ... ON CONFLICT; SQLite uses INSERT OR REPLACE
+        if self._use_pg:
+            sql = """
+                INSERT INTO trades
+                (id, trade_date, strategy, underlying, legs_json,
+                 fill_price, slippage, max_loss, hard_stop, contracts,
+                 net_credit, status, broker, created_at, updated_at,
+                 delta, vega, theta, underlying_price, expiry,
+                 profit_target_price, profit_target_pct)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET
+                  updated_at = EXCLUDED.updated_at,
+                  status     = EXCLUDED.status
+            """
+        else:
+            sql = """
+                INSERT OR REPLACE INTO trades
+                (id, trade_date, strategy, underlying, legs_json,
+                 fill_price, slippage, max_loss, hard_stop, contracts,
+                 net_credit, status, broker, created_at, updated_at,
+                 delta, vega, theta, underlying_price, expiry,
+                 profit_target_price, profit_target_pct)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """
+        params = (
+            filled.order_id,
+            date.today().isoformat(),
+            self._STRATEGY_NAME_MAP.get(order.strategy_name, order.strategy_name),
+            order.underlying,
+            legs_json,
+            filled.fill_price,
+            filled.slippage_actual,
+            order.max_loss_dollars,
+            order.hard_stop_price,
+            order.position_size_contracts,
+            order.net_debit_credit,
+            filled.status,
+            filled.broker,
+            now, now,
+            _delta, _vega, _theta, _spot, _expiry_str,
+            _profit_target_price, _profit_target_pct,
+        )
+        conn = self._get_conn()
+        try:
+            self._execute(conn, sql, params)
+            conn.commit()
             logger.info("[TradeDB] Saved: %s %s", filled.order_id, order.strategy_name)
         except Exception as exc:
             logger.error("[TradeDB] Save failed: %s", exc)
+        finally:
+            conn.close()
 
     def update_status(
         self, order_id: str, status: str,
@@ -423,16 +527,19 @@ class TradeDatabase:
         realized_pnl: Optional[float] = None,
     ) -> None:
         now = datetime.now(tz=timezone.utc).isoformat()
+        conn = self._get_conn()
         try:
-            with self._get_conn() as conn:
-                conn.execute(
-                    "UPDATE trades SET status=?, close_price=?, realized_pnl=?, "
-                    "updated_at=? WHERE id=?",
-                    (status, close_price, realized_pnl, now, order_id)
-                )
-                conn.commit()
+            self._execute(
+                conn,
+                "UPDATE trades SET status=?, close_price=?, realized_pnl=?, "
+                "updated_at=? WHERE id=?",
+                (status, close_price, realized_pnl, now, order_id)
+            )
+            conn.commit()
         except Exception as exc:
             logger.error("[TradeDB] Update failed for %s: %s", order_id, exc)
+        finally:
+            conn.close()
 
     def update_greeks(
         self,
@@ -443,33 +550,43 @@ class TradeDatabase:
         underlying_price: float,
     ) -> None:
         """Backfill Greeks on an open trade after the first monitor cycle snapshot."""
-        now = __import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc).isoformat()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn = self._get_conn()
         try:
-            with self._get_conn() as conn:
-                conn.execute(
-                    "UPDATE trades SET delta=?, vega=?, theta=?, underlying_price=?, "
-                    "updated_at=? WHERE id=? AND status='open'",
-                    (delta, vega, theta, underlying_price, now, order_id)
-                )
-                conn.commit()
+            self._execute(
+                conn,
+                "UPDATE trades SET delta=?, vega=?, theta=?, underlying_price=?, "
+                "updated_at=? WHERE id=? AND status='open'",
+                (delta, vega, theta, underlying_price, now, order_id)
+            )
+            conn.commit()
         except Exception as exc:
             logger.error("[TradeDB] update_greeks failed for %s: %s", order_id, exc)
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Read operations
+    # ------------------------------------------------------------------
 
     def get_open_trades(self) -> list[dict]:
+        conn = self._get_conn()
         try:
-            with self._get_conn() as conn:
-                cur = conn.execute(
-                    "SELECT id, strategy, underlying, hard_stop, contracts, "
-                    "net_credit, fill_price, legs_json, "
-                    "delta, vega, theta, underlying_price, expiry, "
-                    "profit_target_price, profit_target_pct "
-                    "FROM trades WHERE status='open'"
-                )
-                cols = [d[0] for d in cur.description]
-                return [dict(zip(cols, row)) for row in cur.fetchall()]
+            cur = self._execute(
+                conn,
+                "SELECT id, strategy, underlying, hard_stop, contracts, "
+                "net_credit, fill_price, legs_json, "
+                "delta, vega, theta, underlying_price, expiry, "
+                "profit_target_price, profit_target_pct "
+                "FROM trades WHERE status='open'"
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
         except Exception as exc:
             logger.error("[TradeDB] get_open_trades failed: %s", exc)
             return []
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
