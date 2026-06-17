@@ -331,6 +331,16 @@ class AlpacaBroker:
             )
         limit_price = _limit_price_single(live_mid, leg.side)
 
+        # Fail-stop: limit_price must be positive and non-zero before submission.
+        # _limit_price_single applies a small buffer to live_mid; if live_mid was
+        # near-zero (deep OTM, stale quote) the result could be <= 0, which Alpaca
+        # would reject with a cryptic API error. Catch it here with a clear message.
+        if not limit_price or limit_price <= 0:
+            raise PipelineConnectionError(
+                f"Invalid limit_price={limit_price!r} for {leg.symbol} "
+                f"(live_mid={live_mid}). Aborting order — check quote freshness."
+            )
+
         stop = StopLossRequest(stop_price=round(order.hard_stop_price, 2))
 
         # Timestamp + uuid4 suffix: Railway container restarts get a new
