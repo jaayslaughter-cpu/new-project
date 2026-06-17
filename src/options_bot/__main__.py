@@ -241,6 +241,38 @@ def main() -> None:
             )
             sys.exit(1)
 
+    # ── System validation — boot-sequence firewall ───────────────────────────
+    # Runs all 4 checks (env, broker, market data, internal modules) before
+    # constructing anything. Raises SystemValidationError and exits on failure.
+    # Skipped in --dry-run mode (PaperBroker, no network calls).
+    from options_bot.system_validator import run_system_validation, SystemValidationError
+    try:
+        run_system_validation(
+            api_key=api_key,
+            secret_key=secret_key,
+            paper=paper,
+            discord_webhook=os.getenv("DISCORD_WEBHOOK_URL"),
+        )
+    except SystemValidationError as sv_exc:
+        logger.critical("Boot aborted — system validation failed: %s", sv_exc)
+        # Send Discord alert if webhook is available
+        _webhook = os.getenv("DISCORD_WEBHOOK_URL")
+        if _webhook:
+            try:
+                import urllib.request, json as _json
+                _payload = _json.dumps({
+                    "content": f"🔴 **Options Bot failed to start**\n```{sv_exc}```"
+                }).encode()
+                _req = urllib.request.Request(
+                    _webhook, data=_payload,
+                    headers={"Content-Type": "application/json"}, method="POST"
+                )
+                urllib.request.urlopen(_req, timeout=5)
+            except Exception:
+                pass
+        sys.exit(1)
+    # ─────────────────────────────────────────────────────────────────────────
+
     from options_bot.orchestrator import Orchestrator, OrchestratorConfig
     from options_bot.risk import RiskConfig
 
