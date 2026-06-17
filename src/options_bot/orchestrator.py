@@ -983,11 +983,30 @@ class PositionMonitor:
         if not all_symbols:
             return
 
-        # Fetch latest quotes
+        # Fetch latest quotes — explicit rate-limit and disconnect logging
         try:
             quotes = self.broker.get_latest_quotes(all_symbols)
         except PipelineConnectionError as exc:
-            logger.warning("[Monitor] Quote fetch failed: %s", exc)
+            err_str = str(exc).lower()
+            if "429" in err_str or "too many" in err_str or "rate" in err_str:
+                logger.warning(
+                    "[Monitor] ⚠ RATE LIMIT (HTTP 429) — Alpaca throttled quote fetch "
+                    "for %d symbols. Will retry next monitor cycle (%ds). "
+                    "If this persists, reduce monitor_poll_seconds in OrchestratorConfig.",
+                    len(all_symbols), self.config.monitor_interval_minutes * 60,
+                )
+            elif "connect" in err_str or "timeout" in err_str or "network" in err_str:
+                logger.warning(
+                    "[Monitor] ⚠ CONNECTION LOST — Quote fetch timed out or network "
+                    "dropped for %d symbols (%s). Positions unmonitored this cycle — "
+                    "stops are exchange-managed via hard_stop_price on single-leg orders.",
+                    len(all_symbols), exc,
+                )
+            else:
+                logger.warning(
+                    "[Monitor] Quote fetch failed for %d symbols: %s",
+                    len(all_symbols), exc,
+                )
             return
 
         # Backfill Greeks for any open trades that still have NULL delta/vega/theta.
