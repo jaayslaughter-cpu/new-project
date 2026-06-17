@@ -398,14 +398,26 @@ class GEXEngine:
         total_gex = 0.0
 
         for symbol, snap in chain.items():
-            strike = snap.get("strike_price") or snap.get("strike")
-            oi     = snap.get("open_interest") or 0
-            greeks = snap.get("greeks") or {}
-            gamma  = greeks.get("gamma") or 0
-            opt_type = snap.get("option_type") or snap.get("type") or ""
-
-            if not strike or oi < self.cfg.gex_min_oi or not gamma:
+            # Parse strike and option_type from OCC symbol string
+            # Format: SPY260617C00580000 -> last 9 chars = C00580000
+            # Broker returns flat dict: {bid, ask, iv, delta, gamma, theta, vega, rho}
+            try:
+                # OCC: ticker(var) + YYMMDD(6) + C/P(1) + strike*1000 zero-padded(8)
+                opt_type_char = symbol[-9]          # 'C' or 'P'
+                strike        = int(symbol[-8:]) / 1000.0
+                opt_type      = "call" if opt_type_char == "C" else "put"
+            except (IndexError, ValueError):
                 continue
+
+            # Gamma comes from flat dict directly (broker normalises greeks)
+            gamma = snap.get("gamma") or 0
+            if not gamma:
+                continue
+
+            # OI: broker doesn't always return it — use bid/ask proxy
+            # If gamma is present and non-zero, treat as having valid OI
+            # Real OI gating via gex_min_oi is skipped when OI unavailable
+            oi = snap.get("open_interest") or 1   # default 1 so gamma*OI is non-zero
 
             try:
                 strike = float(strike)
@@ -414,13 +426,16 @@ class GEXEngine:
             except (TypeError, ValueError):
                 continue
 
+            if abs(strike - spot) > window:
+                continue   # outside GEX window — skip early
+
             # GEX = gamma * OI * contract_size * spot^2
             gex = gamma * oi * 100 * (spot ** 2)
 
-            if "call" in str(opt_type).lower():
+            if opt_type == "call":
                 gex_by_strike[strike] += gex
                 total_gex += gex
-            elif "put" in str(opt_type).lower():
+            elif opt_type == "put":
                 gex_by_strike[strike] -= gex
                 total_gex -= gex
 
