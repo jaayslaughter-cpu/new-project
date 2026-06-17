@@ -744,19 +744,21 @@ class TradingPipeline:
         broker: AlpacaBroker | PaperBroker,
         db: TradeDatabase,
         state: SessionState,
+        regime_detector: Optional[RegimeDetector] = None,
     ):
         self.config = config
         self.rm = risk_manager
         self.broker = broker
         self.db = db
         self.state = state
+        self._regime    = regime_detector or RegimeDetector()
         self.enricher   = GreeksEnricher()   # fetches Treasury rate on init
         self.strategy   = get_strategy(config.strategy_name, config.strategy_config)
         self._sentiment = SentimentAnalyzer(config=SentimentConfig())
         self._confidence = ConfidenceScorer(
             regime_detector=self._regime,
             db=db,
-            risk_manager=rm,
+            risk_manager=risk_manager,
         )
 
     def run_for_ticker(
@@ -1370,6 +1372,7 @@ class Orchestrator:
             broker=self.broker,
             db=self.db,
             state=self.state,
+            regime_detector=self.regime_detector,
         )
         self.monitor = PositionMonitor(
             broker=self.broker,
