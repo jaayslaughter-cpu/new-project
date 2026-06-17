@@ -1365,22 +1365,7 @@ class Orchestrator:
             sqlite_path=config.sqlite_path,
         )
 
-        # Pipeline and monitor
-        self.pipeline = TradingPipeline(
-            config=config,
-            risk_manager=self.rm,
-            broker=self.broker,
-            db=self.db,
-            state=self.state,
-            regime_detector=self.regime_detector,
-        )
-        self.monitor = PositionMonitor(
-            broker=self.broker,
-            db=self.db,
-            state=self.state,
-            discord_webhook_url=config.discord_webhook_url,
-            risk_manager=self.rm,
-        )
+        # Pipeline and monitor — constructed below after regime_detector is ready
 
         # Apply risk profile — overrides relevant config fields.
         # strategy_config must be instantiated first so apply_profile() can
@@ -1417,6 +1402,23 @@ class Orchestrator:
         # Regime detector — replaces simple VIX threshold
         self.regime_detector = RegimeDetector(
             cache_ttl_seconds=config.regime_cache_ttl
+        )
+
+        # Pipeline and monitor (needs self.regime_detector, so constructed here)
+        self.pipeline = TradingPipeline(
+            config=config,
+            risk_manager=self.rm,
+            broker=self.broker,
+            db=self.db,
+            state=self.state,
+            regime_detector=self.regime_detector,
+        )
+        self.monitor = PositionMonitor(
+            broker=self.broker,
+            db=self.db,
+            state=self.state,
+            discord_webhook_url=config.discord_webhook_url,
+            risk_manager=self.rm,
         )
 
         # Sentiment analyzer — FinBERT news signal layer
