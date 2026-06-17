@@ -22,6 +22,51 @@ OptionType = Literal["call", "put"]
 OrderSide = Literal["buy_to_open", "sell_to_open", "buy_to_close", "sell_to_close"]
 
 
+# ---------------------------------------------------------------------------
+# OCC symbol helper — also available in broker.py for execution layer
+# ---------------------------------------------------------------------------
+
+def format_option_symbol(
+    ticker: str,
+    expiry_yymmdd: str,
+    option_type: str,
+    strike: float,
+) -> str:
+    """
+    Format an option contract symbol in strict Alpaca OCC format (no spaces).
+
+    Pattern: {TICKER}{YYMMDD}{C|P}{strike_8digit}
+
+    Strike encoding: integer value of (strike * 1000), zero-padded to 8 digits.
+    This encodes up to $99,999.999 with three decimal places of precision.
+
+    Examples:
+        SPY $580.00 call 2026-06-20  → "SPY260620C00580000"
+        SPY $522.50 put  2026-06-20  → "SPY260620P00522500"
+        QQQ $475.50 call 2026-07-18  → "QQQ260718C00475500"
+
+    Args:
+        ticker:        Underlying symbol e.g. "SPY" (case-insensitive)
+        expiry_yymmdd: 6-char string "YYMMDD" e.g. "260620" for 2026-06-20
+        option_type:   "C", "CALL", "P", or "PUT" (case-insensitive)
+        strike:        Strike price as float e.g. 580.0 or 522.5
+
+    Returns:
+        OCC-formatted symbol string with no spaces.
+
+    Raises:
+        ValueError: if option_type is invalid or strike is non-positive.
+    """
+    ot = option_type.upper()
+    if ot not in ("C", "P", "CALL", "PUT"):
+        raise ValueError(f"option_type must be C/P/CALL/PUT, got {option_type!r}")
+    ot_char = "C" if ot in ("C", "CALL") else "P"
+    if strike <= 0:
+        raise ValueError(f"Strike must be positive, got {strike}")
+    padded_strike = f"{int(round(strike * 1000)):08d}"
+    return f"{ticker.upper()}{expiry_yymmdd}{ot_char}{padded_strike}"
+
+
 @dataclass
 class OptionChainRow:
     """
