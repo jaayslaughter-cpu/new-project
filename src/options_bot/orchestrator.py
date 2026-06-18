@@ -1976,6 +1976,18 @@ class Orchestrator:
                 logger.info("[Orchestrator] All tickers blocked by pre-screening gate — no scan")
                 return []
 
+        # Append congress+news confirmed individual stocks to scan list
+        # These bypass the BullishScanner gate (they have their own signal gate)
+        # but still go through the full pipeline: IV, Greeks, risk, execution
+        if _dynamic:
+            new_stocks = [t for t in _dynamic if t not in scan_tickers]
+            if new_stocks:
+                scan_tickers = list(scan_tickers) + new_stocks
+                logger.info(
+                    "[Orchestrator] +%d dynamic stock(s) appended to scan: %s",
+                    len(new_stocks), ", ".join(new_stocks),
+                )
+
         for ticker in scan_tickers:
             # Don't exceed max positions mid-scan
             positions = self.broker.get_positions()
