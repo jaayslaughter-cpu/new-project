@@ -58,7 +58,7 @@ from .exceptions import (
 from .greeks import GreeksEnricher
 from .market_data import YFinanceDataLoader
 from .risk import ExecutionGuard, RiskConfig, RiskManager
-from .regime import RegimeDetector
+from .regime import RegimeDetector, get_regime_policy, REGIME_POLICY
 from .sentiment import SentimentAnalyzer, SentimentConfig
 from .metrics import summary as perf_summary
 from .adaptive import AdaptiveTuner
@@ -641,6 +641,73 @@ def send_discord(webhook_url: str, message: str) -> None:
         logger.warning("[Discord] Send failed (non-fatal): %s", exc)
 
 
+def _classify_vol_regime_inline(
+    iv_rank: Optional[float],
+    skew_ratio: Optional[float],
+    term_slope: Optional[float],
+) -> Optional[dict]:
+    """
+    Classify vol regime from per-contract signal data.
+    Adapted from Quantops/options_vol_regime.py classify_vol_regime().
+
+    Returns dict with premium/skew/term regime + favored strategy list,
+    or None if insufficient data.
+    """
+    if iv_rank is None:
+        return None
+
+    # Premium regime
+    if iv_rank >= 75:
+        premium = "rich"
+    elif iv_rank <= 25:
+        premium = "cheap"
+    else:
+        premium = "neutral"
+
+    # Skew regime
+    if skew_ratio is not None:
+        if skew_ratio >= 1.30:
+            skew = "steep_put"
+        elif skew_ratio <= 0.85:
+            skew = "steep_call"
+        else:
+            skew = "neutral"
+    else:
+        skew = "neutral"
+
+    # Term structure
+    if term_slope is not None:
+        if term_slope >= 0.02:
+            term = "contango"
+        elif term_slope <= -0.02:
+            term = "backwardation"
+        else:
+            term = "flat"
+    else:
+        term = "flat"
+
+    # Strategy routing
+    favored = []
+    if premium == "rich":
+        if skew == "steep_put":
+            favored = ["short_put_spread", "iron_condor"]
+        elif skew == "neutral":
+            favored = ["short_put_spread", "short_strangle"]
+        else:
+            favored = ["short_strangle"]
+    elif premium == "cheap":
+        favored = ["csp"]   # collect what's available; avoid spreads
+    else:
+        favored = ["short_put_spread"]
+
+    return {
+        "premium": premium,
+        "skew":    skew,
+        "term":    term,
+        "favored": ", ".join(favored),
+    }
+
+
 def _format_signal_message(
     signal: StrategySignal,
     filled: FilledOrder,
@@ -969,6 +1036,24 @@ class TradingPipeline:
             self.state.filled_today.append(filled)
 
         _conf_line = _confidence_report.short_line() if _confidence_report else ""
+        # Vol regime classification (skew-aware strategy routing)
+        # Adapted from Quantops/options_vol_regime.py
+        try:
+            _iv_rank = getattr(signal, "iv_rank", None)
+            _iv_skew = getattr(signal, "iv_skew", None)    # put_iv/call_iv ratio
+            _term_sl = getattr(signal, "term_slope", None) # back_iv - front_iv
+            _vol_regime = _classify_vol_regime_inline(
+                iv_rank=_iv_rank, skew_ratio=_iv_skew, term_slope=_term_sl
+            )
+            if _vol_regime:
+                logger.info(
+                    "[Pipeline] %s vol regime: premium=%s skew=%s term=%s → %s",
+                    ticker, _vol_regime["premium"], _vol_regime["skew"],
+                    _vol_regime["term"], _vol_regime["favored"],
+                )
+        except Exception:
+            pass
+
         msg = _format_signal_message(signal, filled, regime_name, regime_options_weight)
         if _conf_line:
             msg = msg + "\n" + _conf_line
@@ -1761,6 +1846,21 @@ class Orchestrator:
             indicators.get("yield_curve_slope", 0),
         )
 
+        # Apply regime policy — single source of truth for regime-driven constraints
+        policy = get_regime_policy(regime_name)
+
+        if policy.block_new_entries:
+            msg = (
+                f"🔴 **REGIME GATE: Trading halted** — "
+                f"regime={regime_name.upper()} | "
+                f"VIX={indicators.get('vix_level', 0):.1f} | "
+                f"options_weight={options_weight:.0%}\n"
+                f"_All new entries blocked until regime improves._"
+            )
+            logger.warning("[Orchestrator] %s", msg)
+            send_discord(self.config.discord_webhook_url, msg)
+            return []
+
         if options_weight < self.config.regime_min_options_weight:
             msg = (
                 f"⚠️ **REGIME GATE: No new trades today** — "
@@ -1775,6 +1875,14 @@ class Orchestrator:
             logger.warning("[Orchestrator] %s", msg)
             send_discord(self.config.discord_webhook_url, msg)
             return []
+
+        # Log regime policy being applied
+        logger.info(
+            "[Orchestrator] Regime policy: size×%.2f max_trades=%d "
+            "conf_boost=%d favored=%s",
+            policy.size_multiplier, policy.max_trades_per_scan,
+            policy.min_confidence_boost, policy.favored_strategy,
+        )
 
         # Legacy VIX hard-stop (defense in depth, independent of regime score)
         vix_level = indicators.get("vix_level")
