@@ -471,7 +471,7 @@ class ShortPutSpreadConfig:
     max_dte: int = 45
     min_open_interest: int = 100
     max_spread_pct: float = 0.25
-    min_spread_width: float = 2.0       # minimum strike width in dollars
+    min_spread_width: float = 1.0       # minimum strike width in dollars (lowered for ETFs)
     max_spread_width: float = 20.0      # maximum strike width
     min_credit: float = 0.25            # minimum credit to bother with the trade
     stop_multiplier: float = 2.0        # stop at 2x credit received
