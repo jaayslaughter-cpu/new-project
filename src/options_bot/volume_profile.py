@@ -400,11 +400,21 @@ def check_strike_safety(
                     f"above HVN ${hvn_price} (strength {lvl['strength_pct']}%)"
                 )
 
-        # Danger 3: strike is inside the value area — contested zone
+        # Danger 3: strike inside value area — warn but allow
+        # For ETFs the value area spans most of the tradeable range because
+        # volume is distributed across the entire price history. A hard reject
+        # here blocks almost every ETF spread. Downgrade to a warning — the
+        # strike quality score in the confidence scorer will reflect this.
         if va_lo < short_strike < va_hi:
-            return False, (
-                f"short strike ${short_strike} is inside value area "
-                f"[${va_lo}–${va_hi}] — high contested zone"
+            import logging as _log
+            _log.getLogger(__name__).debug(
+                "VP: %s short strike $%.2f inside value area [$%.2f–$%.2f] "
+                "— caution but allowing (ETF universe)", ticker, short_strike, va_lo, va_hi
+            )
+            # Return True with a caution note instead of blocking
+            return True, (
+                f"caution: short strike ${short_strike} inside value area "
+                f"[${va_lo}–${va_hi}] — monitor for mean reversion"
             )
 
     else:  # bear_call — short call above spot
