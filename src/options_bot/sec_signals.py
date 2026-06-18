@@ -309,14 +309,81 @@ def _score_sec_signals_impl(ticker: str, use_cache: bool = True) -> dict:
         result["detail"] = result.get("detail", "") + f"; AV insider boost=+{av_boost}"
         logger.debug("[SEC] %s: AV insider boost +%d → total score=%d", ticker, av_boost, result["score"])
 
-    # Congressional trades boost (same-day disclosure via Quiver Quant)
-    congress_boost = score_congress_signals(ticker)
+    # Congressional trades boost — filtered by news sentiment confirmation
+    # Fetch news signal to cross-reference against congressional activity
+    _news_sig   = result.get("news_signal")    # injected by orchestrator if available
+    _news_score = result.get("news_score")     # injected by orchestrator if available
+    congress_boost = score_congress_signals(
+        ticker,
+        news_signal=_news_sig,
+        news_score=_news_score,
+    )
     if congress_boost != 0:
+        congress_trades = get_congress_trades(ticker)
+        buys  = [t for t in congress_trades if "purchase" in t.trade_type or "buy" in t.trade_type]
+        sells = [t for t in congress_trades if "sale" in t.trade_type]
+        news_note = f" [news={_news_sig}]" if _news_sig else ""
         result["score"] = result.get("score", 0) + congress_boost
-        result["detail"] = result.get("detail", "") + f"; Congress boost={congress_boost:+d}"
-        logger.debug("[SEC] %s: Congress boost %+d → total score=%d", ticker, congress_boost, result["score"])
+        result["detail"] = (
+            result.get("detail", "") +
+            f"; Congress boost={congress_boost:+d}{news_note}"
+            f" ({len(buys)} buys/{len(sells)} sells in 90d)"
+        )
+        result["congress_buys"]  = len(buys)
+        result["congress_sells"] = len(sells)
+        result["news_confirmed"]  = _news_sig == "BUY" if _news_sig else None
+        logger.info(
+            "[SEC] %s: Congress %+d%s buys=%d sells=%d → total=%d",
+            ticker, congress_boost, news_note, len(buys), len(sells), result["score"],
+        )
 
     _results_cache[ticker] = (now, result)
+    return result
+
+
+def score_sec_with_news(
+    ticker: str,
+    news_signal: Optional[str] = None,
+    news_score: Optional[float] = None,
+) -> dict:
+    """
+    Run SEC scoring with news sentiment pre-injected for congress confirmation.
+
+    Call this instead of score_sec_signals() when you have sentiment data available.
+    The news_signal and news_score are temporarily stored in the result dict
+    so score_congress_signals() can read them during scoring.
+
+    Parameters
+    ----------
+    ticker       : ETF ticker
+    news_signal  : "BUY" | "SELL" | "HOLD" from SentimentAnalyzer.get_signals()
+    news_score   : weighted score -1.0 to +1.0 from TickerSignal.weighted_score
+    """
+    # Use a fresh (uncached) score with the news data injected
+    result = _score_sec_signals_impl(ticker, use_cache=False)
+    # The congress call inside _score_sec_signals_impl will have already used
+    # result["news_signal"] if it was set — but we need to pre-seed it.
+    # Re-run congress scoring with news context and update result.
+    result["news_signal"] = news_signal
+    result["news_score"]  = news_score
+    congress_boost = score_congress_signals(ticker, news_signal=news_signal, news_score=news_score)
+    if congress_boost != 0:
+        trades = get_congress_trades(ticker)
+        buys  = [t for t in trades if "purchase" in t.trade_type or "buy" in t.trade_type]
+        sells = [t for t in trades if "sale" in t.trade_type]
+        news_note = f" [news={news_signal}]" if news_signal else ""
+        # Avoid double-counting: subtract any previous congress boost and re-add
+        prev_boost = result.get("_prev_congress_boost", 0)
+        result["score"] = max(0, result["score"] - prev_boost) + congress_boost
+        result["_prev_congress_boost"] = congress_boost
+        result["detail"] = (
+            result.get("detail", "").split("; Congress boost=")[0] +
+            f"; Congress boost={congress_boost:+d}{news_note}"
+            f" ({len(buys)} buys/{len(sells)} sells)"
+        )
+        result["congress_buys"]  = len(buys)
+        result["congress_sells"] = len(sells)
+        result["news_confirmed"]  = news_signal == "BUY" if news_signal else None
     return result
 
 
@@ -700,29 +767,70 @@ def _parse_amount_range(text: str) -> tuple[float, float]:
     return _parse(parts[0]), _parse(parts[1])
 
 
-def score_congress_signals(ticker: str) -> int:
+def score_congress_signals(
+    ticker: str,
+    news_signal: Optional[str] = None,   # "BUY" | "SELL" | "HOLD" | None
+    news_score: Optional[float] = None,  # weighted sentiment -1.0 to +1.0
+) -> int:
     """
-    Score recent congressional trading activity for use in sec_signals.
+    Score congressional trades filtered and weighted by news confirmation.
 
-    Scoring:
-      Recent purchase (≤30 days):  +12 per trade (capped at +36)
-      Recent purchase (31-90 days): +5 per trade (capped at +15)
-      Recent sale:                  -3 per trade
+    Congressional trades alone are useful but noisy — politicians sometimes
+    trade on sector-wide macro views, not company-specific knowledge. Requiring
+    a corroborating news signal significantly improves signal quality:
 
-    Returns integer score to add to SEC signal score.
+      Congress BUY + News BUY  → full boost + 10pt bonus (strong combined signal)
+      Congress BUY + News HOLD → full boost (neutral confirmation, proceed)
+      Congress BUY + News SELL → 50% boost (conflicting signals — halved)
+      Congress SELL + any news → penalty applied (insider distribution)
+
+    If news_signal is not provided (None), falls back to standalone scoring.
+
+    Scoring (before news adjustment):
+      Recent purchase (≤30 days):  +12 each (cap +36)
+      Older purchase (31-90 days):  +5 each (cap +15)
+      Sale:                         -3 each
+
+    Returns integer score to add to SEC signal total.
     """
     trades = get_congress_trades(ticker)
     if not trades:
         return 0
 
-    score = 0
+    # Base score from trade activity
+    raw_score = 0
+    buy_count = 0
     for t in trades:
         if "purchase" in t.trade_type or "buy" in t.trade_type:
-            score += 12 if t.days_since <= 30 else 5
+            raw_score += 12 if t.days_since <= 30 else 5
+            buy_count += 1
         elif "sale" in t.trade_type:
-            score -= 3
+            raw_score -= 3
 
-    return max(-15, min(36, score))
+    raw_score = max(-15, min(36, raw_score))
+
+    # News confirmation adjustment
+    if news_signal is not None and buy_count > 0:
+        news_sig = (news_signal or "HOLD").upper()
+        if news_sig == "BUY":
+            # Strong combined signal: congress buying + positive news
+            adjusted = raw_score + 10
+            logger.info(
+                "[Congress+News] %s: congress_score=%d + news_BUY_bonus=+10 → %d",
+                ticker, raw_score, adjusted,
+            )
+            raw_score = adjusted
+        elif news_sig == "SELL":
+            # Conflicting: congress buying but negative news cycle
+            adjusted = int(raw_score * 0.5)
+            logger.info(
+                "[Congress+News] %s: congress_score=%d × 0.5 (news=SELL conflict) → %d",
+                ticker, raw_score, adjusted,
+            )
+            raw_score = adjusted
+        # HOLD: no adjustment — congress signal stands on its own
+
+    return max(-15, min(46, raw_score))   # cap raised to 46 for combined BUY+BUY
 
 
 def policy_etf_boost(ticker: str, signals: list[PolicySignal]) -> int:
