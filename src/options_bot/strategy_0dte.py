@@ -458,10 +458,15 @@ class GEXEngine:
 
         try:
             today_str = date.today().isoformat()
+            # For 0DTE: do NOT pass expiration_date — Alpaca's snapshot endpoint
+            # returns today's contracts by default. Passing today's date as a
+            # filter causes the API to return an empty chain (confirmed by logs).
+            # Filter to near-ATM strikes only to keep the response lean.
             chain = self.broker.get_option_chain(
                 self.cfg.underlying,
-                expiration_date=today_str,
                 option_type=None,   # both calls and puts
+                strike_price_gte=spot * (1 - self.cfg.gex_window_pct),
+                strike_price_lte=spot * (1 + self.cfg.gex_window_pct),
             )
             _cb.record_success("alpaca_chain_0dte")
         except Exception as exc:
@@ -492,6 +497,7 @@ class GEXEngine:
             # Gamma comes from flat dict directly (broker normalises greeks)
             gamma = snap.get("gamma") or 0
             if not gamma:
+                logger.debug("[GEX] %s: gamma=None/0 — skipping (greeks not available)", symbol)
                 continue
 
             # OI: broker doesn't always return it — use bid/ask proxy
@@ -520,7 +526,22 @@ class GEXEngine:
                 total_gex -= gex
 
         if not gex_by_strike:
-            logger.warning("[GEX] No valid strikes in chain")
+            logger.warning(
+                "[GEX] No valid strikes in chain for %s "
+                "(chain had %d contracts, all had gamma=None/0 — "
+                "Alpaca may not return greeks for 0DTE contracts; "
+                "activating CBOE fallback)",
+                self.cfg.underlying, len(chain),
+            )
+            # Try CBOE free GEX fallback
+            try:
+                from .gex_analysis import fetch_cboe_gex
+                cboe_result = fetch_cboe_gex(self.cfg.underlying)
+                if cboe_result:
+                    logger.info("[GEX] CBOE fallback succeeded: %s", cboe_result)
+                    return cboe_result
+            except Exception as cboe_exc:
+                logger.debug("[GEX] CBOE fallback failed: %s", cboe_exc)
             return None
 
         regime = "POSITIVE_GAMMA" if total_gex >= 0 else "NEGATIVE_GAMMA"
