@@ -75,6 +75,86 @@ ET = pytz.timezone("US/Eastern")
 # Configuration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Gap guard  (trading-bot-main/gap_guard.py)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dcg
+
+@_dcg(frozen=True)
+class GapDecision:
+    action: str   # "skip" | "proceed" | "proceed_lower"
+    ratio:  float
+    reason: str
+
+def evaluate_gap(prev_close: float, current: float, tolerance: float = 0.015) -> "GapDecision":
+    """Three-way gap decision for 0DTE entries."""
+    if prev_close <= 0 or current <= 0:
+        return GapDecision("proceed", 1.0, "no_price_passthrough")
+    ratio = current / prev_close
+    if ratio > 1.0 + tolerance:
+        return GapDecision("skip", ratio, f"gap_up_{(ratio-1)*100:.2f}%")
+    if ratio < 1.0 - tolerance:
+        return GapDecision("proceed_lower", ratio, f"gap_down_{(1-ratio)*100:.2f}%_recentre")
+    return GapDecision("proceed", ratio, f"within_tol_{ratio:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# Session-aware momentum engine  (alpaca-options-framework/momentum.py)
+# ---------------------------------------------------------------------------
+
+class IntraSessionMomentum:
+    """VWAP + EMA5/20 + consecutive bars. VWAP resets each session; EMAs persist."""
+    _MIN_CONSEC = 2; _ROC_MIN = 0.0003
+
+    def __init__(self):
+        self._bars: list = []; self._ema5 = self._ema20 = None
+        self._cum_tp_vol = self._cum_vol = 0.0
+        self._consec_g = self._consec_r = 0
+
+    def reset_session(self):
+        self._cum_tp_vol = self._cum_vol = 0.0
+        self._bars = []; self._consec_g = self._consec_r = 0
+
+    @staticmethod
+    def _ema(prev, price, n):
+        k = 2.0/(n+1); return price if prev is None else price*k+prev*(1-k)
+
+    def on_bar(self, o: float, h: float, l: float, c: float, v: float = 1.0) -> dict:
+        self._bars.append((o,h,l,c,v))
+        if len(self._bars) > 50: self._bars.pop(0)
+        tp = (h+l+c)/3.0; self._cum_tp_vol += tp*v; self._cum_vol += v
+        vwap = self._cum_tp_vol/self._cum_vol if self._cum_vol else c
+        self._ema5  = self._ema(self._ema5,  c, 5)
+        self._ema20 = self._ema(self._ema20, c, 20)
+        roc5 = 0.0
+        if len(self._bars) >= 6:
+            p5 = self._bars[-6][3]; roc5 = (c-p5)/p5 if p5 else 0.0
+        if c > o: self._consec_g += 1; self._consec_r = 0
+        elif c < o: self._consec_g = 0; self._consec_r += 1
+        atr5 = sum(b[1]-b[2] for b in self._bars[-5:]) / min(5, len(self._bars))
+        e5, e20 = self._ema5 or c, self._ema20 or c
+        bull = c>vwap and e5>e20 and roc5>=self._ROC_MIN and self._consec_g>=self._MIN_CONSEC
+        bear = c<vwap and e5<e20 and roc5<=-self._ROC_MIN and self._consec_r>=self._MIN_CONSEC
+        return {"direction":"bull" if bull else("bear" if bear else"neutral"),
+                "vwap":round(vwap,4),"ema5":round(e5,4),"ema20":round(e20,4),
+                "roc5":round(roc5,6),"consec_green":self._consec_g,
+                "consec_red":self._consec_r,"atr5":round(atr5,4)}
+
+
+class BarCooldown:
+    """N 1-min bar cooldown after a fill or stop."""
+    def __init__(self, bars: int = 3):
+        self._total = bars; self._rem = 0
+    def start(self):
+        self._rem = self._total; logger.info("[0DTE] Cooldown: %d bars", self._total)
+    def tick(self):
+        if self._rem > 0: self._rem -= 1
+    def ready(self) -> bool: return self._rem == 0
+    @property
+    def remaining(self) -> int: return self._rem
+
+
 @dataclass
 class ZeroDTEConfig:
     """All tunable parameters for the 0DTE GEX scalper."""
@@ -1091,9 +1171,13 @@ class ZeroDTEStrategy:
             logger.info("[0DTE] %d consecutive down days > %d — skip", consec_down, self.cfg.max_consec_down_days)
             return None
 
-        if gap_pct > self.cfg.max_gap_pct:
-            logger.info("[0DTE] Gap %.2f%% > max %.1f%% — GEX pin disrupted", gap_pct, self.cfg.max_gap_pct)
-            return None
+        _prev = spy_data.get("prev_close", spy_data.get("open", spy_price))
+        _gd   = evaluate_gap(_prev, spy_price, self.cfg.max_gap_pct / 100.0)
+        if _gd.action == "skip":
+            logger.info("[0DTE] Gap SKIP: %s", _gd.reason); return None
+        if _gd.action == "proceed_lower":
+            logger.info("[0DTE] Gap PROCEED_LOWER: %s — recentring", _gd.reason)
+            spy_price = spy_data.get("open", spy_price)
 
         # Expected move filter
         exp_move = _expected_move_pct(spy_price, vix, hours=2.0)
