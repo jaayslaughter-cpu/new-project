@@ -833,6 +833,203 @@ def score_congress_signals(
     return max(-15, min(46, raw_score))   # cap raised to 46 for combined BUY+BUY
 
 
+# ---------------------------------------------------------------------------
+# Dynamic ticker universe — congress + news confirmed individual stocks
+# ---------------------------------------------------------------------------
+
+_DYNAMIC_UNIVERSE_CACHE: dict[str, tuple[float, list[str]]] = {}
+_DYNAMIC_TTL = 3600   # 1 hour — refresh once per hour during market hours
+
+# Minimum liquidity requirements for individual stocks
+# (stricter than ETFs — stocks have thinner options markets)
+_STOCK_MIN_OI         = 500    # min open interest per contract
+_STOCK_MIN_MARKET_CAP = 10e9   # $10B+ market cap proxy via yfinance
+_STOCK_MAX_SPREAD_PCT = 0.15   # max bid/ask spread as % of mid
+
+
+def get_congress_universe(lookback_days: int = 30, top_n: int = 10) -> list[str]:
+    """
+    Fetch ALL recent congressional trades and return the most-purchased
+    individual stock tickers (non-ETF) from the last lookback_days.
+
+    Uses Quiver Quant's aggregate endpoint (no ticker filter) to discover
+    new tickers being bought by congress without having to know them in advance.
+
+    Returns list of tickers sorted by buy count, capped at top_n.
+    """
+    cache_key = f"congress_universe_{lookback_days}"
+    cached = _DYNAMIC_UNIVERSE_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < _DYNAMIC_TTL:
+        return cached[1]
+
+    if not _cb.is_available("congress_universe"):
+        return []
+
+    try:
+        import urllib.request as _ur, ssl as _ssl
+        from datetime import date as _date, datetime as _dt
+        from collections import Counter as _Counter
+
+        # Quiver aggregate endpoint — returns all recent trades
+        url = _QUIVER_URL   # https://api.quiverquant.com/beta/live/congresstrading
+        req = _ur.Request(url, headers=_QUIVER_HEADERS)
+        ctx = _ssl.create_default_context()
+        with _ur.urlopen(req, timeout=12, context=ctx) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+
+        _cb.record_success("congress_universe")
+
+        today = _date.today()
+        cutoff = today.toordinal() - lookback_days
+
+        # Known ETF prefixes/patterns to exclude
+        _ETF_CLUES = {
+            "SPY","QQQ","IWM","DIA","MDY","XLF","XLK","XLE","XLV","XLI",
+            "XLC","XLY","XLP","XLB","XLRE","GLD","TLT","EEM","HYG","SMH",
+            "VXX","XBI","VTI","VOO","AGG","BND","LQD","GDX","SLV","USO",
+            "ARKK","ARKG","TQQQ","SQQQ","UVXY","VIXY","IBB","XRT",
+        }
+
+        buy_counts: _Counter = _Counter()
+        for row in (data if isinstance(data, list) else []):
+            try:
+                ticker = str(row.get("Ticker") or row.get("ticker") or "").upper().strip()
+                if not ticker or len(ticker) > 5 or ticker in _ETF_CLUES:
+                    continue
+                # Skip leveraged/inverse (contain numbers or 2-3 letter + S/L)
+                if any(c.isdigit() for c in ticker):
+                    continue
+                tx_type = str(row.get("Transaction") or "").lower()
+                if "purchase" not in tx_type and "buy" not in tx_type:
+                    continue
+                filed = str(row.get("Date") or row.get("FiledAfter") or "")[:10]
+                try:
+                    filed_date = _dt.strptime(filed, "%Y-%m-%d").date()
+                    if filed_date.toordinal() < cutoff:
+                        continue
+                except ValueError:
+                    continue
+                buy_counts[ticker] += 1
+            except Exception:
+                continue
+
+        result = [t for t, _ in buy_counts.most_common(top_n)]
+        _DYNAMIC_UNIVERSE_CACHE[cache_key] = (time.time(), result)
+        if result:
+            logger.info("[Congress Universe] %d candidate tickers: %s",
+                        len(result), ", ".join(result))
+        return result
+
+    except Exception as exc:
+        _cb.record_failure("congress_universe", str(exc))
+        logger.debug("[Congress Universe] fetch failed: %s", exc)
+        return []
+
+
+def get_news_universe(
+    lookback_days: int = 3,
+    top_n: int = 10,
+    min_articles: int = 3,
+) -> list[str]:
+    """
+    Discover individual stock tickers getting significant positive news coverage.
+
+    Fetches recent Alpaca news without a ticker filter to find what's being
+    discussed broadly, then surfaces tickers mentioned in multiple articles.
+    Only returns tickers with min_articles mentions (avoids one-off noise).
+
+    Returns list of tickers sorted by mention count, capped at top_n.
+    """
+    cache_key = f"news_universe_{lookback_days}"
+    cached = _DYNAMIC_UNIVERSE_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < _DYNAMIC_TTL:
+        return cached[1]
+
+    try:
+        import os as _os, urllib.request as _ur
+        from collections import Counter as _Counter
+
+        api_key    = _os.getenv("ALPACA_API_KEY", "")
+        api_secret = _os.getenv("ALPACA_SECRET_KEY", "")
+        if not api_key or not api_secret:
+            return []
+
+        from datetime import timezone as _tz, timedelta as _td
+        base_url = _os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+        start = (datetime.now(tz=timezone.utc) - timedelta(days=lookback_days)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        # No symbols filter — get broad market news
+        params  = f"start={start}&limit=50&sort=desc"
+        headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": api_secret}
+        req = _ur.Request(
+            f"{base_url}/v1beta1/news?{params}", headers=headers
+        )
+        with _ur.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+
+        _ETF_CLUES = {
+            "SPY","QQQ","IWM","DIA","MDY","XLF","XLK","XLE","XLV","XLI",
+            "XLC","XLY","XLP","XLB","XLRE","GLD","TLT","EEM","HYG","SMH",
+            "VXX","XBI","VTI","VOO","BND",
+        }
+
+        mention_counts: _Counter = _Counter()
+        for article in data.get("news", []):
+            symbols = article.get("symbols") or []
+            for sym in symbols:
+                sym = sym.upper().strip()
+                if not sym or len(sym) > 5 or sym in _ETF_CLUES:
+                    continue
+                if any(c.isdigit() for c in sym):
+                    continue
+                mention_counts[sym] += 1
+
+        result = [t for t, c in mention_counts.most_common(top_n * 2)
+                  if c >= min_articles][:top_n]
+        _DYNAMIC_UNIVERSE_CACHE[cache_key] = (time.time(), result)
+        if result:
+            logger.info("[News Universe] %d tickers with %d+ mentions: %s",
+                        len(result), min_articles, ", ".join(result))
+        return result
+
+    except Exception as exc:
+        logger.debug("[News Universe] fetch failed: %s", exc)
+        return []
+
+
+def get_dynamic_tickers(max_tickers: int = 5) -> list[str]:
+    """
+    Return up to max_tickers individual stock tickers that appear in BOTH
+    the congressional trades universe AND the news universe.
+
+    Congress-only or news-only tickers are excluded — only the intersection
+    qualifies. This requires two independent confirming signals before any
+    individual stock enters the scan universe.
+
+    These tickers are appended to the static ETF list at scan time and
+    subject to all the same filters (IV quality, Piotroski, sentiment, risk).
+    """
+    congress_tickers = set(get_congress_universe())
+    news_tickers     = set(get_news_universe())
+
+    # Intersection = confirmed by both sources
+    confirmed = list(congress_tickers & news_tickers)
+
+    if confirmed:
+        logger.info(
+            "[Dynamic Universe] %d tickers confirmed by congress+news: %s",
+            len(confirmed), ", ".join(confirmed),
+        )
+    else:
+        logger.debug(
+            "[Dynamic Universe] No overlap — congress=%s news=%s",
+            list(congress_tickers)[:5], list(news_tickers)[:5],
+        )
+
+    return confirmed[:max_tickers]
+
+
 def policy_etf_boost(ticker: str, signals: list[PolicySignal]) -> int:
     """
     Return a score boost (+15 per L1 signal, +8 per L2) if a ticker is in the
