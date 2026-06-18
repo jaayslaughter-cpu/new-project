@@ -69,7 +69,7 @@ from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profi
 from .universe import UniverseBuilder
 from .volume_profile import volume_profile_cache
 from .stress_testing import run_stress_suite, positions_from_broker
-from .sec_signals import is_entry_confirmed, score_sec_signals
+from .sec_signals import is_entry_confirmed, score_sec_signals, score_sec_with_news
 from .confidence_score import ConfidenceScorer
 
 logger = logging.getLogger(__name__)
@@ -90,45 +90,33 @@ class OrchestratorConfig:
     # All have liquid options markets on Alpaca. The bot ranks and filters daily
     # and trades only the top candidates that pass all signal gates.
     tickers: list[str] = field(default_factory=lambda: [
-        # Index ETFs (core)
-        "SPY", "QQQ", "IWM", "DIA", "MDY",
-        # Sector ETFs
-        "XLF", "XLK", "XLE", "XLV", "XLI", "XLC", "XLY", "XLP", "XLB", "XLRE",
-        # Volatility-sensitive
-        "GLD", "TLT", "EEM", "HYG", "SMH",
-
-        # ── Expansion tier — uncomment when ready to grow beyond 20 ──────────
-        # Add these only if: signal frequency is too low, win rate weakens on
-        # existing tickers, or you want more granular sector/asset exposure.
-        # Verify each has active options on Alpaca before enabling.
-        #
-        # Volatility instruments
-        # "VIXY",           # ProShares VIX Short-Term Futures ETF (VIX proxy)
-        #
-        # Bonds (broader fixed income)
-        # "AGG",            # iShares Core U.S. Aggregate Bond ETF
-        # "LQD",            # iShares iBoxx Investment Grade Corporate Bond ETF
-        # "BND",            # Vanguard Total Bond Market ETF
-        #
-        # International
-        # "VEA",            # Vanguard Developed Markets ETF
-        # "VWO",            # Vanguard Emerging Markets ETF
-        # "EWJ",            # iShares MSCI Japan ETF
-        #
-        # Sectors (granular industry)
-        # "XBI",            # SPDR S&P Biotech ETF (high vol, active options)
-        # "XRT",            # SPDR S&P Retail ETF
-        # "XHB",            # SPDR S&P Homebuilders ETF
-        #
-        # Commodities
-        # "USO",            # United States Oil Fund (crude oil proxy)
-        # "UNG",            # United States Natural Gas Fund
-        # "COPX",           # Global X Copper Miners ETF
-        # "SLV",            # iShares Silver Trust
-        #
-        # Tech / Semis (additional)
-        # "SOXX",           # iShares Semiconductor ETF (alongside SMH)
-        # ─────────────────────────────────────────────────────────────────────
+        # ── Core index ETFs ─────────────────────────────────────────
+        "SPY",    # S&P 500 — highest liquidity, 0DTE module
+        "QQQ",    # Nasdaq 100 — second-deepest options market
+        "IWM",    # Russell 2000 — small-cap, 166 contracts daily
+        # ── Fixed income ────────────────────────────────────────────
+        "TLT",    # 20-yr Treasuries — rate regime signal, 80 contracts
+        # ── Sector ETFs (liquid options, weeklies available) ────────
+        "XLF",    # Financials — 51 contracts, rate-sensitive
+        "XLK",    # Technology — strong OI
+        "XLE",    # Energy — 8M vol, good premium
+        "XLV",    # Healthcare — defensive, 71 contracts
+        "XLI",    # Industrials — 73 contracts
+        # ── Commodity & alternatives ─────────────────────────────────
+        "GLD",    # Gold — commodity regime hedge
+        "EEM",    # Emerging markets — carries EM risk premium
+        "HYG",    # High yield bonds — credit spread indicator
+        "SMH",    # Semiconductors — high beta, elevated IV
+        # ── Added (higher liquidity than dropped tickers) ───────────
+        "VXX",    # VIX short-term futures — fat premiums, crisis hedge
+        "XBI",    # Biotech — elevated IV year-round from FDA catalysts
+        # ── Removed (thin options markets, failed liquidity filters) ─
+        # MDY:  0/40 contracts passed yesterday. No weeklies.
+        # XLB:  3M volume, few strikes, no weeklies
+        # XLC:  2M volume, bearish tech, thin chains
+        # XLRE: 1M volume, almost no options OI
+        # XLP:  2M volume, staples — tiny premiums
+        # DIA:  Wide spreads, low OI, redundant with SPY
     ])
 
     # --- Strategy ---
@@ -975,7 +963,20 @@ class TradingPipeline:
                 _sig_obj = sentiment_signals.get(ticker)
             except Exception:
                 pass
-            _sec_data_full = score_sec_signals(ticker)
+            # Pass news sentiment into SEC scoring for congress+news confirmation
+            _news_sig   = _sig_obj.signal         if _sig_obj else None
+            _news_score = _sig_obj.weighted_score  if _sig_obj else None
+            _sec_data_full = score_sec_with_news(
+                ticker,
+                news_signal=_news_sig,
+                news_score=_news_score,
+            )
+            if _sec_data_full.get("news_confirmed") is True:
+                logger.info(
+                    "[Pipeline] %s ⭐ Congress+News aligned: buys=%d news=%s sec_score=%d",
+                    ticker, _sec_data_full.get("congress_buys",0),
+                    _news_sig, _sec_data_full.get("score",0),
+                )
             _confidence_report = self._confidence.score(
                 signal=signal,
                 ticker=ticker,
