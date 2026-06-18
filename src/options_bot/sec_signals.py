@@ -51,8 +51,40 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from .circuit_breaker import data_circuit_breaker as _cb
+import os as _os
 
 logger = logging.getLogger(__name__)
+
+_AV_KEY     = _os.getenv("ALPHA_VANTAGE_KEY", "")
+_AV_PCR_URL = ("https://www.alphavantage.co/query"
+               "?function=REALTIME_PUT_CALL_RATIO&symbol={sym}&apikey={key}")
+
+
+def get_av_put_call_ratio(ticker: str) -> Optional[float]:
+    """
+    Realtime put/call ratio from Alpha Vantage.
+    PCR >= 1.2 → elevated put demand → good short-put-spread entry signal.
+    Returns None if AV key not set or call fails.
+    """
+    if not _AV_KEY or not _cb.is_available("av_pcr"):
+        return None
+    try:
+        url = _AV_PCR_URL.format(sym=ticker.upper().strip(), key=_AV_KEY)
+        req = urllib.request.Request(url, headers={"User-Agent": "OptionsBot/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+        _cb.record_success("av_pcr")
+        pcr = data.get("put_call_ratio") or data.get("ratio")
+        if pcr is None:
+            for v in data.values():
+                if isinstance(v, dict):
+                    pcr = v.get("put_call_ratio") or v.get("ratio")
+                    if pcr: break
+        return float(pcr) if pcr is not None else None
+    except Exception as exc:
+        _cb.record_failure("av_pcr", str(exc))
+        logger.debug("[AV PCR] %s: %s", ticker, exc)
+        return None
 
 # SEC EDGAR requires a User-Agent with contact info
 _SEC_HEADERS = {
