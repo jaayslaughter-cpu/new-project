@@ -333,8 +333,8 @@ class CSPConfig:
     target_delta: float = -0.20         # target put delta to sell
     min_delta: float = -0.30            # reject if delta more negative than this
     max_delta: float = -0.10            # reject if delta less negative than this
-    min_dte: int = 21                   # minimum days to expiration
-    max_dte: int = 45                   # maximum days to expiration
+    min_dte: int = 14                   # minimum days to expiration (widened for monthly-only ETFs)
+    max_dte: int = 60                   # maximum days to expiration
     min_open_interest: int = 500        # higher OI requirement for CSPs
     max_spread_pct: float = 0.15        # tighter spread requirement
     stop_multiplier: float = 2.0        # stop at 2x premium received
@@ -467,8 +467,8 @@ class ShortPutSpreadConfig:
     """Configuration for ShortPutSpread strategy."""
     short_delta: float = -0.25          # sell this delta put
     long_delta: float = -0.10           # buy this delta put (further OTM)
-    min_dte: int = 21
-    max_dte: int = 45
+    min_dte: int = 14     # widened: captures monthly-only ETF expirations
+    max_dte: int = 60
     min_open_interest: int = 100
     max_spread_pct: float = 0.25
     min_spread_width: float = 1.0       # minimum strike width in dollars (lowered for ETFs)
@@ -714,7 +714,7 @@ class ShortStrangleConfig:
     call_delta: float = 0.20            # sell this delta call
     put_delta: float = -0.20            # sell this delta put
     delta_tolerance: float = 0.05       # ± tolerance for delta matching
-    min_dte: int = 30
+    min_dte: int = 21     # strangle: needs more time for both sides to decay
     max_dte: int = 60
     min_open_interest: int = 200
     max_spread_pct: float = 0.20
