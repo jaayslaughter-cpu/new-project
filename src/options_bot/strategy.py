@@ -540,7 +540,11 @@ class ShortPutSpread(BaseStrategy):
         long_leg_candidates = [
             c for c in put_candidates
             if c.strike < short_put.strike          # must be lower strike
-            and (short_put.strike - c.strike) >= cfg.min_spread_width
+            and (short_put.strike - c.strike) >= (
+                    # For ETFs priced under $100, allow $0.5 wide spreads
+                    # ($1 wide on a $50 ETF = 2% of spot, same ratio as $5 on SPY)
+                    0.5 if short_put.strike < 100 else cfg.min_spread_width
+                )
             and (short_put.strike - c.strike) <= cfg.max_spread_width
         ]
 
