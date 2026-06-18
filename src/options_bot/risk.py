@@ -54,6 +54,52 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Vol-adaptive sizing helpers
+# ---------------------------------------------------------------------------
+
+def compute_atr_pct(symbol: str, period: int = 14) -> Optional[float]:
+    """14-period ATR as % of current price."""
+    try:
+        import pandas as pd, yfinance as yf
+        df = yf.download(symbol, period="30d", interval="1d", progress=False, auto_adjust=True)
+        if df is None or len(df) < period + 1: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        h, l, c = df["High"], df["Low"], df["Close"]
+        tr = pd.concat([(h-l),(h-c.shift(1)).abs(),(l-c.shift(1)).abs()],axis=1).max(axis=1)
+        atr = float(tr.rolling(period).mean().iloc[-1])
+        price = float(c.iloc[-1])
+        return round(atr/price*100,3) if price>0 and not math.isnan(atr) else None
+    except Exception as exc:
+        logger.debug("[Risk] compute_atr_pct(%s): %s", symbol, exc); return None
+
+_GARCH_LOOKBACK=60; _GARCH_THRESHOLD=1.5; _GARCH_FLOOR=0.5
+
+def compute_garch_vol_scalar(symbol: str) -> float:
+    """GARCH(1,1) size multiplier [0.5,1.0]. Returns 1.0 if arch not installed."""
+    if not symbol: return 1.0
+    try:
+        import pandas as pd, yfinance as yf
+        from arch import arch_model
+        df = yf.download(symbol, period="90d", interval="1d", progress=False, auto_adjust=True)
+        if df is None or len(df) < _GARCH_LOOKBACK+5: return 1.0
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        ret = df["Close"].pct_change().dropna()*100
+        ret = ret.tail(_GARCH_LOOKBACK)
+        if len(ret) < 30: return 1.0
+        res = arch_model(ret,vol="GARCH",p=1,q=1,rescale=False).fit(disp="off",show_warning=False)
+        fv  = float(res.forecast(horizon=1,reindex=False).variance.iloc[-1,0])
+        if fv<=0 or math.isnan(fv): return 1.0
+        ratio = (fv**0.5) / max(float(ret.std()),1e-9)
+        if ratio <= _GARCH_THRESHOLD: return 1.0
+        scalar = max(_GARCH_FLOOR, _GARCH_THRESHOLD/ratio)
+        logger.info("[Risk] GARCH %s: ratio=%.2f → ×%.2f", symbol, ratio, scalar)
+        return round(scalar,3)
+    except ImportError: return 1.0
+    except Exception as exc:
+        logger.debug("[Risk] compute_garch_vol_scalar(%s): %s", symbol, exc); return 1.0
+
+
 @dataclass
 class RiskConfig:
     """
@@ -552,17 +598,16 @@ class RiskManager:
           contracts = floor(risk_budget / max_loss_per_contract)
           contracts = clamp(contracts, min_contracts, max_contracts)
         """
-        raw = math.floor(risk_budget_dollars / max_loss_per_contract)
+        garch = compute_garch_vol_scalar(getattr(self,"_current_underlying",""))
+        adj   = risk_budget_dollars * garch
+        raw   = math.floor(adj / max_loss_per_contract)
         sized = max(self.config.min_contracts, min(raw, self.config.max_contracts))
-
-        if sized != raw:
-            logger.debug(
-                "[RiskManager] Position size clamped: raw=%d → final=%d "
-                "(min=%d, max=%d)",
-                raw, sized,
-                self.config.min_contracts, self.config.max_contracts,
-            )
-
+        if garch < 1.0:
+            logger.info("[Risk] GARCH: $%.2f→$%.2f (×%.2f) raw=%d sized=%d",
+                        risk_budget_dollars, adj, garch, raw, sized)
+        elif sized != raw:
+            logger.debug("[Risk] Clamped: raw=%d→%d (min=%d max=%d)",
+                         raw, sized, self.config.min_contracts, self.config.max_contracts)
         return sized
 
     def _check_liquidity(self, option: EnrichedOptionRow) -> Optional[str]:
