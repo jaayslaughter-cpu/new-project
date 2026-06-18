@@ -47,6 +47,105 @@ from .breadth import get_market_breadth, composite_to_regime_score
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Regime → Risk Policy lookup table
+# Ported from investor-bot/risk/regime_policy.py + extended for options
+#
+# Maps each regime string to a frozen policy that controls execution:
+#   block_new_entries      — set True in crisis to halt all new trades
+#   max_trades_per_scan    — cap new entries per scan cycle
+#   min_confidence_boost   — extra confidence points required before entry
+#   size_multiplier        — fraction of normal Kelly position size
+#   favored_strategy       — which strategy to prefer in this regime
+#
+# These replace the scattered if/elif regime checks in orchestrator.py.
+# The orchestrator calls get_regime_policy(regime_name) once and applies it.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dc
+
+
+@_dc(frozen=True)
+class RegimePolicy:
+    """Execution constraints for a given market regime."""
+    block_new_entries:    bool
+    max_trades_per_scan:  int
+    min_confidence_boost: int    # added to the 45-point threshold
+    size_multiplier:      float  # applied on top of Kelly sizing
+    favored_strategy:     str    # "short_put_spread" | "short_strangle" | "csp" | "any"
+
+
+REGIME_POLICY: dict[str, RegimePolicy] = {
+    # Full-risk regimes — mean-reverting environments are ideal for short premium
+    "mean_reverting": RegimePolicy(
+        block_new_entries=False,
+        max_trades_per_scan=5,
+        min_confidence_boost=0,
+        size_multiplier=1.0,
+        favored_strategy="short_put_spread",
+    ),
+    # Trending market: price makes sustained directional moves
+    # Risk is directional blow-through on short puts → reduce size, prefer strangles
+    "trending": RegimePolicy(
+        block_new_entries=False,
+        max_trades_per_scan=3,
+        min_confidence_boost=5,     # need higher conviction
+        size_multiplier=0.75,
+        favored_strategy="short_strangle",  # collect both sides to be direction-neutral
+    ),
+    # High volatility: wide bid/ask, large moves — reduce exposure significantly
+    "high_volatility": RegimePolicy(
+        block_new_entries=False,
+        max_trades_per_scan=2,
+        min_confidence_boost=10,
+        size_multiplier=0.50,
+        favored_strategy="csp",     # CSP only — defined risk, single leg
+    ),
+    # Crisis / extreme vol: full halt
+    "crisis": RegimePolicy(
+        block_new_entries=True,
+        max_trades_per_scan=0,
+        min_confidence_boost=99,
+        size_multiplier=0.0,
+        favored_strategy="any",
+    ),
+    # VANNA_DOMINANT (Fed days, OPEX): reduce to half size, 0DTE disabled
+    "vanna_dominant": RegimePolicy(
+        block_new_entries=False,
+        max_trades_per_scan=2,
+        min_confidence_boost=8,
+        size_multiplier=0.50,
+        favored_strategy="short_put_spread",
+    ),
+    # Neutral/unknown fallback
+    "neutral": RegimePolicy(
+        block_new_entries=False,
+        max_trades_per_scan=3,
+        min_confidence_boost=0,
+        size_multiplier=0.75,
+        favored_strategy="any",
+    ),
+}
+
+_DEFAULT_POLICY = REGIME_POLICY["neutral"]
+
+
+def get_regime_policy(regime_name: str) -> RegimePolicy:
+    """
+    Return the RegimePolicy for a given regime string.
+
+    Case-insensitive. Falls back to neutral policy if regime is unknown.
+    Used by the orchestrator to apply execution constraints without
+    scattered if/elif regime checks.
+    """
+    key = regime_name.lower().replace("-", "_").replace(" ", "_")
+    # Partial match: "mean_reverting_breadth" → "mean_reverting"
+    for k in REGIME_POLICY:
+        if key.startswith(k) or k in key:
+            return REGIME_POLICY[k]
+    return _DEFAULT_POLICY
+
 # Cache TTL — 15 minutes, same as TradeX default
 _CACHE_TTL_SECONDS = 15 * 60
 
