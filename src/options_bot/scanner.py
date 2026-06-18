@@ -59,14 +59,16 @@ _FUND_TTL_SECONDS   = 7 * 24 * 3600  # 7 days
 @dataclass
 class TechnicalScore:
     ticker:        str
-    score:         float          # 0.0 – 7.0 (higher = more bullish; trendlines add up to 1.5)
+    score:         float          # 0.0 – 8.5 (higher = more bullish)
     sma_score:     float          # 0–2: above SMA20 (+1), above SMA50 (+1)
     rsi_score:     float          # 0–1: RSI 50–70 (+1), 30–50 (+0.5)
-    macd_score:    float          # 0–1.8: above signal (+1.0), histogram rising (+0.5), normalised magnitude (+0.3 max)
-    adx_score:        float          # 0–1.5: ADX>25 with +DI>-DI (+1.5)
-    trendline_score:  float = 0.0   # 0–1.5: bullish pattern near support/breakout
+    macd_score:    float          # 0–1.8: above signal (+1.0), histogram rising (+0.5), magnitude (+0.3 max)
+    adx_score:     float          # 0–1.5: ADX>25 with +DI>-DI (+1.5)
+    trendline_score: float = 0.0  # 0–1.5: bullish pattern near support/breakout
+    bb_score:      float = 0.0    # 0–1.5: Bollinger Band position (near lower band = best for puts)
     rsi:           Optional[float] = None
     adx:           Optional[float] = None
+    bb_pct:        Optional[float] = None  # 0=at lower band, 1=at upper band
     trendline:     Optional[TrendlineResult] = None
     is_bullish:    bool = False   # score >= threshold
     computed_at:   datetime = None
@@ -307,7 +309,52 @@ class BullishScanner:
             except Exception as exc:
                 logger.debug("[BullishScanner] %s trendline failed: %s", ticker, exc)
 
-            total = sma_score + rsi_score + macd_score + adx_score + trendline_score
+            # Bollinger Bands score — AV BBANDS with local numpy fallback
+            # Near lower band = oversold + wide bands = elevated IV = best put premiums
+            bb_score = 0.0
+            bb_pct   = None
+            try:
+                av_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+                if av_key and _cb_bb.is_available("av_bbands"):
+                    _bb_url = (
+                        f"https://www.alphavantage.co/query"
+                        f"?function=BBANDS&symbol={ticker}&interval=daily"
+                        f"&time_period=20&series_type=close&nbdevup=2&nbdevdn=2"
+                        f"&apikey={av_key}"
+                    )
+                    import urllib.request as _ur2, ssl as _ssl2
+                    _ctx2 = _ssl2.create_default_context()
+                    _req2 = _ur2.Request(_bb_url, headers={"User-Agent": "OptionsBot/1.0"})
+                    with _ur2.urlopen(_req2, timeout=10, context=_ctx2) as _r2:
+                        _bb_data = json.loads(_r2.read().decode("utf-8", errors="replace"))
+                    _bb_series = _bb_data.get("Technical Analysis: BBANDS", {})
+                    if _bb_series:
+                        _latest = _bb_series[sorted(_bb_series.keys())[-1]]
+                        _bb_upper = float(_latest.get("Real Upper Band", 0))
+                        _bb_lower = float(_latest.get("Real Lower Band", 0))
+                        _bb_width = _bb_upper - _bb_lower
+                        if _bb_width > 0:
+                            bb_pct = max(0.0, min(1.0, (price - _bb_lower) / _bb_width))
+                        _cb_bb.record_success("av_bbands")
+                else:
+                    # Local fallback using last 20 closes already in memory
+                    if len(close) >= 20:
+                        import numpy as _np
+                        _mid = float(_np.mean(close[-20:]))
+                        _std = float(_np.std(close[-20:], ddof=1))
+                        _w   = 4 * _std
+                        if _w > 0:
+                            bb_pct = max(0.0, min(1.0, (price - (_mid - 2*_std)) / _w))
+                if bb_pct is not None:
+                    if bb_pct <= 0.20:   bb_score = 1.5   # near lower band
+                    elif bb_pct <= 0.40: bb_score = 0.8   # lower half
+                    elif bb_pct <= 0.60: bb_score = 0.3   # near midline
+                    logger.debug("[BullishScanner] %s BB: pct=%.2f score=%.1f", ticker, bb_pct, bb_score)
+            except Exception as _bb_exc:
+                _cb_bb.record_failure("av_bbands", str(_bb_exc))
+                logger.debug("[BullishScanner] %s BB failed: %s", ticker, _bb_exc)
+
+            total = sma_score + rsi_score + macd_score + adx_score + trendline_score + bb_score
 
             return TechnicalScore(
                 ticker=ticker,
@@ -317,8 +364,10 @@ class BullishScanner:
                 macd_score=macd_score,
                 adx_score=adx_score,
                 trendline_score=trendline_score,
+                bb_score=bb_score,
                 rsi=round(rsi, 1),
                 adx=round(adx, 1) if adx is not None else None,
+                bb_pct=round(bb_pct, 3) if bb_pct is not None else None,
                 trendline=tl_result,
                 is_bullish=total >= self.threshold,
             )
