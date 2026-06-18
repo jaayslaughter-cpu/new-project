@@ -1125,6 +1125,35 @@ class ZeroDTEStrategy:
             vwap_check["stretch_pct"], vwap_check["vwap"],
         )
 
+        # Bar cooldown: prevent re-entry too quickly after a recent fill
+        self.bar_cooldown.tick()
+        if not self.bar_cooldown.ready():
+            logger.info(
+                "[0DTE] Bar cooldown active — %d bars remaining before re-entry",
+                self.bar_cooldown.remaining,
+            )
+            return None
+
+        # Feed latest intraday bars into session momentum engine
+        try:
+            _bars_raw = getattr(self.vwap_filter, "_last_bars", [])
+            if _bars_raw:
+                _last = _bars_raw[-1]
+                _mom = self.momentum.on_bar(
+                    _last.get("open", spy_price), _last.get("high", spy_price),
+                    _last.get("low",  spy_price), _last.get("close", spy_price),
+                    _last.get("volume", 1.0),
+                )
+                logger.debug(
+                    "[0DTE] Momentum: dir=%s ema5=%.2f ema20=%.2f "
+                    "roc5=%.4f cg=%d cr=%d atr5=%.3f",
+                    _mom["direction"], _mom["ema5"], _mom["ema20"],
+                    _mom["roc5"], _mom["consec_green"],
+                    _mom["consec_red"], _mom["atr5"],
+                )
+        except Exception:
+            pass
+
         # 6. Fetch option quotes for the selected strikes
         today_str    = today.strftime("%y%m%d")
         short_strike = strikes["short_strike"]
