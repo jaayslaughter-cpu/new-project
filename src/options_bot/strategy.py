@@ -902,10 +902,163 @@ class ShortStrangle(BaseStrategy):
 # Strategy registry — maps name → class for config-driven instantiation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Short Call Spread — sell OTM call, buy further OTM call
+# Mirror of ShortPutSpread for bearish/high-IV environments.
+# Use when: ticker is overbought, IV elevated, or regime is trending-down.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShortCallSpreadConfig:
+    """Config for short call spread (bear call spread)."""
+    target_delta:     float = 0.25     # sell ~25-delta call (OTM)
+    min_delta:        float = 0.15     # reject if short call delta below this
+    max_delta:        float = 0.35     # reject if short call delta above this
+    min_spread_width: float = 1.0      # min strike separation (ETF-friendly)
+    max_spread_width: float = 20.0     # max strike separation
+    min_credit:       float = 0.25     # minimum credit to collect
+    min_pop:          float = 0.65     # minimum probability of profit
+    min_dte:          int   = 14       # minimum days to expiry
+    max_dte:          int   = 60       # maximum days to expiry
+    min_open_interest: int  = 100      # per-contract OI floor
+
+
+class ShortCallSpread(BaseStrategy):
+    """
+    Bear call spread: sell OTM call + buy further OTM call on same expiry.
+
+    Profits when the underlying stays BELOW the short call strike.
+    Best entered when: IV rank is elevated, ticker is technically overbought
+    (near upper Bollinger Band), or regime is trending/mean-reverting bearish.
+
+    Max profit = net credit collected.
+    Max loss   = spread width - credit (defined risk).
+    """
+    name = "short_call_spread"
+
+    def __init__(self, config: ShortCallSpreadConfig | None = None):
+        self.cfg = config or ShortCallSpreadConfig()
+
+    def evaluate(
+        self,
+        ticker: str,
+        chain: list,
+        expiry,
+        dte: int,
+        underlying_price: float,
+        **kwargs,
+    ) -> Optional[TradeSignal]:
+        cfg = self.cfg
+
+        # Filter: calls only, DTE + liquidity
+        liquid = [
+            c for c in chain
+            if c.option_type == "call"
+            and c.dte >= cfg.min_dte
+            and c.dte <= cfg.max_dte
+            and c.open_interest >= cfg.min_open_interest
+            and c.bid is not None and c.bid > 0
+        ]
+        if not liquid:
+            logger.debug("[ShortCallSpread] %s: no liquid calls in DTE %d-%d",
+                         ticker, cfg.min_dte, cfg.max_dte)
+            return None
+
+        # Select short call closest to target_delta (positive delta for calls)
+        target = cfg.target_delta
+        candidates = [
+            c for c in liquid
+            if c.delta is not None
+            and cfg.min_delta <= c.delta <= cfg.max_delta
+        ]
+        if not candidates:
+            logger.debug("[ShortCallSpread] %s: no calls in delta range %.2f-%.2f",
+                         ticker, cfg.min_delta, cfg.max_delta)
+            return None
+
+        short_call = min(candidates, key=lambda c: abs((c.delta or 0) - target))
+
+        # Find long call above short call strike
+        long_candidates = [
+            c for c in liquid
+            if c.strike > short_call.strike
+            and (
+                0.5 if short_call.strike < 100 else cfg.min_spread_width
+            ) <= (c.strike - short_call.strike) <= cfg.max_spread_width
+        ]
+        if not long_candidates:
+            logger.debug("[ShortCallSpread] %s: no valid long leg above short strike %.2f",
+                         ticker, short_call.strike)
+            return None
+
+        # Pick long call with best risk/reward (narrowest viable spread)
+        long_call = min(long_candidates, key=lambda c: c.strike)
+
+        # Calculate spread metrics
+        short_mid = ((short_call.bid or 0) + (short_call.ask or short_call.bid or 0)) / 2
+        long_mid  = ((long_call.bid or 0)  + (long_call.ask  or long_call.bid  or 0)) / 2
+        credit    = round(short_mid - long_mid, 2)
+        width     = round(long_call.strike - short_call.strike, 2)
+        max_loss_per_contract = round((width - credit) * 100, 2)
+
+        if credit < cfg.min_credit:
+            logger.debug("[ShortCallSpread] %s: credit $%.2f < min $%.2f",
+                         ticker, credit, cfg.min_credit)
+            return None
+
+        if max_loss_per_contract <= 0:
+            return None
+
+        # Probability of profit
+        pop = 1.0 - abs(short_call.delta or 0)
+        if pop < cfg.min_pop:
+            logger.debug("[ShortCallSpread] %s: PoP %.1f%% < min %.1f%%",
+                         ticker, pop * 100, cfg.min_pop * 100)
+            return None
+
+        # Earnings check — reuse parent method
+        try:
+            self._check_earnings(short_call.underlying, short_call.expiry, short_call.dte)
+        except Exception as e:
+            logger.info("[ShortCallSpread] %s: blocked — %s", ticker, e)
+            return None
+
+        hard_stop = round(short_call.strike + width * 1.5, 2)
+        logger.info(
+            "[ShortCallSpread] %s: short=%.2f(Δ%.2f) long=%.2f "
+            "width=%.1f credit=%.2f max_loss=$%.2f PoP=%.1f%% DTE=%d",
+            ticker, short_call.strike, short_call.delta or 0,
+            long_call.strike, width, credit,
+            max_loss_per_contract, pop * 100, dte,
+        )
+
+        return TradeSignal(
+            ticker=ticker,
+            strategy=self.name,
+            legs=[
+                OrderLeg(symbol=short_call.symbol, side="sell", quantity=1,
+                         option_type="call", strike=short_call.strike,
+                         expiry=short_call.expiry, delta=short_call.delta),
+                OrderLeg(symbol=long_call.symbol, side="buy", quantity=1,
+                         option_type="call", strike=long_call.strike,
+                         expiry=long_call.expiry, delta=long_call.delta),
+            ],
+            net_credit=credit,
+            max_loss_per_contract=max_loss_per_contract,
+            probability_of_profit=pop,
+            hard_stop_price=hard_stop,
+            underlying=ticker,
+            underlying_price=underlying_price,
+            expiry=short_call.expiry,
+            dte=dte,
+        )
+
+
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
-    "csp": CashSecuredPut,
-    "short_put_spread": ShortPutSpread,
-    "short_strangle": ShortStrangle,
+    "csp":               CashSecuredPut,
+    "short_put_spread":  ShortPutSpread,
+    "short_call_spread": ShortCallSpread,
+    "short_strangle":    ShortStrangle,
 }
 
 
