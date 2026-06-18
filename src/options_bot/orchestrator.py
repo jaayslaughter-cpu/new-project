@@ -1642,6 +1642,21 @@ class Orchestrator:
             self.config.close_hour, self.config.close_minute,
             et_eod, self.config.close_minute,
         )
+        # Startup announcement — sent at scheduler start so the env var
+        # has had time to be fully injected (avoids the boot-timing issue)
+        _strategies = [self.config.strategy_name] + (
+            getattr(self.config, "extra_strategies", None) or []
+        )
+        send_discord(
+            self.config.discord_webhook_url,
+            f"🟢 **Options Bot started** — "
+            f"{'PAPER' if self.config.paper else 'LIVE'} mode\n"
+            f"**Tickers:** {', '.join(self.config.tickers)}\n"
+            f"**Strategies:** {', '.join(s.upper() for s in _strategies)}\n"
+            f"**Scan:** {self.config.scan_hour:02d}:{self.config.scan_minute:02d} PT "
+            f"= {et_scan:02d}:{self.config.scan_minute:02d} ET | "
+            f"**Risk:** {self.config.risk_config.risk_budget_pct:.0%}/trade",
+        )
         send_discord(
             self.config.discord_webhook_url,
             f"🟢 **Options Bot started** — {self.config.strategy_name.upper()} "
