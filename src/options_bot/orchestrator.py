@@ -120,8 +120,17 @@ class OrchestratorConfig:
     ])
 
     # --- Strategy ---
-    strategy_name: str = "short_put_spread"   # csp | short_put_spread | short_strangle
+    # Primary strategy — runs first on every ticker in the shortlist
+    strategy_name: str = "short_put_spread"   # csp | short_put_spread | short_call_spread | short_strangle
     strategy_config: object = None             # strategy-specific config dataclass
+
+    # Additional strategies — run after primary on the same shortlist each scan.
+    # short_call_spread: sells calls when ticker is overbought / near upper BB
+    # short_strangle:    sells both call and put on same expiry (neutral premium)
+    extra_strategies: list = field(default_factory=lambda: [
+        "short_call_spread",   # calls — bearish/overbought setups
+        "short_strangle",      # both sides — neutral high-IV setups
+    ])
 
     # --- Risk ---
     risk_config: RiskConfig = field(default_factory=RiskConfig)
