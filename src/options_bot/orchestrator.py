@@ -1075,22 +1075,40 @@ class TradingPipeline:
 
     def _pick_expiry(self, expirations: list[str], loader: YFinanceDataLoader) -> Optional[str]:
         """
-        Select the expiration closest to the mid-point of the DTE window.
-        e.g. for min_dte=21, max_dte=45 → target DTE ≈ 33
+        Two-pass expiry selection:
+          Pass 1 — prefer sweet spot 30-45 DTE (peak theta/gamma ratio)
+          Pass 2 — accept full 14-60 DTE window (rescues monthly-only ETFs
+                   that have no expiry in the 30-45 range on a given day)
         """
         today = date.today()
-        target_dte = (self.config.min_dte + self.config.max_dte) / 2
+        sweet_min, sweet_max = 30, 45
+        sweet_target = (sweet_min + sweet_max) / 2
+
+        # Pass 1 — sweet spot
         best = None
         best_diff = float("inf")
         for exp_str in expirations:
             try:
-                exp_date = date.fromisoformat(exp_str)
-                dte = (exp_date - today).days
-                if self.config.min_dte <= dte <= self.config.max_dte:
-                    diff = abs(dte - target_dte)
+                dte = (date.fromisoformat(exp_str) - today).days
+                if sweet_min <= dte <= sweet_max:
+                    diff = abs(dte - sweet_target)
                     if diff < best_diff:
-                        best_diff = diff
-                        best = exp_str
+                        best_diff = diff; best = exp_str
+            except ValueError:
+                continue
+        if best:
+            return best
+
+        # Pass 2 — full window fallback
+        full_target = (self.config.min_dte + self.config.max_dte) / 2
+        best_diff = float("inf")
+        for exp_str in expirations:
+            try:
+                dte = (date.fromisoformat(exp_str) - today).days
+                if self.config.min_dte <= dte <= self.config.max_dte:
+                    diff = abs(dte - full_target)
+                    if diff < best_diff:
+                        best_diff = diff; best = exp_str
             except ValueError:
                 continue
         return best
