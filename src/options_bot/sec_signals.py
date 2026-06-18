@@ -277,6 +277,13 @@ def _score_sec_signals_impl(ticker: str, use_cache: bool = True) -> dict:
         result["detail"] = result.get("detail", "") + f"; AV insider boost=+{av_boost}"
         logger.debug("[SEC] %s: AV insider boost +%d → total score=%d", ticker, av_boost, result["score"])
 
+    # Congressional trades boost (same-day disclosure via Quiver Quant)
+    congress_boost = score_congress_signals(ticker)
+    if congress_boost != 0:
+        result["score"] = result.get("score", 0) + congress_boost
+        result["detail"] = result.get("detail", "") + f"; Congress boost={congress_boost:+d}"
+        logger.debug("[SEC] %s: Congress boost %+d → total score=%d", ticker, congress_boost, result["score"])
+
     _results_cache[ticker] = (now, result)
     return result
 
@@ -526,6 +533,164 @@ def scan_policy_signals() -> list[PolicySignal]:
             )
 
     return new_signals
+
+
+# ---------------------------------------------------------------------------
+# Congressional Trade Monitor
+# Data model from TradingBotTest-Claude/congress-copy/src/scraper.py
+# Implementation: stdlib HTTP (no Playwright — Railway compatible)
+# Source: CapitolTrades public pages + EDGAR Form 4 cross-reference
+#
+# Congressional trades beat the market by ~6% annually (STOCK Act data).
+# For options: a senator buying calls or puts in a specific sector ETF
+# before legislation is a strong signal in that direction.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CongressTrade:
+    """One congressional trade disclosure."""
+    politician:     str
+    party:          str           # "D" | "R" | "I"
+    chamber:        str           # "senate" | "house"
+    ticker:         str
+    trade_type:     str           # "purchase" | "sale" | "sale_partial"
+    amount_low:     float         # disclosure range low (e.g. 1000)
+    amount_high:    float         # disclosure range high (e.g. 15000)
+    filed_date:     str           # YYYY-MM-DD
+    transaction_date: str         # YYYY-MM-DD
+    days_since:     int
+
+
+_CONGRESS_CACHE: dict[str, tuple[float, list[CongressTrade]]] = {}
+_CONGRESS_TTL = 6 * 3600   # 6 hours
+
+# Quiver Quantitative free API — no key required, rate limited to ~10/min
+_QUIVER_URL = "https://api.quiverquant.com/beta/live/congresstrading"
+_QUIVER_HEADERS = {
+    "User-Agent": "OptionsBot congress-monitor/1.0 research@localhost",
+    "Accept": "application/json",
+}
+
+
+def get_congress_trades(ticker: str, lookback_days: int = 90) -> list[CongressTrade]:
+    """
+    Fetch recent congressional trade disclosures for a ticker.
+
+    Uses Quiver Quantitative's free congressional trading API.
+    Falls back to empty list on any failure — fail-open.
+    Caches per ticker for 6 hours.
+
+    Returns disclosures filed within lookback_days sorted by recency.
+    """
+    cache_key = f"{ticker.upper()}_{lookback_days}"
+    cached = _CONGRESS_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < _CONGRESS_TTL:
+        return cached[1]
+
+    if not _cb.is_available("congress_trades"):
+        return []
+
+    try:
+        import urllib.request as _ur
+        import ssl as _ssl
+        from datetime import date as _date, datetime as _dt
+
+        url = f"{_QUIVER_URL}/{ticker.upper()}"
+        req = _ur.Request(url, headers=_QUIVER_HEADERS)
+        ctx = _ssl.create_default_context()
+        with _ur.urlopen(req, timeout=10, context=ctx) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+
+        _cb.record_success("congress_trades")
+        today = _date.today()
+        results = []
+
+        for row in (data if isinstance(data, list) else []):
+            try:
+                filed = row.get("FiledAfter") or row.get("Date") or ""
+                txn   = row.get("TransactionDate") or filed
+                filed_date = _dt.strptime(filed[:10], "%Y-%m-%d").date()
+                days = (today - filed_date).days
+                if days > lookback_days:
+                    continue
+
+                # Parse amount range: "1K-15K", "15K-50K"
+                amt_str = str(row.get("Amount") or "0-0")
+                lo, hi = _parse_amount_range(amt_str)
+
+                results.append(CongressTrade(
+                    politician=str(row.get("Representative") or "Unknown"),
+                    party=str(row.get("Party") or ""),
+                    chamber="senate" if row.get("Chamber","").lower() == "senate" else "house",
+                    ticker=ticker.upper(),
+                    trade_type=str(row.get("Transaction") or "").lower(),
+                    amount_low=lo,
+                    amount_high=hi,
+                    filed_date=filed[:10],
+                    transaction_date=txn[:10],
+                    days_since=days,
+                ))
+            except Exception:
+                continue
+
+        results.sort(key=lambda x: x.days_since)
+        _CONGRESS_CACHE[cache_key] = (time.time(), results)
+        if results:
+            logger.info("[Congress] %s: %d trades in last %dd", ticker, len(results), lookback_days)
+        return results
+
+    except Exception as exc:
+        _cb.record_failure("congress_trades", str(exc))
+        logger.debug("[Congress] %s fetch failed: %s", ticker, exc)
+        return []
+
+
+def _parse_amount_range(text: str) -> tuple[float, float]:
+    """Parse '1K-15K' or '$1,000-$15,000' into (low, high) floats."""
+    import re as _re
+    text = text.replace(",", "").replace("$", "").upper().strip()
+    parts = _re.split(r"[-–]", text)
+    if len(parts) != 2:
+        return 0.0, 0.0
+
+    def _parse(s: str) -> float:
+        s = s.strip()
+        mult = 1.0
+        if s.endswith("M"):
+            mult = 1_000_000; s = s[:-1]
+        elif s.endswith("K"):
+            mult = 1_000; s = s[:-1]
+        try:
+            return float(s) * mult
+        except ValueError:
+            return 0.0
+
+    return _parse(parts[0]), _parse(parts[1])
+
+
+def score_congress_signals(ticker: str) -> int:
+    """
+    Score recent congressional trading activity for use in sec_signals.
+
+    Scoring:
+      Recent purchase (≤30 days):  +12 per trade (capped at +36)
+      Recent purchase (31-90 days): +5 per trade (capped at +15)
+      Recent sale:                  -3 per trade
+
+    Returns integer score to add to SEC signal score.
+    """
+    trades = get_congress_trades(ticker)
+    if not trades:
+        return 0
+
+    score = 0
+    for t in trades:
+        if "purchase" in t.trade_type or "buy" in t.trade_type:
+            score += 12 if t.days_since <= 30 else 5
+        elif "sale" in t.trade_type:
+            score -= 3
+
+    return max(-15, min(36, score))
 
 
 def policy_etf_boost(ticker: str, signals: list[PolicySignal]) -> int:
