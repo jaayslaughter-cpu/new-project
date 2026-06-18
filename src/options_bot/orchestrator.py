@@ -69,7 +69,8 @@ from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profi
 from .universe import UniverseBuilder
 from .volume_profile import volume_profile_cache
 from .stress_testing import run_stress_suite, positions_from_broker
-from .sec_signals import is_entry_confirmed, score_sec_signals, score_sec_with_news
+from .sec_signals import (is_entry_confirmed, score_sec_signals,
+                           score_sec_with_news, get_dynamic_tickers)
 from .confidence_score import ConfidenceScorer
 
 logger = logging.getLogger(__name__)
@@ -143,8 +144,8 @@ class OrchestratorConfig:
     close_minute: int = 45
 
     # --- Chain filter ---
-    min_dte: int = 21
-    max_dte: int = 45
+    min_dte: int = 14     # widened: captures monthly-only ETF expirations
+    max_dte: int = 60
     min_open_interest: int = 100
     max_spread_pct: float = 0.25
 
@@ -1958,6 +1959,15 @@ class Orchestrator:
                 logger.warning("[Orchestrator] Sentiment fetch failed (non-fatal): %s", exc)
 
         filled_orders = []
+
+        # Congress+news dynamic tickers — discovered at scan time, not static config
+        # Only tickers confirmed by BOTH sources are included (intersection gate)
+        try:
+            _dynamic = get_dynamic_tickers(max_tickers=5)
+        except Exception as _dyn_exc:
+            _dynamic = []
+            logger.debug("[Orchestrator] Dynamic ticker fetch failed: %s", _dyn_exc)
+
         # Dynamic universe rebuild (if enabled, replaces config.tickers for this scan)
         scan_tickers = self.config.tickers
         if self.universe_builder is not None:
