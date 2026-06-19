@@ -733,7 +733,17 @@ def send_discord(webhook_url: str, message: str) -> None:
         req = urllib.request.Request(
             url,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                # AUDIT FIX: Discord's API sits behind Cloudflare, which
+                # blocks generic script user-agents (e.g. Python's default
+                # "Python-urllib/3.x") with a 403 Forbidden — independent of
+                # whether the webhook itself is valid. A descriptive UA
+                # avoids the block. This was misdiagnosed twice as a bad/
+                # expired webhook before the real cause (missing header)
+                # was found — a brand-new webhook hit the identical 403.
+                "User-Agent": "OptionsBot/1.0 (+https://github.com/jaayslaughter-cpu/new-project)",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5):
