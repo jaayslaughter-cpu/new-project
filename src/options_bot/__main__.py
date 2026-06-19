@@ -165,9 +165,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--tickers", nargs="+", default=[
-            "SPY", "QQQ", "IWM", "DIA", "MDY",
-            "XLF", "XLK", "XLE", "XLV", "XLI", "XLC", "XLY", "XLP", "XLB", "XLRE",
-            "GLD", "TLT", "EEM", "HYG", "SMH",
+            # AUDIT FIX: was a stale 20-ticker list including MDY/XLB/XLC/XLRE/
+            # XLP/DIA, which OrchestratorConfig's own default explicitly drops
+            # for failing liquidity filters (thin chains, no weeklies, wide
+            # spreads — see OrchestratorConfig.tickers comments). This CLI
+            # default silently overrode the correct list on every boot since
+            # Railway runs with no flags. Now matches OrchestratorConfig exactly.
+            "SPY", "QQQ", "IWM", "TLT",
+            "XLF", "XLK", "XLE", "XLV", "XLI",
+            "GLD", "EEM", "HYG", "SMH", "VXX", "XBI",
         ],
         help="Tickers to scan",
     )
