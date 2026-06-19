@@ -148,6 +148,8 @@ class BarCooldown:
         self._total = bars; self._rem = 0
     def start(self):
         self._rem = self._total; logger.info("[0DTE] Cooldown: %d bars", self._total)
+        # Note: caller is responsible for persisting via strategy._save_session_state()
+        # immediately after calling start() — done at the order-fill call site.
     def tick(self):
         if self._rem > 0: self._rem -= 1
     def ready(self) -> bool: return self._rem == 0
@@ -1132,6 +1134,55 @@ class ZeroDTEStrategy:
         self.slippage    = SlippageGuard(cfg)
         self.gamma_adj   = GammaAdjuster()
         self.vwap_filter = VWAPStretchFilter(cfg, broker)
+        self.momentum     = IntraSessionMomentum()
+        self.bar_cooldown = BarCooldown(bars=3)
+
+        # Restore in-memory state from the last save (survives Railway
+        # container restarts mid-session). State older than 18h is treated
+        # as stale (e.g. resuming Friday's state on Monday) and discarded.
+        # Idea: IntelliStock/strategy_cache_persistence.py — fail-open if
+        # the DB is unavailable or the saved state is malformed.
+        if self.db is not None:
+            try:
+                saved = self.db.load_state("0dte_session_state", max_age_hours=18)
+                if saved:
+                    self.bar_cooldown._rem = int(saved.get("cooldown_remaining", 0))
+                    mom_state = saved.get("momentum", {})
+                    self.momentum._ema5  = mom_state.get("ema5")
+                    self.momentum._ema20 = mom_state.get("ema20")
+                    self.momentum._cum_tp_vol = mom_state.get("cum_tp_vol", 0.0)
+                    self.momentum._cum_vol    = mom_state.get("cum_vol", 0.0)
+                    self.momentum._consec_g   = mom_state.get("consec_green", 0)
+                    self.momentum._consec_r   = mom_state.get("consec_red", 0)
+                    logger.info(
+                        "[0DTE] Restored session state: cooldown=%d ema5=%s ema20=%s",
+                        self.bar_cooldown._rem, mom_state.get("ema5"), mom_state.get("ema20"),
+                    )
+            except Exception as exc:
+                logger.debug("[0DTE] State restore failed (non-fatal, starting fresh): %s", exc)
+
+    def _save_session_state(self) -> None:
+        """
+        Persist current cooldown + momentum state so a Railway restart
+        mid-session doesn't silently reset the warm-up. Called after every
+        bar tick. Fail-open — never let a save failure break the scan.
+        """
+        if self.db is None:
+            return
+        try:
+            self.db.save_state("0dte_session_state", {
+                "cooldown_remaining": self.bar_cooldown.remaining,
+                "momentum": {
+                    "ema5":         self.momentum._ema5,
+                    "ema20":        self.momentum._ema20,
+                    "cum_tp_vol":   self.momentum._cum_tp_vol,
+                    "cum_vol":      self.momentum._cum_vol,
+                    "consec_green": self.momentum._consec_g,
+                    "consec_red":   self.momentum._consec_r,
+                },
+            })
+        except Exception as exc:
+            logger.debug("[0DTE] State save failed (non-fatal): %s", exc)
 
     def evaluate(self) -> Optional[ApprovedOrder]:
         """
@@ -1256,6 +1307,9 @@ class ZeroDTEStrategy:
                     _mom["roc5"], _mom["consec_green"],
                     _mom["consec_red"], _mom["atr5"],
                 )
+                # Persist after every bar so a mid-session restart resumes
+                # warm rather than cold (idea: IntelliStock cache persistence)
+                self._save_session_state()
         except Exception:
             pass
 
