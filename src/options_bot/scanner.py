@@ -76,7 +76,7 @@ class TechnicalScore:
     def __post_init__(self):
         if self.computed_at is None:
             self.computed_at = datetime.now(tz=timezone.utc)
-        self.is_bullish = self.score >= 3.0
+        self.is_bullish = self.score >= 4.5
 
 
 class BullishScanner:
@@ -103,7 +103,7 @@ class BullishScanner:
     the trading_skills package dependency.
     """
 
-    def __init__(self, bullish_threshold: float = 3.0, period: str = "3mo"):
+    def __init__(self, bullish_threshold: float = 4.5, period: str = "3mo"):
         self.threshold = bullish_threshold
         self.period    = period
         self._cache: dict[str, tuple[float, TechnicalScore]] = {}  # ticker → (ts, score)
