@@ -255,6 +255,7 @@ class RegimeDetector:
         breadth_data   = get_market_breadth()
         breadth_scores = composite_to_regime_score(breadth_data)
         stock_bond     = self._compute_stock_bond_divergence()
+        dollar_stress  = self._compute_dollar_stress()
 
         return {
             "vix_level":          round(vix_level,      2) if vix_level      is not None else 20.0,
@@ -283,6 +284,12 @@ class RegimeDetector:
             "capitulation":                stock_bond["capitulation"],
             "stock_bond_correlation_20d":  stock_bond["stock_bond_correlation_20d"],
             "stock_bond_signal_trusted":   stock_bond["signal_trusted"],
+            # Dollar stress (UUP) divergence — global funding-stress signal.
+            # Informational/contextual weight only — see _compute_dollar_stress
+            # docstring for why this doesn't have the same correlation-gate
+            # rigor as the SPY/TLT signal above.
+            "dollar_stress_day":          dollar_stress["dollar_stress_day"],
+            "uup_spy_correlation_20d":    dollar_stress["uup_spy_correlation_20d"],
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
@@ -665,6 +672,78 @@ class RegimeDetector:
             logger.warning("[RegimeDetector] Stock-bond divergence failed: %s", exc)
         return _safe
 
+    def _compute_dollar_stress(self) -> dict:
+        """
+        Dollar strength (UUP) divergence signal — global funding-stress flag.
+
+        Source: classic macro signal, not a single backtested study like the
+        SPY/TLT signal above. The dollar tends to spike during episodes of
+        acute risk aversion / global dollar funding stress (investors and
+        institutions scrambling for USD liquidity), often coinciding with
+        equity selloffs. This is well-documented macro behaviour (e.g. 2008,
+        March 2020) rather than a specific empirically-backtested edge —
+        treat this flag as informational context for the regime score, not
+        a precisely calibrated signal the way the SPY/TLT one is.
+
+        Uses UUP (Invesco DB US Dollar Index Bullish Fund) as the proxy —
+        raw DXY futures aren't reliably available via yfinance, UUP is a
+        liquid, tradeable ETF that tracks dollar strength closely.
+
+        dollar_stress_day — UUP 1d return > +0.5% AND SPY 1d return < -1%
+                             (dollar spiking while equities sell off)
+
+        Also computes the realized 20d UUP/SPY correlation for visibility/
+        logging (no hard trust-gate applied here, unlike the ECB-informed
+        gate on the stock-bond signal — there isn't a specific study backing
+        a correlation threshold for this one, so it's reported but not used
+        to suppress the flag).
+
+        Returns dict with: dollar_stress_day, uup_1d_return, spy_1d_return,
+        uup_spy_correlation_20d.
+        """
+        _safe = {
+            "dollar_stress_day": False, "uup_1d_return": 0.0,
+            "spy_1d_return": 0.0, "uup_spy_correlation_20d": None,
+        }
+        try:
+            import yfinance as yf
+            import numpy as np
+
+            uup_hist = yf.Ticker("UUP").history(period="35d")
+            spy_hist = yf.Ticker("SPY").history(period="35d")
+            if uup_hist.empty or spy_hist.empty or len(uup_hist) < 22 or len(spy_hist) < 22:
+                return _safe
+
+            uup_close = uup_hist["Close"]
+            spy_close = spy_hist["Close"]
+
+            uup_1d_return = float(uup_close.iloc[-1] / uup_close.iloc[-2] - 1.0)
+            spy_1d_return = float(spy_close.iloc[-1] / spy_close.iloc[-2] - 1.0)
+
+            dollar_stress_day = (uup_1d_return > 0.005) and (spy_1d_return < -0.01)
+
+            n = min(21, len(uup_close), len(spy_close))
+            uup_rets = uup_close.iloc[-n:].pct_change().dropna()
+            spy_rets = spy_close.iloc[-n:].pct_change().dropna()
+            common_len = min(len(uup_rets), len(spy_rets))
+            correlation_20d = None
+            if common_len >= 10:
+                corr_matrix = np.corrcoef(
+                    uup_rets.iloc[-common_len:].values,
+                    spy_rets.iloc[-common_len:].values,
+                )
+                correlation_20d = float(corr_matrix[0, 1])
+
+            return {
+                "dollar_stress_day":         dollar_stress_day,
+                "uup_1d_return":             round(uup_1d_return, 4),
+                "spy_1d_return":             round(spy_1d_return, 4),
+                "uup_spy_correlation_20d":   round(correlation_20d, 3) if correlation_20d is not None else None,
+            }
+        except Exception as exc:
+            logger.warning("[RegimeDetector] Dollar stress signal failed: %s", exc)
+        return _safe
+
     def _compute_vix_percentile(self, current_vix: Optional[float], window_days: int = 252) -> Optional[float]:
         """
         Compute where the current VIX level sits within its own N-day history.
@@ -958,6 +1037,14 @@ class RegimeDetector:
                 scores["high_volatility"] += 0.20
             elif indicators.get("big_blue_day"):
                 scores["high_volatility"] += 0.12
+
+        # Dollar stress (UUP) divergence — 9th signal, lighter weight than
+        # the SPY/TLT signal since this is general macro behaviour rather
+        # than a specifically backtested edge (see _compute_dollar_stress
+        # docstring). No correlation trust-gate — always contributes when
+        # the flag fires.
+        if indicators.get("dollar_stress_day"):
+            scores["high_volatility"] += 0.10
 
         # Pick winner
         regime = max(scores, key=scores.__getitem__)
