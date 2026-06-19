@@ -76,7 +76,14 @@ class TechnicalScore:
     def __post_init__(self):
         if self.computed_at is None:
             self.computed_at = datetime.now(tz=timezone.utc)
-        self.is_bullish = self.score >= 4.5
+        # AUDIT FIX: this used to unconditionally overwrite is_bullish with a
+        # hardcoded `score >= 4.5` check, clobbering the value the constructor
+        # already correctly set from `is_bullish=total >= self.threshold`
+        # (BullishScanner._compute, the only call site). This made every
+        # configurable threshold (BullishScanner, TickerGate, OrchestratorConfig)
+        # silently dead — only the hardcoded 4.5 ever mattered, regardless of
+        # what was actually configured. Removed; is_bullish now reflects the
+        # value passed at construction, honoring the real configured threshold.
 
 
 class BullishScanner:
@@ -103,7 +110,15 @@ class BullishScanner:
     the trading_skills package dependency.
     """
 
-    def __init__(self, bullish_threshold: float = 4.5, period: str = "3mo"):
+    def __init__(self, bullish_threshold: float = 3.5, period: str = "3mo"):
+        # AUDIT FIX: consolidated to a single value (3.5) shared by
+        # BullishScanner, TickerGate, and OrchestratorConfig.scanner_bullish_threshold.
+        # Previously these had three different uncoordinated defaults (4.5, 2.0,
+        # 3.0) and it didn't matter because of the dead is_bullish bug above —
+        # now that the configured threshold actually takes effect, they must
+        # agree. 3.5 reflects that ETFs structurally rarely score above 3.0
+        # (mixed sector technicals by design) while still being more selective
+        # than the original un-investigated 3.0 default.
         self.threshold = bullish_threshold
         self.period    = period
         self._cache: dict[str, tuple[float, TechnicalScore]] = {}  # ticker → (ts, score)
@@ -624,16 +639,20 @@ class TickerGate:
 
     def __init__(
         self,
-        bullish_threshold: float = 2.0,  # lowered from 3.0 for ETF universe
+        bullish_threshold: float = 3.5,  # AUDIT FIX: consolidated with BullishScanner
+                                          # default (was 2.0 here, a third diverging
+                                          # value that did nothing real due to the
+                                          # dead is_bullish bug — see TechnicalScore).
+        bearish_threshold: float = 1.5,  # score <= this routes to ShortCallSpread
+                                          # in multi-strategy mode; below bullish
+                                          # but above "no real signal" floor.
         piotroski_threshold: int = 6,
         require_bullish: bool = True,
         require_piotroski: bool = True,
         require_iv_quality: bool = True,
         iv_block_on_caution: bool = False,
     ):
-        # ETF universe uses 2.0 threshold — ETFs rarely score above 3.0
-        # because broad-market funds have mixed sector technicals by design.
-        # 2.0 means: price above at least one SMA + one bullish momentum signal.
+        self.bearish_threshold = bearish_threshold
         self.scanner   = BullishScanner(bullish_threshold)
         self.piotroski = PiotroskiScorer(piotroski_threshold)
         self.require_bullish    = require_bullish
@@ -740,6 +759,70 @@ class TickerGate:
             "[TickerGate] Shortlist: %d/%d tickers (top %d by score): %s",
             len(shortlist), len(tickers), top_n,
             ", ".join(f"{t}({s:.1f})" for s, t in scored[:top_n]),
+        )
+        return shortlist
+
+    def filter_ranked_multi_strategy(
+        self,
+        tickers: list[str],
+        top_n: int = 10,
+    ) -> list[tuple[str, str]]:
+        """
+        Score all tickers and route each to a strategy by technical direction,
+        instead of rejecting everything below the bullish threshold.
+
+        Routing:
+          score >= bullish_threshold              -> "short_put_spread"  (bullish bet)
+          score <= bearish_threshold               -> "short_call_spread" (bearish bet)
+          bearish_threshold < score < bullish_threshold -> "short_strangle" (neutral/range-bound)
+
+        IV quality and Piotroski remain hard gates regardless of direction —
+        only the directional bullish-only rejection from filter_ranked() is
+        relaxed here. Tickers with no scorable data default to "short_strangle"
+        (no directional read = no directional bet).
+
+        Returns list of (ticker, strategy_name) tuples, ranked by signal
+        confidence (distance from the neutral midpoint), capped at top_n.
+        """
+        midpoint = (self.scanner.threshold + self.bearish_threshold) / 2.0
+        scored: list[tuple[float, str, str, float]] = []  # (confidence, ticker, strategy_name, raw_score)
+
+        for t in tickers:
+            iv_ok, iv_report = self.iv_gate.check(t)
+            if not iv_ok:
+                logger.info(
+                    "[TickerGate] %s blocked: IV quality BLOCK (score=%d)",
+                    t, iv_report.quality_score if iv_report else 0,
+                )
+                continue
+
+            fund_ok = (not self.require_piotroski) or self.piotroski.is_entry_allowed(t)
+            if not fund_ok:
+                logger.info("[TickerGate] %s blocked: weak fundamentals", t)
+                continue
+
+            ts = self.scanner.compute(t) if self.require_bullish else None
+            if ts is None:
+                scored.append((0.0, t, "short_strangle", 0.0))
+                continue
+
+            if ts.score >= self.scanner.threshold:
+                strategy_name = "short_put_spread"
+            elif ts.score <= self.bearish_threshold:
+                strategy_name = "short_call_spread"
+            else:
+                strategy_name = "short_strangle"
+
+            confidence = abs(ts.score - midpoint)
+            scored.append((confidence, t, strategy_name, ts.score))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        shortlist = [(t, s) for _, t, s, _ in scored[:top_n]]
+
+        logger.info(
+            "[TickerGate] Multi-strategy shortlist: %d/%d tickers (top %d by confidence): %s",
+            len(shortlist), len(tickers), top_n,
+            ", ".join(f"{t}({s}, score={sc:.1f})" for _, t, s, sc in scored[:top_n]),
         )
         return shortlist
 
