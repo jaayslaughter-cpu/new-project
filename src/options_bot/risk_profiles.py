@@ -144,10 +144,13 @@ LOW = RiskProfile(
     max_trades_per_day  = 2,
 
     # Schedule (PT): scan at 9:45 AM PT, EOD at 3:45 PM PT
-    scan_hour          = 9,
+    scan_hour          = 6,    # AUDIT FIX: was 9 (= 12:45 PM ET, 3hrs after open).
+                                # 6:45 AM PT = 9:45 AM ET, matches OrchestratorConfig
+                                # default and the intended 15-min-after-open scan.
     scan_minute        = 45,
     no_entry_after_hour = 11,   # 11 AM PT = 2 PM ET for 0DTE
-    eod_close_hour     = 15,
+    eod_close_hour     = 12,   # AUDIT FIX: was 15 (= 6:45 PM ET, ~3hrs after close).
+                                # 12:45 PM PT = 3:45 PM ET, 15 min before close.
     eod_close_minute   = 45,
 
     # Regime: reduce size significantly in bad conditions
@@ -199,10 +202,10 @@ MEDIUM = RiskProfile(
     max_trades_per_day  = 3,
 
     # Schedule (PT): scan at 9:45 AM PT, EOD at 3:45 PM PT
-    scan_hour          = 9,
+    scan_hour          = 6,    # AUDIT FIX: 6:45 AM PT = 9:45 AM ET (was 9 = 12:45 PM ET)
     scan_minute        = 45,
     no_entry_after_hour = 11,
-    eod_close_hour     = 15,
+    eod_close_hour     = 12,   # AUDIT FIX: 12:45 PM PT = 3:45 PM ET (was 15 = 6:45 PM ET)
     eod_close_minute   = 45,
 
     # Regime: balanced
@@ -256,10 +259,10 @@ HIGH = RiskProfile(
     max_trades_per_day  = 5,
 
     # Schedule (PT)
-    scan_hour          = 9,
+    scan_hour          = 6,    # AUDIT FIX: 6:45 AM PT = 9:45 AM ET (was 9 = 12:45 PM ET)
     scan_minute        = 45,
     no_entry_after_hour = 11,
-    eod_close_hour     = 15,
+    eod_close_hour     = 12,   # AUDIT FIX: 12:45 PM PT = 3:45 PM ET (was 15 = 6:45 PM ET)
     eod_close_minute   = 45,
 
     # Regime: more aggressive in favorable conditions
