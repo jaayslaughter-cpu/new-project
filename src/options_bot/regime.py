@@ -254,6 +254,7 @@ class RegimeDetector:
         # Data quality flag is propagated to scoring to down-weight thin data.
         breadth_data   = get_market_breadth()
         breadth_scores = composite_to_regime_score(breadth_data)
+        stock_bond     = self._compute_stock_bond_divergence()
 
         return {
             "vix_level":          round(vix_level,      2) if vix_level      is not None else 20.0,
@@ -274,6 +275,14 @@ class RegimeDetector:
             "breadth_quality":    breadth_data.get("data_quality", "unknown"),
             # Pre-scored contributions (PROVISIONAL_WEIGHTS — see breadth.py)
             "_breadth_scores":    breadth_scores,
+            # Stock-bond (SPY/TLT) divergence — flight-to-safety signal.
+            # signal_trusted is gated on realized 20d correlation being
+            # negative (ECB FSR Nov 2022 finding: this can break down in
+            # high-inflation regimes) — see _compute_stock_bond_divergence.
+            "big_blue_day":               stock_bond["big_blue_day"],
+            "capitulation":                stock_bond["capitulation"],
+            "stock_bond_correlation_20d":  stock_bond["stock_bond_correlation_20d"],
+            "stock_bond_signal_trusted":   stock_bond["signal_trusted"],
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
@@ -559,6 +568,103 @@ class RegimeDetector:
             logger.warning("[RegimeDetector] Trend strength failed: %s", exc)
         return None
 
+    def _compute_stock_bond_divergence(self) -> dict:
+        """
+        Stock-bond (SPY/TLT) divergence flags — flight-to-safety signal.
+
+        Source: empirically validated by an independent backtest study
+        (Clarion `backtests/spy_tlt_signals`, 2002-2026 incl. GFC) — Sharpe
+        0.65 vs SPY buy-and-hold 0.43, max drawdown cut from -55% to -14%.
+        Two Tier-1 signals:
+          big_blue_day — SPY 1d return < -1% AND TLT 1d return > +1%
+          capitulation — SPY 1d return < -1% AND TLT red AND
+                          SPY volume > 1.5x its trailing 20d average
+
+        IMPORTANT CAVEAT (ECB Financial Stability Review, Nov 2022,
+        "Cross-asset correlations in a more inflationary environment"):
+        the stock-bond correlation that this signal's premise depends on
+        (bonds rally when stocks fall) is NOT stable — it has trended
+        positive during high-inflation regimes via the discount-rate
+        channel, meaning stocks and bonds can sell off together instead
+        of bonds providing the expected offset. To guard against trusting
+        a broken-down relationship, this method also computes the trailing
+        20-day realized SPY/TLT return correlation and only marks the
+        signal "trusted" when that correlation is negative — i.e. the
+        flight-to-safety mechanism is actually currently functioning.
+        When correlation is positive, the divergence flags are still
+        reported (for visibility/logging) but flagged untrusted and are
+        not added to the regime score.
+
+        Returns dict with: big_blue_day, capitulation, spy_1d_return,
+        tlt_1d_return, spy_volume_ratio, stock_bond_correlation_20d,
+        signal_trusted (bool).
+        """
+        _safe = {
+            "big_blue_day": False, "capitulation": False,
+            "spy_1d_return": 0.0, "tlt_1d_return": 0.0,
+            "spy_volume_ratio": 1.0, "stock_bond_correlation_20d": None,
+            "signal_trusted": False,
+        }
+        try:
+            import yfinance as yf
+            import numpy as np
+
+            spy_hist = yf.Ticker("SPY").history(period="35d")
+            tlt_hist = yf.Ticker("TLT").history(period="35d")
+            if spy_hist.empty or tlt_hist.empty or len(spy_hist) < 22 or len(tlt_hist) < 22:
+                return _safe
+
+            spy_close = spy_hist["Close"]
+            tlt_close = tlt_hist["Close"]
+            spy_vol   = spy_hist["Volume"]
+
+            spy_1d_return = float(spy_close.iloc[-1] / spy_close.iloc[-2] - 1.0)
+            tlt_1d_return = float(tlt_close.iloc[-1] / tlt_close.iloc[-2] - 1.0)
+
+            spy_vol_avg20 = float(spy_vol.iloc[-21:-1].mean())
+            spy_vol_today = float(spy_vol.iloc[-1])
+            spy_volume_ratio = (spy_vol_today / spy_vol_avg20) if spy_vol_avg20 > 0 else 1.0
+
+            big_blue_day = (spy_1d_return < -0.01) and (tlt_1d_return > 0.01)
+            capitulation = (
+                (spy_1d_return < -0.01)
+                and (tlt_1d_return < 0.0)
+                and (spy_volume_ratio > 1.5)
+            )
+
+            # Trailing 20-day realized correlation — the ECB-informed gate.
+            # Negative correlation = flight-to-safety mechanism is working
+            # (bonds and stocks moving opposite directions, as the signal
+            # assumes). Positive correlation = the relationship has broken
+            # down (both sell off together) and the signal should not be
+            # trusted, per the ECB's inflationary-regime finding.
+            n = min(21, len(spy_close), len(tlt_close))
+            spy_rets = spy_close.iloc[-n:].pct_change().dropna()
+            tlt_rets = tlt_close.iloc[-n:].pct_change().dropna()
+            common_len = min(len(spy_rets), len(tlt_rets))
+            correlation_20d = None
+            if common_len >= 10:
+                corr_matrix = np.corrcoef(
+                    spy_rets.iloc[-common_len:].values,
+                    tlt_rets.iloc[-common_len:].values,
+                )
+                correlation_20d = float(corr_matrix[0, 1])
+
+            signal_trusted = (correlation_20d is not None) and (correlation_20d < 0.0)
+
+            return {
+                "big_blue_day":               big_blue_day,
+                "capitulation":                capitulation,
+                "spy_1d_return":               round(spy_1d_return, 4),
+                "tlt_1d_return":                round(tlt_1d_return, 4),
+                "spy_volume_ratio":             round(spy_volume_ratio, 2),
+                "stock_bond_correlation_20d":   round(correlation_20d, 3) if correlation_20d is not None else None,
+                "signal_trusted":               signal_trusted,
+            }
+        except Exception as exc:
+            logger.warning("[RegimeDetector] Stock-bond divergence failed: %s", exc)
+        return _safe
+
     def _compute_vix_percentile(self, current_vix: Optional[float], window_days: int = 252) -> Optional[float]:
         """
         Compute where the current VIX level sits within its own N-day history.
@@ -838,6 +944,20 @@ class RegimeDetector:
             scores["trending"]        += 0.12
         else:
             scores["high_volatility"] += 0.05  # random walk — slight uncertainty bump
+
+        # Stock-bond (SPY/TLT) divergence — 8th signal.
+        # capitulation is the stronger of the two flags (adds volume
+        # confirmation on top of the basic divergence) — weighted higher.
+        # Only contributes to the score when signal_trusted is True (i.e.
+        # the realized 20d SPY/TLT correlation is actually negative right
+        # now — see _compute_stock_bond_divergence docstring for why this
+        # gate exists). An untrusted signal is still logged/visible in
+        # indicators for monitoring, but does not move the regime score.
+        if indicators.get("stock_bond_signal_trusted"):
+            if indicators.get("capitulation"):
+                scores["high_volatility"] += 0.20
+            elif indicators.get("big_blue_day"):
+                scores["high_volatility"] += 0.12
 
         # Pick winner
         regime = max(scores, key=scores.__getitem__)
