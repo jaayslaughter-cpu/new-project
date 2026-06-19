@@ -1032,6 +1032,102 @@ class TestShortPutSpread(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Test: ShortCallSpread strategy
+#
+# AUDIT FIX: this strategy previously had an incompatible evaluate() signature
+# (ticker, chain, expiry, dte, underlying_price) that didn't match the single
+# `evaluate(chain)` call the orchestrator actually uses, and returned an
+# undefined `TradeSignal` type instead of `StrategySignal`. It would throw
+# TypeError on every single ticker if "short_call_spread" were ever selected
+# as the active strategy, and had zero test coverage to catch it. Rewritten
+# to mirror ShortPutSpread's structure exactly (same checks, same return type)
+# and covered here so a regression can never go undetected again.
+# ---------------------------------------------------------------------------
+
+class TestShortCallSpread(unittest.TestCase):
+
+    def setUp(self):
+        from options_bot.strategy import ShortCallSpread, ShortCallSpreadConfig
+        # Default call_strikes only reach delta~0.24 (max strike 610); widen the
+        # ladder so a true ~0.15-delta call exists for this lower-delta config.
+        self.chain = make_spy_chain_for_strategy(
+            dte=30,
+            call_strikes=[595, 600, 605, 610, 615, 620, 625, 630, 635, 640],
+        )
+        self.strategy = ShortCallSpread(ShortCallSpreadConfig(
+            target_delta=0.15,
+            long_delta=0.07,
+            min_dte=15,
+            max_dte=60,
+            min_open_interest=50,
+            min_credit=0.10,
+            min_spread_width=2.0,
+        ))
+
+    def test_returns_signal(self):
+        from options_bot.strategy import StrategySignal
+        signal = self.strategy.evaluate(self.chain)
+        self.assertIsInstance(signal, StrategySignal)
+
+    def test_signal_has_two_legs(self):
+        signal = self.strategy.evaluate(self.chain)
+        self.assertEqual(len(signal.legs), 2)
+
+    def test_both_legs_are_calls(self):
+        signal = self.strategy.evaluate(self.chain)
+        for leg in signal.legs:
+            self.assertEqual(leg.option_type, "call")
+
+    def test_long_leg_is_higher_strike(self):
+        signal = self.strategy.evaluate(self.chain)
+        short_leg = next(l for l in signal.legs if l.side == "sell_to_open")
+        long_leg  = next(l for l in signal.legs if l.side == "buy_to_open")
+        self.assertGreater(long_leg.strike, short_leg.strike)
+
+    def test_net_credit_is_positive(self):
+        signal = self.strategy.evaluate(self.chain)
+        self.assertGreater(signal.estimated_fill_price, 0)
+        self.assertLess(signal.net_debit_credit, 0)   # negative = credit received
+
+    def test_max_loss_equals_spread_minus_credit(self):
+        signal = self.strategy.evaluate(self.chain)
+        short_leg = next(l for l in signal.legs if l.side == "sell_to_open")
+        long_leg  = next(l for l in signal.legs if l.side == "buy_to_open")
+        spread_width = long_leg.strike - short_leg.strike
+        net_credit = signal.estimated_fill_price
+        expected_max_loss = (spread_width - net_credit) * 100
+        self.assertAlmostEqual(
+            signal.max_loss_per_contract, expected_max_loss, delta=0.01
+        )
+
+    def test_max_loss_is_finite(self):
+        signal = self.strategy.evaluate(self.chain)
+        self.assertTrue(abs(signal.max_loss_per_contract) < float('inf'))
+
+    def test_hard_stop_is_2x_credit(self):
+        signal = self.strategy.evaluate(self.chain)
+        ratio = signal.hard_stop_price / signal.estimated_fill_price
+        self.assertAlmostEqual(ratio, 2.0, delta=0.01)
+
+    def test_orchestrator_call_signature(self):
+        """
+        Regression guard: orchestrator.py always calls
+        self.strategy.evaluate(enriched) with exactly one positional arg.
+        This must never require ticker/expiry/dte/underlying_price again.
+        """
+        import inspect
+        sig = inspect.signature(self.strategy.evaluate)
+        params = list(sig.parameters.keys())
+        self.assertEqual(params, ["chain"])
+
+    def test_reachable_via_strategy_registry(self):
+        from options_bot.strategy import get_strategy, StrategySignal
+        s = get_strategy("short_call_spread")
+        signal = s.evaluate(self.chain)
+        self.assertIsInstance(signal, StrategySignal)
+
+
+# ---------------------------------------------------------------------------
 # Test: ShortStrangle strategy
 # ---------------------------------------------------------------------------
 
