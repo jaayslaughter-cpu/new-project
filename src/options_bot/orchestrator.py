@@ -973,20 +973,29 @@ class TradingPipeline:
                 _sig_obj = sentiment_signals.get(ticker)
             except Exception:
                 pass
-            # Pass news sentiment into SEC scoring for congress+news confirmation
-            _news_sig   = _sig_obj.signal         if _sig_obj else None
-            _news_score = _sig_obj.weighted_score  if _sig_obj else None
-            _sec_data_full = score_sec_with_news(
-                ticker,
-                news_signal=_news_sig,
-                news_score=_news_score,
-            )
-            if _sec_data_full.get("news_confirmed") is True:
-                logger.info(
-                    "[Pipeline] %s ⭐ Congress+News aligned: buys=%d news=%s sec_score=%d",
-                    ticker, _sec_data_full.get("congress_buys",0),
-                    _news_sig, _sec_data_full.get("score",0),
+            # Pass news sentiment into SEC scoring for congress+news confirmation.
+            # score_sec_with_news() is independently hardened, but wrap here too —
+            # a single ticker's SEC/congress lookup must never crash the whole scan.
+            try:
+                _news_sig   = _sig_obj.signal         if _sig_obj else None
+                _news_score = _sig_obj.weighted_score  if _sig_obj else None
+                _sec_data_full = score_sec_with_news(
+                    ticker,
+                    news_signal=_news_sig,
+                    news_score=_news_score,
                 )
+                if _sec_data_full.get("news_confirmed") is True:
+                    logger.info(
+                        "[Pipeline] %s ⭐ Congress+News aligned: buys=%d news=%s sec_score=%d",
+                        ticker, _sec_data_full.get("congress_buys",0),
+                        _news_sig, _sec_data_full.get("score",0),
+                    )
+            except Exception as _sec_exc:
+                logger.warning(
+                    "[Pipeline] %s SEC/Congress scoring failed (non-fatal, using neutral): %s",
+                    ticker, _sec_exc,
+                )
+                _sec_data_full = {"score": 0, "detail": "scoring unavailable"}
             _confidence_report = self._confidence.score(
                 signal=signal,
                 ticker=ticker,
