@@ -980,8 +980,9 @@ class TestShortPutSpread(unittest.TestCase):
         from options_bot.strategy import ShortPutSpread, ShortPutSpreadConfig
         self.chain = make_spy_chain_for_strategy(dte=30)
         self.strategy = ShortPutSpread(ShortPutSpreadConfig(
-            short_delta=-0.25,
-            long_delta=-0.10,
+            short_delta=-0.15,   # matches production default (lowered from -0.25
+                                  # to stay under the 35% PoT hard-reject threshold)
+            long_delta=-0.07,
             min_dte=15,
             max_dte=60,
             min_open_interest=50,
