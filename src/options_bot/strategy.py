@@ -616,7 +616,7 @@ class ShortPutSpread(BaseStrategy):
         )
         # GEX gamma wall check — don't short near the put wall or above pin
         self._check_gex(
-            enriched=enriched,
+            enriched=valid,
             short_strike=short_put.strike,
             spot=short_put.underlying_price,
             expiry=short_put.expiry,
