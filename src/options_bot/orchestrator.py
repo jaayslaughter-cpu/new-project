@@ -1050,6 +1050,18 @@ class TradingPipeline:
         except PipelineConnectionError as exc:
             self.state.record_error(f"{ticker} strategy failed: {exc}")
             return None
+        except Exception as exc:
+            # Defense in depth: any unexpected bug in strategy code (bad variable
+            # reference, type error, etc.) must not kill the entire scan job.
+            # Skip this ticker, log loudly, and let the scan continue to the
+            # next ticker in the shortlist.
+            logger.error(
+                "[Pipeline] %s: UNEXPECTED error in strategy.evaluate() — %s. "
+                "Skipping this ticker. This indicates a bug — investigate.",
+                ticker, exc, exc_info=True,
+            )
+            self.state.record_error(f"{ticker} strategy UNEXPECTED error: {exc}")
+            return None
 
         # --- Step 4: Risk evaluation ---
         # Update equity from broker before sizing
