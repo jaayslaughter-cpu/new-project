@@ -309,33 +309,37 @@ def _score_sec_signals_impl(ticker: str, use_cache: bool = True) -> dict:
         result["detail"] = result.get("detail", "") + f"; AV insider boost=+{av_boost}"
         logger.debug("[SEC] %s: AV insider boost +%d → total score=%d", ticker, av_boost, result["score"])
 
-    # Congressional trades boost — filtered by news sentiment confirmation
-    # Fetch news signal to cross-reference against congressional activity
-    _news_sig   = result.get("news_signal")    # injected by orchestrator if available
-    _news_score = result.get("news_score")     # injected by orchestrator if available
-    congress_boost = score_congress_signals(
-        ticker,
-        news_signal=_news_sig,
-        news_score=_news_score,
-    )
-    if congress_boost != 0:
-        congress_trades = get_congress_trades(ticker)
-        buys  = [t for t in congress_trades if "purchase" in t.trade_type or "buy" in t.trade_type]
-        sells = [t for t in congress_trades if "sale" in t.trade_type]
-        news_note = f" [news={_news_sig}]" if _news_sig else ""
-        result["score"] = result.get("score", 0) + congress_boost
-        result["detail"] = (
-            result.get("detail", "") +
-            f"; Congress boost={congress_boost:+d}{news_note}"
-            f" ({len(buys)} buys/{len(sells)} sells in 90d)"
+    # Congressional trades boost — filtered by news sentiment confirmation.
+    # Entire block is non-fatal: any failure here must NOT crash the scan job.
+    try:
+        _news_sig   = result.get("news_signal")
+        _news_score = result.get("news_score")
+        congress_boost = score_congress_signals(
+            ticker, news_signal=_news_sig, news_score=_news_score,
         )
-        result["congress_buys"]  = len(buys)
-        result["congress_sells"] = len(sells)
-        result["news_confirmed"]  = _news_sig == "BUY" if _news_sig else None
-        logger.info(
-            "[SEC] %s: Congress %+d%s buys=%d sells=%d → total=%d",
-            ticker, congress_boost, news_note, len(buys), len(sells), result["score"],
-        )
+        if congress_boost != 0:
+            congress_trades = get_congress_trades(ticker)
+            buys  = [t for t in congress_trades
+                     if "purchase" in (getattr(t, "trade_type", "") or "")
+                     or "buy" in (getattr(t, "trade_type", "") or "")]
+            sells = [t for t in congress_trades
+                     if "sale" in (getattr(t, "trade_type", "") or "")]
+            news_note = f" [news={_news_sig}]" if _news_sig else ""
+            result["score"] = result.get("score", 0) + congress_boost
+            result["detail"] = (
+                result.get("detail", "") +
+                f"; Congress boost={congress_boost:+d}{news_note}"
+                f" ({len(buys)} buys/{len(sells)} sells in 90d)"
+            )
+            result["congress_buys"]  = len(buys)
+            result["congress_sells"] = len(sells)
+            result["news_confirmed"]  = _news_sig == "BUY" if _news_sig else None
+            logger.info(
+                "[SEC] %s: Congress %+d%s buys=%d sells=%d → total=%d",
+                ticker, congress_boost, news_note, len(buys), len(sells), result["score"],
+            )
+    except Exception as exc:
+        logger.debug("[SEC] %s: congress boost block failed (non-fatal): %s", ticker, exc)
 
     _results_cache[ticker] = (now, result)
     return result
@@ -359,31 +363,44 @@ def score_sec_with_news(
     news_signal  : "BUY" | "SELL" | "HOLD" from SentimentAnalyzer.get_signals()
     news_score   : weighted score -1.0 to +1.0 from TickerSignal.weighted_score
     """
-    # Use a fresh (uncached) score with the news data injected
-    result = _score_sec_signals_impl(ticker, use_cache=False)
-    # The congress call inside _score_sec_signals_impl will have already used
-    # result["news_signal"] if it was set — but we need to pre-seed it.
-    # Re-run congress scoring with news context and update result.
+    # Use a fresh (uncached) score with the news data injected.
+    # This entire function is non-fatal — any failure falls back to a
+    # neutral empty result rather than crashing the scan job.
+    try:
+        result = _score_sec_signals_impl(ticker, use_cache=False)
+    except Exception as exc:
+        logger.debug("[SEC] %s: base scoring failed, using neutral result: %s", ticker, exc)
+        result = {"ticker": ticker.upper(), "score": 0, "detail": "scoring unavailable",
+                   "signal": "NEUTRAL", "insider_buy_count": 0,
+                   "has_activist": False, "is_activist": False, "last_insider_buy_date": ""}
+
     result["news_signal"] = news_signal
     result["news_score"]  = news_score
-    congress_boost = score_congress_signals(ticker, news_signal=news_signal, news_score=news_score)
-    if congress_boost != 0:
-        trades = get_congress_trades(ticker)
-        buys  = [t for t in trades if "purchase" in t.trade_type or "buy" in t.trade_type]
-        sells = [t for t in trades if "sale" in t.trade_type]
-        news_note = f" [news={news_signal}]" if news_signal else ""
-        # Avoid double-counting: subtract any previous congress boost and re-add
-        prev_boost = result.get("_prev_congress_boost", 0)
-        result["score"] = max(0, result["score"] - prev_boost) + congress_boost
-        result["_prev_congress_boost"] = congress_boost
-        result["detail"] = (
-            result.get("detail", "").split("; Congress boost=")[0] +
-            f"; Congress boost={congress_boost:+d}{news_note}"
-            f" ({len(buys)} buys/{len(sells)} sells)"
-        )
-        result["congress_buys"]  = len(buys)
-        result["congress_sells"] = len(sells)
-        result["news_confirmed"]  = news_signal == "BUY" if news_signal else None
+
+    try:
+        congress_boost = score_congress_signals(ticker, news_signal=news_signal, news_score=news_score)
+        if congress_boost != 0:
+            trades = get_congress_trades(ticker)
+            buys  = [t for t in trades
+                     if "purchase" in (getattr(t, "trade_type", "") or "")
+                     or "buy" in (getattr(t, "trade_type", "") or "")]
+            sells = [t for t in trades
+                     if "sale" in (getattr(t, "trade_type", "") or "")]
+            news_note = f" [news={news_signal}]" if news_signal else ""
+            prev_boost = result.get("_prev_congress_boost", 0)
+            result["score"] = max(0, result.get("score", 0) - prev_boost) + congress_boost
+            result["_prev_congress_boost"] = congress_boost
+            result["detail"] = (
+                result.get("detail", "").split("; Congress boost=")[0] +
+                f"; Congress boost={congress_boost:+d}{news_note}"
+                f" ({len(buys)} buys/{len(sells)} sells)"
+            )
+            result["congress_buys"]  = len(buys)
+            result["congress_sells"] = len(sells)
+            result["news_confirmed"]  = news_signal == "BUY" if news_signal else None
+    except Exception as exc:
+        logger.debug("[SEC] %s: congress+news block failed (non-fatal): %s", ticker, exc)
+
     return result
 
 
@@ -399,12 +416,15 @@ def is_entry_confirmed(ticker: str, require_score: int = 20) -> tuple[bool, str]
     insider buying, and that's fine. This function confirms when present,
     not blocks when absent.
     """
-    sig = score_sec_signals(ticker)
-    score = sig.get("score", 0)
-
-    if score >= require_score:
-        return True, f"SEC confirmed: {sig['detail']} (score={score})"
-    return False, f"no SEC confirmation (score={score}) — {sig['detail']}"
+    try:
+        sig = score_sec_signals(ticker)
+        score = sig.get("score", 0)
+        if score >= require_score:
+            return True, f"SEC confirmed: {sig.get('detail','')} (score={score})"
+        return False, f"no SEC confirmation (score={score}) — {sig.get('detail','')}"
+    except Exception as exc:
+        logger.debug("[SEC] is_entry_confirmed(%s) failed (non-fatal): %s", ticker, exc)
+        return False, f"SEC check unavailable: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -793,44 +813,51 @@ def score_congress_signals(
 
     Returns integer score to add to SEC signal total.
     """
-    trades = get_congress_trades(ticker)
-    if not trades:
+    try:
+        trades = get_congress_trades(ticker)
+        if not trades:
+            return 0
+
+        # Base score from trade activity — defensive attribute access
+        raw_score = 0
+        buy_count = 0
+        for t in trades:
+            try:
+                trade_type = getattr(t, "trade_type", "") or ""
+                days_since = getattr(t, "days_since", 999)
+                if "purchase" in trade_type or "buy" in trade_type:
+                    raw_score += 12 if days_since <= 30 else 5
+                    buy_count += 1
+                elif "sale" in trade_type:
+                    raw_score -= 3
+            except Exception:
+                continue   # skip malformed trade record, don't crash the scan
+
+        raw_score = max(-15, min(36, raw_score))
+
+        # News confirmation adjustment
+        if news_signal is not None and buy_count > 0:
+            news_sig = (news_signal or "HOLD").upper()
+            if news_sig == "BUY":
+                adjusted = raw_score + 10
+                logger.info(
+                    "[Congress+News] %s: congress_score=%d + news_BUY_bonus=+10 → %d",
+                    ticker, raw_score, adjusted,
+                )
+                raw_score = adjusted
+            elif news_sig == "SELL":
+                adjusted = int(raw_score * 0.5)
+                logger.info(
+                    "[Congress+News] %s: congress_score=%d × 0.5 (news=SELL conflict) → %d",
+                    ticker, raw_score, adjusted,
+                )
+                raw_score = adjusted
+
+        return max(-15, min(46, raw_score))
+
+    except Exception as exc:
+        logger.debug("[Congress] score_congress_signals(%s) failed (non-fatal): %s", ticker, exc)
         return 0
-
-    # Base score from trade activity
-    raw_score = 0
-    buy_count = 0
-    for t in trades:
-        if "purchase" in t.trade_type or "buy" in t.trade_type:
-            raw_score += 12 if t.days_since <= 30 else 5
-            buy_count += 1
-        elif "sale" in t.trade_type:
-            raw_score -= 3
-
-    raw_score = max(-15, min(36, raw_score))
-
-    # News confirmation adjustment
-    if news_signal is not None and buy_count > 0:
-        news_sig = (news_signal or "HOLD").upper()
-        if news_sig == "BUY":
-            # Strong combined signal: congress buying + positive news
-            adjusted = raw_score + 10
-            logger.info(
-                "[Congress+News] %s: congress_score=%d + news_BUY_bonus=+10 → %d",
-                ticker, raw_score, adjusted,
-            )
-            raw_score = adjusted
-        elif news_sig == "SELL":
-            # Conflicting: congress buying but negative news cycle
-            adjusted = int(raw_score * 0.5)
-            logger.info(
-                "[Congress+News] %s: congress_score=%d × 0.5 (news=SELL conflict) → %d",
-                ticker, raw_score, adjusted,
-            )
-            raw_score = adjusted
-        # HOLD: no adjustment — congress signal stands on its own
-
-    return max(-15, min(46, raw_score))   # cap raised to 46 for combined BUY+BUY
 
 
 # ---------------------------------------------------------------------------
