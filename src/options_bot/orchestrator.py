@@ -1879,6 +1879,14 @@ class Orchestrator:
         if self.zero_dte is None:
             return
 
+        # Market holiday / closed guard — APScheduler's cron trigger does not
+        # know about NYSE holidays (Juneteenth, Thanksgiving, etc.), so without
+        # this check the job fires every 2 minutes against stale or missing
+        # data on closed days.
+        if not _market_is_open():
+            logger.debug("[0DTE scan] Market closed — skip")
+            return
+
         # Respect max daily position cap
         if self.zero_dte_monitor and \
            self.zero_dte_monitor.open_count >= self.config.zero_dte_config.max_daily_positions:
