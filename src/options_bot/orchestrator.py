@@ -733,17 +733,7 @@ def send_discord(webhook_url: str, message: str) -> None:
         req = urllib.request.Request(
             url,
             data=payload,
-            headers={
-                "Content-Type": "application/json",
-                # AUDIT FIX: Discord's API sits behind Cloudflare, which
-                # blocks generic script user-agents (e.g. Python's default
-                # "Python-urllib/3.x") with a 403 Forbidden — independent of
-                # whether the webhook itself is valid. A descriptive UA
-                # avoids the block. This was misdiagnosed twice as a bad/
-                # expired webhook before the real cause (missing header)
-                # was found — a brand-new webhook hit the identical 403.
-                "User-Agent": "OptionsBot/1.0 (+https://github.com/jaayslaughter-cpu/new-project)",
-            },
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5):
@@ -2168,6 +2158,13 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("[Orchestrator] Universe rebuild failed (using config list): %s", exc)
 
+        # Capture the pre-bullish-filter candidate pool — needed below so the
+        # extra-strategy pass (short_call_spread, short_strangle) can route
+        # off direction-appropriate shortlists instead of reusing the
+        # bullish-only one. Must be captured before filter_ranked() narrows
+        # scan_tickers down to bullish-only candidates.
+        candidate_pool = scan_tickers
+
         # Score all universe tickers, take top N by composite score.
         # Chain fetching only runs on the shortlist — avoids 20 slow yfinance
         # options chain calls when most tickers would be rejected anyway.
@@ -2223,12 +2220,50 @@ class Orchestrator:
             len(filled_orders)
         )
 
-        # Multi-strategy pass — run extra_strategies against same shortlist
+        # Multi-strategy pass — run extra_strategies on DIRECTION-APPROPRIATE
+        # shortlists, not the bullish-only one used by the primary strategy.
+        #
+        # AUDIT FIX: previously every extra strategy (including
+        # short_call_spread, a BEARISH bet) ran against `scan_tickers`, which
+        # `filter_ranked()` had already narrowed down to bullish-only
+        # candidates. Selling calls on a ticker the bot just confirmed is
+        # bullish fights the trend instead of using it — structurally
+        # backwards. Now each extra strategy gets the shortlist that actually
+        # matches its market thesis:
+        #   short_call_spread -> tickers routed "bearish" by the technical scorer
+        #   short_strangle     -> tickers routed "neutral" (no strong direction)
         # Each extra strategy uses its own default config, independent of the
         # main strategy. Respects daily position caps across all strategies.
+        _multi_strategy_routes: dict[str, list[str]] = {}
+        if self.ticker_gate is not None and self.config.extra_strategies:
+            try:
+                _routed = self.ticker_gate.filter_ranked_multi_strategy(
+                    candidate_pool,
+                    top_n=self.config.scanner_shortlist_top_n,
+                )
+                for _t, _strategy_name in _routed:
+                    _multi_strategy_routes.setdefault(_strategy_name, []).append(_t)
+            except Exception as exc:
+                logger.warning(
+                    "[Orchestrator] Multi-strategy routing failed (extra "
+                    "strategies will be skipped this scan): %s", exc
+                )
+
         for extra_name in (self.config.extra_strategies or []):
             if extra_name == self.config.strategy_name:
                 continue  # already ran this one above
+
+            # Direction-appropriate shortlist for this specific strategy.
+            # Falls back to the bullish shortlist only if routing produced
+            # nothing (e.g. ticker_gate disabled) rather than silently
+            # skipping the strategy entirely.
+            extra_tickers = _multi_strategy_routes.get(extra_name, []) or scan_tickers
+            if not extra_tickers:
+                logger.info(
+                    "[Orchestrator] No tickers routed to %s this scan — skipping",
+                    extra_name,
+                )
+                continue
 
             # Check positions cap before starting next strategy pass
             positions = self.broker.get_positions()
@@ -2240,13 +2275,16 @@ class Orchestrator:
                 )
                 break
 
-            logger.info("[Orchestrator] === EXTRA STRATEGY PASS: %s ===", extra_name.upper())
+            logger.info(
+                "[Orchestrator] === EXTRA STRATEGY PASS: %s (%d tickers: %s) ===",
+                extra_name.upper(), len(extra_tickers), ", ".join(extra_tickers),
+            )
             try:
                 # Build a fresh pipeline using the extra strategy
                 extra_cfg = get_strategy(extra_name, None).config                     if hasattr(get_strategy(extra_name, None), "config") else None
                 self.pipeline.strategy = get_strategy(extra_name, extra_cfg)
 
-                for ticker in scan_tickers:
+                for ticker in extra_tickers:
                     positions = self.broker.get_positions()
                     current_count = len([
                         p for p in positions if p.get("asset_class") == "us_option"
