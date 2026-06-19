@@ -330,9 +330,11 @@ class BaseStrategy(ABC):
 @dataclass
 class CSPConfig:
     """Configuration for CashSecuredPut strategy."""
-    target_delta: float = -0.20         # target put delta to sell
-    min_delta: float = -0.30            # reject if delta more negative than this
-    max_delta: float = -0.10            # reject if delta less negative than this
+    target_delta: float = -0.15         # target put delta to sell (lowered from -0.20:
+                                         # PoT≈2×delta rule means -0.20 often breaches the
+                                         # 35% PoT hard-reject; -0.15 keeps PoT in the 25-35% zone)
+    min_delta: float = -0.22            # reject if delta more negative than this
+    max_delta: float = -0.08            # reject if delta less negative than this
     min_dte: int = 14                   # minimum days to expiration (widened for monthly-only ETFs)
     max_dte: int = 60                   # maximum days to expiration
     min_open_interest: int = 500        # higher OI requirement for CSPs
@@ -465,8 +467,10 @@ class CashSecuredPut(BaseStrategy):
 @dataclass
 class ShortPutSpreadConfig:
     """Configuration for ShortPutSpread strategy."""
-    short_delta: float = -0.25          # sell this delta put
-    long_delta: float = -0.10           # buy this delta put (further OTM)
+    short_delta: float = -0.15          # sell this delta put (lowered from -0.25:
+                                         # PoT≈2×delta rule means -0.25 ~50% PoT, almost
+                                         # always breaching the 35% PoT hard-reject)
+    long_delta: float = -0.07           # buy this delta put (further OTM, scaled down to match)
     min_dte: int = 14     # widened: captures monthly-only ETF expirations
     max_dte: int = 60
     min_open_interest: int = 100
@@ -711,8 +715,8 @@ class ShortPutSpread(BaseStrategy):
 @dataclass
 class ShortStrangleConfig:
     """Configuration for ShortStrangle strategy."""
-    call_delta: float = 0.20            # sell this delta call
-    put_delta: float = -0.20            # sell this delta put
+    call_delta: float = 0.15            # sell this delta call (lowered from 0.20 — see PoT note above)
+    put_delta: float = -0.15            # sell this delta put (lowered from -0.20 — see PoT note above)
     delta_tolerance: float = 0.05       # ± tolerance for delta matching
     min_dte: int = 21     # strangle: needs more time for both sides to decay
     max_dte: int = 60
@@ -911,9 +915,9 @@ class ShortStrangle(BaseStrategy):
 @dataclass
 class ShortCallSpreadConfig:
     """Config for short call spread (bear call spread)."""
-    target_delta:     float = 0.25     # sell ~25-delta call (OTM)
-    min_delta:        float = 0.15     # reject if short call delta below this
-    max_delta:        float = 0.35     # reject if short call delta above this
+    target_delta:     float = 0.15     # sell ~15-delta call (lowered from 0.25 — see PoT note above)
+    min_delta:        float = 0.08     # reject if short call delta below this
+    max_delta:        float = 0.22     # reject if short call delta above this
     min_spread_width: float = 1.0      # min strike separation (ETF-friendly)
     max_spread_width: float = 20.0     # max strike separation
     min_credit:       float = 0.25     # minimum credit to collect
