@@ -426,10 +426,25 @@ def check_strike_safety(
                     f"of POC ${poc} — resistance likely breached"
                 )
 
+        # AUDIT FIX: this previously hard-rejected on value-area overlap,
+        # while the bull_put branch above downgrades the identical check to
+        # a warning (see "Danger 3" comment) specifically because ETF value
+        # areas span most of the tradeable range — a hard reject there blocks
+        # almost every ETF spread. That same reasoning applies equally to
+        # bear_call; there was no principled reason for calls to face a
+        # stricter version of this check than puts. This asymmetry meant
+        # ShortCallSpread was structurally harder to trigger than
+        # ShortPutSpread independent of any other filter. Mirrored the same
+        # warning-not-reject treatment here for consistency.
         if va_lo < short_strike < va_hi:
-            return False, (
-                f"short call ${short_strike} inside value area "
-                f"[${va_lo}–${va_hi}]"
+            import logging as _log
+            _log.getLogger(__name__).debug(
+                "VP: %s short call $%.2f inside value area [$%.2f–$%.2f] "
+                "— caution but allowing (ETF universe)", ticker, short_strike, va_lo, va_hi
+            )
+            return True, (
+                f"caution: short call ${short_strike} inside value area "
+                f"[${va_lo}–${va_hi}] — monitor for mean reversion"
             )
 
     return True, f"strike ${short_strike} is safely away from all HVNs"
