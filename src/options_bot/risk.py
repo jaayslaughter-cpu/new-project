@@ -557,7 +557,7 @@ class RiskManager:
                 return self._veto(liq_veto)
 
         # --- Position sizing (GARCH vol scalar applied inside) ---
-        self._current_underlying = getattr(signal, "underlying", "")
+        self._current_underlying = getattr(option, "underlying", "") or getattr(option, "symbol", "")
         contracts = self._size_position(
             risk_budget_dollars=risk_budget,
             max_loss_per_contract=max_loss_per_contract,
