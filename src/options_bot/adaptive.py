@@ -57,7 +57,8 @@ logger = logging.getLogger(__name__)
 EVAL_WINDOW = 20
 
 # How many closed trades must exist before we start tuning at all
-MIN_TRADES_TO_TUNE = 10
+MIN_TRADES_TO_TUNE = 20   # 10 trades gives a ~±30% CI on win rate — statistically meaningless.
+                          # 20 trades narrows to ~±20%. WF gate (30 trades) still blocks changes below 30.
 
 # Minimum interval between tune cycles (in closed trades)
 # Prevents over-fitting to a small recent streak
@@ -66,7 +67,7 @@ TUNE_INTERVAL = 10
 # Performance targets
 TARGET_WIN_RATE_LOW  = 0.45   # below this → tighten
 TARGET_WIN_RATE_HIGH = 0.65   # above this (with good PF) → relax slightly
-TARGET_PROFIT_FACTOR = 1.0    # minimum acceptable
+TARGET_PROFIT_FACTOR = 1.2    # minimum acceptable — PF=1.0 is break-even before costs; 1.2 = 20% more gross profit than gross loss, covering commissions
 
 # Per-parameter hard limits (absolute, never crossed regardless of tuning)
 PARAM_LIMITS = {
