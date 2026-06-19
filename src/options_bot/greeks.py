@@ -643,21 +643,36 @@ def probability_of_touch(
     try:
         log_ks = np.log(strike / spot)
 
-        d1_touch = (-log_ks + mu * T) / sig
-        d2_touch = (-log_ks - mu * T) / sig
-
-        # Reflection principle: PoT = N(-d1) + exp(2*mu*log(K/S)/sigma^2)*N(d2_touch)
-        exponent = 2.0 * mu * log_ks / (sigma ** 2)
-
-        # Clamp exponent to prevent overflow
-        exponent = np.clip(exponent, -50, 50)
-
+        # AUDIT FIX (sign error): the reflection-principle formula for the
+        # probability that GBM touches a barrier B before T is:
+        #   P = N(d1) + (B/S0)^(2*mu/sigma^2) * N(d2)
+        #   where d1 = (ln(B/S0) - mu*T) / (sigma*sqrt(T))
+        #         d2 = (ln(B/S0) + mu*T) / (sigma*sqrt(T))
+        # for a barrier BELOW spot (put case, B < S0).
+        # For a barrier ABOVE spot (call case, B > S0), mirror by negating
+        # log(B/S0) throughout.
+        #
+        # PREVIOUS BUG: d1_touch/d2_touch were defined with negated signs but
+        # then combined with norm.cdf(d2_touch) instead of norm.cdf(-d2_touch),
+        # which silently flipped the second term to its complement. This
+        # inflated PoT for puts (e.g. 58% true -> 95% reported) and made PoT
+        # for calls return ~100% for every strike regardless of distance from
+        # spot — meaning the PoT>35% hard-reject was vetoing nearly every
+        # short-premium trade the bot ever evaluated, for both puts and calls.
         if option_type.lower() == "put":
-            # Put touch: underlying drops to strike (strike < spot)
-            pot = norm.cdf(-d1_touch) + np.exp(exponent) * norm.cdf(d2_touch)
+            # Put touch: underlying drops to strike (strike < spot), B = strike
+            d1 = (log_ks - mu * T) / sig
+            d2 = (log_ks + mu * T) / sig
+            exponent = np.clip(2.0 * mu * log_ks / (sigma ** 2), -50, 50)
+            pot = norm.cdf(d1) + np.exp(exponent) * norm.cdf(d2)
         else:
-            # Call touch: underlying rises to strike (strike > spot)
-            pot = norm.cdf(d1_touch) + np.exp(exponent) * norm.cdf(-d2_touch)
+            # Call touch: underlying rises to strike (strike > spot).
+            # Mirror the put formula by negating log(K/S).
+            neg_log_ks = -log_ks
+            d1 = (neg_log_ks - (-mu) * T) / sig    # equivalent: (-log_ks + mu*T)/sig
+            d2 = (neg_log_ks + (-mu) * T) / sig    # equivalent: (-log_ks - mu*T)/sig
+            exponent = np.clip(2.0 * mu * neg_log_ks / (sigma ** 2), -50, 50)
+            pot = norm.cdf(d1) + np.exp(exponent) * norm.cdf(d2)
 
         return float(np.clip(pot, 0.0, 1.0))
     except Exception:
