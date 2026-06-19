@@ -471,6 +471,8 @@ class ShortPutSpreadConfig:
     short_delta: float = -0.15          # sell this delta put (lowered from -0.25:
                                          # PoT≈2×delta rule means -0.25 ~50% PoT, almost
                                          # always breaching the 35% PoT hard-reject)
+    min_delta: float = -0.20            # reject if delta more negative than this
+    max_delta: float = -0.10            # reject if delta less negative than this
     long_delta: float = -0.07           # buy this delta put (further OTM, scaled down to match)
     min_dte: int = 14     # widened: captures monthly-only ETF expirations
     max_dte: int = 60
@@ -528,13 +530,24 @@ class ShortPutSpread(BaseStrategy):
             )
 
         # Find short leg (closer to ATM)
+        # AUDIT FIX: was a "relax and take the closest" fallback, meaning
+        # this strategy would trade an arbitrarily-far-off delta (and
+        # therefore an arbitrarily different risk profile than intended)
+        # rather than skip the trade. CSP and ShortCallSpread both hard-
+        # reject when nothing is in range -- standardized on hard-reject
+        # everywhere as the more conservative, capital-preservation-
+        # consistent behavior. No principled reason ShortPutSpread alone
+        # should be willing to force a trade the other strategies wouldn't.
         short_leg_candidates = [
             c for c in put_candidates
-            if cfg.short_delta - 0.05 <= c.delta <= cfg.short_delta + 0.05
+            if cfg.min_delta <= c.delta <= cfg.max_delta
         ]
         if not short_leg_candidates:
-            # Relax and take the closest
-            short_leg_candidates = put_candidates
+            raise LiquidityFilterError(
+                f"{put_candidates[0].underlying} chain",
+                f"[{self.name}] No puts in delta range "
+                f"[{cfg.min_delta:.2f}, {cfg.max_delta:.2f}]"
+            )
 
         short_put = min(
             short_leg_candidates,
@@ -776,19 +789,22 @@ class ShortStrangle(BaseStrategy):
             )
 
         # Find the call leg
+        # AUDIT FIX: both legs previously had a "relax tolerance" fallback
+        # that fell through to ANY call/put in the chain if nothing was
+        # within delta_tolerance, regardless of how far off the resulting
+        # delta was. CSP and ShortCallSpread hard-reject in the equivalent
+        # situation -- standardized on hard-reject everywhere. See the same
+        # note in ShortPutSpread.evaluate() for the full reasoning.
         call_candidates = [
             c for c in liquid
             if c.option_type == "call"
             and abs(c.delta - cfg.call_delta) <= cfg.delta_tolerance
         ]
         if not call_candidates:
-            # Relax tolerance
-            call_candidates = [c for c in liquid if c.option_type == "call"]
-
-        if not call_candidates:
             raise LiquidityFilterError(
                 _clean_ticker(liquid[0].underlying),
-                f"[{self.name}] No calls in chain"
+                f"[{self.name}] No calls within {cfg.delta_tolerance:.2f} "
+                f"of target delta {cfg.call_delta:.2f}"
             )
 
         short_call = min(
@@ -803,12 +819,10 @@ class ShortStrangle(BaseStrategy):
             and abs(c.delta - cfg.put_delta) <= cfg.delta_tolerance
         ]
         if not put_candidates:
-            put_candidates = [c for c in liquid if c.option_type == "put"]
-
-        if not put_candidates:
             raise LiquidityFilterError(
                 _clean_ticker(liquid[0].underlying),
-                f"[{self.name}] No puts in chain"
+                f"[{self.name}] No puts within {cfg.delta_tolerance:.2f} "
+                f"of target delta {cfg.put_delta:.2f}"
             )
 
         short_put = min(
