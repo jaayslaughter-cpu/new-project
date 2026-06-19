@@ -69,13 +69,26 @@ def _normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def _cdf_below(spot: float, strike: float, iv: float, dte_days: int) -> float:
-    """Probability that underlying closes below `strike` at expiry (log-normal)."""
+def _cdf_below(spot: float, strike: float, iv: float, dte_days: int, rate: float = 0.045) -> float:
+    """
+    Probability that underlying closes below `strike` at expiry (log-normal).
+
+    AUDIT FIX: was missing the risk-free rate drift term in d2, treating the
+    risk-neutral drift as zero. This biased every cdf_below value low by an
+    amount that grows with DTE (negligible at 7 DTE, ~2-3 percentage points
+    by 45-60 DTE). Currently low-impact in practice — cdf_below only feeds
+    the cosmetic lower_tail/upper_tail tags, not gex_score or wall/pin
+    selection or check_strike_gex_safety's actual hard gate — but the
+    formula itself was incomplete and worth correcting regardless. `rate`
+    defaults to a reasonable approximation since this module doesn't thread
+    the live Treasury rate through; callers needing precision should pass
+    the live rate from get_risk_free_rate() in greeks.py.
+    """
     if spot <= 0 or strike <= 0:
         return 0.5
     sigma = max(iv, 0.0001)
     years = max(dte_days, 1) / 365.0
-    d2 = (math.log(spot / strike) - 0.5 * sigma * sigma * years) / (sigma * math.sqrt(years))
+    d2 = (math.log(spot / strike) + (rate - 0.5 * sigma * sigma) * years) / (sigma * math.sqrt(years))
     return min(max(_normal_cdf(-d2), 0.0), 1.0)
 
 
