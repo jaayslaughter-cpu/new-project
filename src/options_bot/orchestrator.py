@@ -254,6 +254,8 @@ class SessionState:
     """Live state shared across scheduled jobs within one trading day."""
     trade_date: date = field(default_factory=date.today)
     equity: float = 0.0
+    peak_equity: float = 0.0          # all-time high equity; drawdown measured from here
+    drawdown_halt: bool = False        # True when max_drawdown_pct is breached
     open_positions: list[dict] = field(default_factory=list)
     filled_today: list[FilledOrder] = field(default_factory=list)
     daily_realized_pnl: float = 0.0
@@ -1055,6 +1057,20 @@ class TradingPipeline:
             current_equity = self.broker.get_equity()
             self.rm.update_equity(current_equity)
             self.state.equity = current_equity
+            # Ratchet peak and check drawdown halt
+            self.rm.update_peak_equity(current_equity)
+            if self.rm.is_drawdown_halted() and not self.state.drawdown_halt:
+                self.state.drawdown_halt = True
+                dd_pct = self.rm.current_drawdown_pct()
+                _dd_msg = (
+                    f"🛑 **MAX DRAWDOWN HALT** — bot paused.\n"
+                    f"Account is down **{dd_pct:.1%}** from peak "
+                    f"(equity=${current_equity:,.2f}, peak=${self.rm._peak_equity:,.2f}, "
+                    f"limit={self.config.risk_config.max_drawdown_pct:.1%}).\n"
+                    f"No new trades will be opened. Review performance and restart the bot manually."
+                )
+                logger.critical("[Orchestrator] %s", _dd_msg.replace("**", ""))
+                send_discord(self.config.discord_webhook_url, _dd_msg)
         except PipelineConnectionError as exc:
             logger.warning("[Pipeline] Equity fetch failed, using cached: %s", exc)
 
@@ -2039,6 +2055,16 @@ class Orchestrator:
             policy.min_confidence_boost, policy.favored_strategy,
         )
 
+        # Cumulative drawdown halt — highest priority gate
+        if self.state.drawdown_halt or self.rm.is_drawdown_halted():
+            dd_pct = self.rm.current_drawdown_pct()
+            logger.warning(
+                "[Orchestrator] DRAWDOWN HALT active (%.1f%% from peak). "
+                "No new trades. Restart bot manually after review.",
+                dd_pct * 100,
+            )
+            return []
+
         # Legacy VIX hard-stop (defense in depth, independent of regime score)
         vix_level = indicators.get("vix_level")
         if vix_level and vix_level >= self.config.vix_max:
@@ -2265,6 +2291,7 @@ class Orchestrator:
             equity = self.broker.get_equity()
             self.state.equity = equity
             self.rm.update_equity(equity)
+            self.rm.update_peak_equity(equity)
         except Exception as exc:
             equity = self.state.equity if self.state.equity > 0 else self.rm.equity
             logger.warning("[EOD] Equity fetch failed, using cached $%.2f: %s", equity, exc)
@@ -2398,6 +2425,12 @@ class Orchestrator:
         except Exception as _eod_ce:
             logger.debug("[EOD] Confidence snapshot non-fatal: %s", _eod_ce)
 
+        _dd_pct  = self.rm.current_drawdown_pct()
+        _dd_line = (
+            f"⚠️ DRAWDOWN HALT ACTIVE: {_dd_pct:.1%} from peak — no new trades\n"
+            if self.state.drawdown_halt else
+            f"Drawdown: {_dd_pct:.1%} from peak (limit={self.config.risk_config.max_drawdown_pct:.1%})\n"
+        )
         summary = (
             f"Daily Summary - {date.today()}\n"
             f"Strategy: {self.config.strategy_name.upper()}  "
@@ -2407,6 +2440,7 @@ class Orchestrator:
             f"${self.state.daily_unrealized_pnl:+.2f} unrealized\n"
             f"Week-to-date: ${wtd_pnl:+.2f} ({len(wtd_pnls)} closed trades)\n"
             f"Total trades: {n_total}/30 to walk-forward unlock\n"
+            f"{_dd_line}"
             f"{metrics_line}"
             f"{stress_line}"
             f"{tuning_line}"
