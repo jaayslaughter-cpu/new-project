@@ -1025,6 +1025,23 @@ class TestShortPutSpread(unittest.TestCase):
         signal = self.strategy.evaluate(self.chain)
         self.assertTrue(abs(signal.max_loss_per_contract) < float('inf'))
 
+    def test_hard_rejects_when_no_delta_in_range(self):
+        """
+        AUDIT FIX regression guard: previously this strategy "relaxed and
+        took the closest" when nothing was in [min_delta, max_delta],
+        meaning it would trade an arbitrarily-far-off delta rather than
+        skip. Now it must hard-reject, consistent with CSP/ShortCallSpread.
+        """
+        from options_bot.strategy import ShortPutSpread, ShortPutSpreadConfig
+        from options_bot.exceptions import LiquidityFilterError
+
+        strategy = ShortPutSpread(ShortPutSpreadConfig(
+            min_delta=-0.95, max_delta=-0.90,
+            min_dte=15, max_dte=60, min_open_interest=50,
+        ))
+        with self.assertRaises(LiquidityFilterError):
+            strategy.evaluate(self.chain)
+
     def test_hard_stop_is_2x_credit(self):
         signal = self.strategy.evaluate(self.chain)
         ratio = signal.hard_stop_price / signal.estimated_fill_price
@@ -1135,10 +1152,18 @@ class TestShortStrangle(unittest.TestCase):
 
     def setUp(self):
         from options_bot.strategy import ShortStrangle, ShortStrangleConfig
-        self.chain = make_spy_chain_for_strategy(dte=35)
+        # Default call_strikes only reach delta~0.24 (max strike 610); widen the
+        # ladder so a true ~0.15-delta call exists, matching the production
+        # default (lowered from 0.20/-0.20 -> 0.15/-0.15, see PoT calibration
+        # note in ShortStrangleConfig). Hard-reject now applies if nothing is
+        # within delta_tolerance, so the fixture must actually contain a match.
+        self.chain = make_spy_chain_for_strategy(
+            dte=35,
+            call_strikes=[595, 600, 605, 610, 615, 620, 625, 630, 635, 640],
+        )
         self.strategy = ShortStrangle(ShortStrangleConfig(
-            call_delta=0.20,
-            put_delta=-0.20,
+            call_delta=0.15,
+            put_delta=-0.15,
             min_dte=15,
             max_dte=60,
             min_open_interest=50,
@@ -1292,7 +1317,11 @@ class TestStrategyToRiskPipeline(unittest.TestCase):
         from options_bot.strategy import ShortStrangle, ShortStrangleConfig
         from options_bot.risk import RiskManager, RiskConfig, ExecutionGuard
 
-        chain = make_spy_chain_for_strategy(dte=35)
+        # Widened call_strikes — production default call_delta=0.15 needs a
+        # strike further OTM than the default ladder's max (610) reaches.
+        chain = make_spy_chain_for_strategy(
+            dte=35, call_strikes=[595, 600, 605, 610, 615, 620, 625, 630, 635, 640],
+        )
         strategy = ShortStrangle(ShortStrangleConfig(
             min_dte=15, max_dte=60, min_open_interest=50, min_total_credit=0.10
         ))
@@ -1484,7 +1513,14 @@ class TestFullPipelineWithBroker(unittest.TestCase):
         from options_bot.risk import RiskManager, RiskConfig
         from options_bot.broker import PaperBroker
 
-        chain = make_spy_chain_for_strategy(dte=35)
+        # Widened call_strikes for short_strangle — production default
+        # call_delta=0.15 needs a strike further OTM than the default
+        # ladder's max (610) reaches.
+        call_strikes = (
+            [595, 600, 605, 610, 615, 620, 625, 630, 635, 640]
+            if strategy_name == "short_strangle" else None
+        )
+        chain = make_spy_chain_for_strategy(dte=35, call_strikes=call_strikes)
         strategy = get_strategy(strategy_name)
         signal = strategy.evaluate(chain)
 
