@@ -126,12 +126,30 @@ class OrchestratorConfig:
     strategy_name: str = "short_put_spread"   # csp | short_put_spread | short_call_spread | short_strangle
     strategy_config: object = None             # strategy-specific config dataclass
 
-    # Additional strategies — run after primary on the same shortlist each scan.
+    # Additional strategies — run after primary each scan, each on a
+    # direction-appropriate shortlist (see filter_ranked_multi_strategy).
+    # csp:               naked puts — same bullish/neutral bet as the
+    #                     primary strategy. Falls back to the bullish
+    #                     shortlist since it has no dedicated routing bucket
+    #                     (CSP and ShortPutSpread are directionally the same
+    #                     bet, just different structures — defined-risk
+    #                     spread vs naked put). Risk sizing naturally limits
+    #                     CSP to lower-priced underlyings — see earlier
+    #                     audit note: CSP's theoretical max loss formula
+    #                     ((strike - credit) x 100) makes it self-reject via
+    #                     the 1% risk budget on anything pricier than a
+    #                     small-cap-ish per-share level.
     # short_call_spread: sells calls when ticker is overbought / near upper BB
     # short_strangle:    sells both call and put on same expiry (neutral premium)
+    #
+    # AUDIT FIX: "csp" was previously missing from this list entirely.
+    # CashSecuredPut was a fully working, tested strategy that simply never
+    # ran in production because nothing ever selected it — strategy_name
+    # defaults to short_put_spread and CSP wasn't in extra_strategies either.
     extra_strategies: list = field(default_factory=lambda: [
-        "short_call_spread",   # calls — bearish/overbought setups
-        "short_strangle",      # both sides — neutral high-IV setups
+        "csp",                  # naked puts — bullish/neutral, same shortlist as primary
+        "short_call_spread",    # calls — bearish/overbought setups
+        "short_strangle",       # both sides — neutral high-IV setups
     ])
 
     # --- Risk ---
