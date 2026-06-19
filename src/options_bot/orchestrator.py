@@ -430,9 +430,110 @@ class TradeDatabase:
                     self._execute(conn, f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
                     logger.info("[TradeDB] Migration: added column %s %s", col, typedef)
             conn.commit()
+
+            # Generic key-value state table — survives container restarts.
+            # Used to persist in-memory strategy state (0DTE cooldown timer,
+            # momentum engine EMAs) that would otherwise silently reset every
+            # time Railway redeploys mid-session.
+            # (idea from IntelliStock's strategy_cache_persistence.py pattern)
+            if self._use_pg:
+                self._execute(conn, """
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        key        TEXT PRIMARY KEY,
+                        value_json TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+            else:
+                self._execute(conn, """
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        key        TEXT PRIMARY KEY,
+                        value_json TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+            conn.commit()
         finally:
             conn.close()
         logger.debug("[TradeDB] Schema ready (%s)", "PostgreSQL" if self._use_pg else "SQLite")
+
+    # ------------------------------------------------------------------
+    # Generic state persistence (survives container restarts)
+    # ------------------------------------------------------------------
+
+    def save_state(self, key: str, value: dict, max_age_hours: int = 18) -> None:
+        """
+        Persist an arbitrary JSON-serialisable dict under a key.
+
+        Used for in-memory strategy state that needs to survive Railway
+        container restarts mid-session (0DTE cooldown, momentum EMAs).
+        Fail-open: any error here must never break the trading loop.
+
+        max_age_hours is not enforced here — it's read by load_state() at
+        load time, so old state (e.g. from a previous trading day) is
+        automatically discarded rather than incorrectly resumed.
+        """
+        try:
+            conn = self._get_conn()
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                payload = json.dumps(value)
+                if self._use_pg:
+                    self._execute(conn, """
+                        INSERT INTO bot_state (key, value_json, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT (key) DO UPDATE
+                        SET value_json = EXCLUDED.value_json,
+                            updated_at = EXCLUDED.updated_at
+                    """, (key, payload, now))
+                else:
+                    self._execute(conn, """
+                        INSERT OR REPLACE INTO bot_state (key, value_json, updated_at)
+                        VALUES (?, ?, ?)
+                    """, (key, payload, now))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("[TradeDB] save_state(%s) failed (non-fatal): %s", key, exc)
+
+    def load_state(self, key: str, max_age_hours: int = 18) -> Optional[dict]:
+        """
+        Load a previously saved state dict, or None if not found / stale.
+
+        Discards state older than max_age_hours — this prevents a Monday
+        morning boot from resuming Friday's stale 0DTE cooldown/momentum
+        state, which would be meaningless after a weekend gap.
+        """
+        try:
+            conn = self._get_conn()
+            try:
+                cur = self._execute(
+                    conn, "SELECT value_json, updated_at FROM bot_state WHERE key = ?", (key,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                value_json, updated_at = row[0], row[1]
+                try:
+                    saved_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    if saved_at.tzinfo is None:
+                        saved_at = saved_at.replace(tzinfo=timezone.utc)
+                    age_hours = (datetime.now(timezone.utc) - saved_at).total_seconds() / 3600
+                    if age_hours > max_age_hours:
+                        logger.debug(
+                            "[TradeDB] load_state(%s) stale (%.1fh > %dh) — ignoring",
+                            key, age_hours, max_age_hours,
+                        )
+                        return None
+                except Exception:
+                    pass
+                return json.loads(value_json)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("[TradeDB] load_state(%s) failed (non-fatal): %s", key, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Strategy name map
