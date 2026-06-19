@@ -108,15 +108,18 @@ class RiskConfig:
     Override per-environment via env vars or YAML config.
     """
     # Per-trade risk limit — UNBREAKABLE
-    risk_budget_pct: float = 0.02          # 2% of equity max per trade
+    risk_budget_pct: float = 0.01          # 1% of equity max per trade — capital preservation default
 
     # Daily halt rules
-    max_daily_loss_pct: float = 0.05       # halt if down 5% on the day
+    max_daily_loss_pct: float = 0.03       # halt if down 3% on the day
     max_trades_per_day: int = 5            # max new positions opened per day
+
+    # Cumulative drawdown halt — bot pauses when equity falls this far from peak
+    max_drawdown_pct: float = 0.08            # pause if down 8% from equity peak
 
     # Position size bounds
     min_contracts: int = 1
-    max_contracts: int = 10               # hard cap regardless of sizing math
+    max_contracts: int = 5                # hard cap regardless of sizing math
 
     # Liquidity requirements (redundant with market_data filter but defense-in-depth)
     min_open_interest: int = 100
@@ -130,16 +133,30 @@ class RiskConfig:
 
     def validate(self) -> None:
         """Raises DataValidationError if any parameter is out of bounds."""
-        if not 0 < self.risk_budget_pct <= 0.25:
+        if not 0 < self.risk_budget_pct <= 0.10:
             raise DataValidationError(
                 "risk_budget_pct",
-                f"Must be in (0, 0.25], got {self.risk_budget_pct}. "
-                "Never risk more than 25% of equity on a single trade."
+                f"Must be in (0, 0.10], got {self.risk_budget_pct}. "
+                "Capital preservation limit: never risk more than 10% of equity on a single trade. "
+                "Recommended: 0.005-0.01 (0.5%-1%)."
             )
-        if not 0 < self.max_daily_loss_pct <= 0.20:
+        if not 0 < self.max_daily_loss_pct <= 0.10:
             raise DataValidationError(
                 "max_daily_loss_pct",
-                f"Must be in (0, 0.20], got {self.max_daily_loss_pct}"
+                f"Must be in (0, 0.10], got {self.max_daily_loss_pct}. "
+                "Recommended: 0.02-0.03 (2%-3%)."
+            )
+        if not 0 < self.max_drawdown_pct <= 0.25:
+            raise DataValidationError(
+                "max_drawdown_pct",
+                f"Must be in (0, 0.25], got {self.max_drawdown_pct}. "
+                "Recommended: 0.05-0.10 (5%-10%). Bot pauses when this level is hit."
+            )
+        if self.max_drawdown_pct < self.max_daily_loss_pct:
+            raise DataValidationError(
+                "max_drawdown_pct",
+                f"max_drawdown_pct ({self.max_drawdown_pct:.1%}) must be >= "
+                f"max_daily_loss_pct ({self.max_daily_loss_pct:.1%})"
             )
         if self.max_trades_per_day < 1:
             raise DataValidationError(
@@ -247,16 +264,18 @@ class RiskManager:
             raise DataValidationError("equity", f"Must be positive, got {equity}")
 
         self._equity = equity
+        self._peak_equity = equity        # all-time high equity for drawdown tracking
         self.config = config or RiskConfig()
         self.config.validate()
         self._daily = DailyState()
 
         logger.info(
             "[RiskManager] Initialized: equity=$%.2f, risk_pct=%.1f%%, "
-            "max_daily_loss=%.1f%%, max_trades=%d",
+            "max_daily_loss=%.1f%%, max_drawdown=%.1f%%, max_trades=%d",
             equity,
             self.config.risk_budget_pct * 100,
             self.config.max_daily_loss_pct * 100,
+            self.config.max_drawdown_pct * 100,
             self.config.max_trades_per_day,
         )
 
@@ -277,6 +296,33 @@ class RiskManager:
             self._equity, new_equity, new_equity - self._equity
         )
         self._equity = new_equity
+        # Ratchet peak upward — never backward
+        if new_equity > self._peak_equity:
+            self._peak_equity = new_equity
+            logger.debug("[RiskManager] New equity peak: $%.2f", self._peak_equity)
+
+    def update_peak_equity(self, equity: float) -> None:
+        """
+        Explicitly ratchet peak equity upward.
+        Call this at EOD or any time you want to confirm the peak is current.
+        Peak only moves up — drawdown is always measured from the highest point reached.
+        """
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+            logger.info("[RiskManager] Peak equity updated: $%.2f", self._peak_equity)
+
+    def current_drawdown_pct(self) -> float:
+        """
+        Current drawdown from the all-time peak as a fraction (0.08 = 8%).
+        Returns 0.0 if equity is at or above peak.
+        """
+        if self._peak_equity <= 0:
+            return 0.0
+        return max(0.0, (self._peak_equity - self._equity) / self._peak_equity)
+
+    def is_drawdown_halted(self) -> bool:
+        """Returns True if the max drawdown limit has been breached."""
+        return self.current_drawdown_pct() >= self.config.max_drawdown_pct
 
     def update_equity_after_fill(
         self, max_loss_committed: float, broker=None
@@ -475,6 +521,16 @@ class RiskManager:
                 f"risk_budget=${risk_budget:.2f} "
                 f"({self.config.risk_budget_pct:.1%} of ${self._equity:.2f}). "
                 "Cannot open even 1 contract within risk limits."
+            )
+
+        # Cumulative drawdown halt — highest priority after hard stop / max loss checks
+        drawdown = self.current_drawdown_pct()
+        if drawdown >= self.config.max_drawdown_pct:
+            return self._veto(
+                f"MAX DRAWDOWN HALT: account is down {drawdown:.1%} from peak "
+                f"(equity=${self._equity:,.2f}, peak=${self._peak_equity:,.2f}, "
+                f"limit={self.config.max_drawdown_pct:.1%}). "
+                "Bot paused. Review performance and resume manually."
             )
 
         # Daily loss halt
