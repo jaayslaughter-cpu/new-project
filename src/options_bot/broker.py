@@ -151,6 +151,18 @@ def _get_live_midpoint(
 
         mid = round((bid + ask) / 2.0, 2)
         logger.debug("[Broker] Live mid for %s: bid=%.2f ask=%.2f mid=%.2f", symbol, bid, ask, mid)
+
+        # Slippage deviation check — warn if live mid differs materially from strategy estimate
+        if fallback is not None and fallback > 0:
+            deviation_pct = abs(mid - fallback) / fallback
+            if deviation_pct > 0.15:
+                logger.warning(
+                    "[Broker] SLIPPAGE WARNING: live mid %.2f deviates %.0f%% from "
+                    "strategy estimate %.2f for %s. Market may have moved — "
+                    "fill economics differ from what risk system approved.",
+                    mid, deviation_pct * 100, fallback, symbol,
+                )
+
         return mid
 
     except Exception as exc:
@@ -475,23 +487,40 @@ class AlpacaBroker:
         return round(net, 2)
 
     def _post_order(self, req, order: ApprovedOrder, client_id: str) -> FilledOrder:
-        """POST /v2/orders — shared submission path."""
+        """
+        POST /v2/orders — shared submission path with retry.
+
+        Retry policy:
+          - 4xx (APIError): no retry — bad request, retrying won't help
+          - 5xx / network timeout: up to 2 retries, exponential backoff (2s, 4s)
+          - After all retries exhausted: raise PipelineConnectionError
+        """
         from alpaca.common.exceptions import APIError
         submit_time = datetime.now(tz=timezone.utc)
-        try:
-            resp = self._trading.submit_order(order_data=req)
-        except APIError as api_err:
-            # APIError carries a structured .message from Alpaca's JSON body.
-            # Raise as PipelineConnectionError so the orchestrator can log and
-            # record the rejection without crashing the full scan loop.
-            err_msg = getattr(api_err, "message", str(api_err))
-            raise PipelineConnectionError(
-                f"Alpaca API rejected order (client_id={client_id}): {err_msg}"
-            ) from api_err
-        except Exception as exc:
-            raise PipelineConnectionError(
-                f"POST /v2/orders failed (client_id={client_id}): {exc}"
-            ) from exc
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self._trading.submit_order(order_data=req)
+                break   # success — exit retry loop
+            except APIError as api_err:
+                # 4xx: Alpaca rejected the request — retrying won't help
+                err_msg = getattr(api_err, "message", str(api_err))
+                raise PipelineConnectionError(
+                    f"Alpaca API rejected order (client_id={client_id}): {err_msg}"
+                ) from api_err
+            except Exception as exc:
+                if attempt == max_attempts:
+                    raise PipelineConnectionError(
+                        f"POST /v2/orders failed after {max_attempts} attempts "
+                        f"(client_id={client_id}): {exc}"
+                    ) from exc
+                wait = 2 ** attempt   # 2s, 4s
+                logger.warning(
+                    "[AlpacaBroker] Order submit attempt %d/%d failed (%s) — "
+                    "retrying in %ds (client_id=%s)",
+                    attempt, max_attempts, exc, wait, client_id,
+                )
+                time.sleep(wait)
 
         order_id = str(resp.id)
         status   = str(resp.status)
