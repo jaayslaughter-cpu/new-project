@@ -72,6 +72,7 @@ from .stress_testing import run_stress_suite, positions_from_broker
 from .sec_signals import (is_entry_confirmed, score_sec_signals,
                            score_sec_with_news, get_dynamic_tickers)
 from .confidence_score import ConfidenceScorer
+from .stat_validation import run_all_validations, format_validation_discord
 
 logger = logging.getLogger(__name__)
 
@@ -2471,6 +2472,49 @@ class Orchestrator:
             "Profit factor: " + "{:.2f}".format(pf) + NL
         )
 
+    def _query_equity_curve(self) -> list[dict]:
+        """
+        Pull the daily account equity from the DB and return as a list of
+        {"date": str, "value": float} sorted oldest -> newest.
+        Falls back to reconstructing from closed trade P&L if the equity
+        snapshot table does not exist.
+        """
+        try:
+            with self.db._get_conn() as conn:
+                try:
+                    cur = conn.execute(
+                        "SELECT snapshot_date, equity "
+                        "FROM equity_snapshots "
+                        "ORDER BY snapshot_date ASC"
+                    )
+                    rows = cur.fetchall()
+                    if rows:
+                        return [{"date": r[0], "value": float(r[1])} for r in rows]
+                except Exception:
+                    pass  # table may not exist yet — fall through to reconstruction
+
+                # Reconstruction: build cumulative curve from closed trade P&L
+                cur = conn.execute(
+                    "SELECT trade_date, realized_pnl FROM trades "
+                    "WHERE status NOT IN ('open') AND realized_pnl IS NOT NULL "
+                    "ORDER BY trade_date ASC"
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return []
+                equity = self.state.equity or 100_000.0
+                # Walk backwards to get starting capital
+                total_pnl = sum(r[1] for r in rows)
+                start_eq  = equity - total_pnl
+                curve, running = [], start_eq
+                for trade_date, pnl in rows:
+                    running += pnl
+                    curve.append({"date": trade_date, "value": round(running, 2)})
+                return curve
+        except Exception as exc:
+            logger.debug("[StatValidation] Could not build equity curve: %s", exc)
+            return []
+
     def _check_milestones(self):
         all_pnls = self._query_all_pnls()
         n = len(all_pnls)
@@ -2507,7 +2551,26 @@ class Orchestrator:
             all_pass = all(p for _, p, _ in checks)
             lines_r.append("READY FOR LIVE TRADING" if all_pass else "Continue paper trading")
             readiness = NL.join(lines_r) + NL
-        msg = title + NL + detail + NL + NL + pnl_block + readiness
+
+        # Statistical edge validation — runs at 30, 60, 90 trade milestones
+        stat_block = ""
+        if n >= 30:
+            try:
+                curve = self._query_equity_curve()
+                initial_capital = self.state.equity or 100_000.0
+                if len(curve) >= 10:
+                    validation = run_all_validations(
+                        curve,
+                        initial_capital=initial_capital,
+                        n_strategies=4,   # ShortPutSpread, CashSecuredPut, ShortStrangle, 0DTE
+                    )
+                    stat_block = NL + format_validation_discord(validation) + NL
+                else:
+                    stat_block = NL + "*(Statistical validation: equity curve too short — run again after more trading days)*" + NL
+            except Exception as exc:
+                logger.warning("[Milestones] Statistical validation failed (non-fatal): %s", exc)
+
+        msg = title + NL + detail + NL + NL + pnl_block + readiness + stat_block
         send_discord(self.config.discord_webhook_url, msg)
 
     def _send_weekly_summary(self):
