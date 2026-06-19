@@ -173,7 +173,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--strategy", default="short_put_spread",
-        choices=["csp", "short_put_spread", "short_strangle"],
+        choices=["csp", "short_put_spread", "short_call_spread", "short_strangle"],
         help="Options strategy",
     )
     parser.add_argument(
@@ -181,8 +181,9 @@ def main() -> None:
         help="Override starting equity (default: fetch from Alpaca)",
     )
     parser.add_argument(
-        "--risk-pct", type=float, default=0.02,
-        help="Risk budget per trade as fraction of equity (e.g. 0.02 = 2%%)",
+        "--risk-pct", type=float, default=0.01,
+        help="Risk budget per trade as fraction of equity (e.g. 0.01 = 1%%). "
+             "Capital preservation default — matches RiskConfig.risk_budget_pct.",
     )
     parser.add_argument(
         "--max-trades", type=int, default=5,
