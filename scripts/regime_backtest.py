@@ -8,7 +8,7 @@ market behavior they claim to predict.
 
 v2 vs v1: now computes ALL 9 signals from real data, given a
 regime_backtest_data.csv built by build_regime_backtest_data_v2.py
-(VIX + Treasury + SPX + VXV + TLT + UUP). v1 only had 4/9 (VIX-only).
+(VIX + Treasury + SPX + VIX3M + TLT + UUP). v1 only had 4/9 (VIX-only).
 
 Signal coverage in this version:
   vix_level, vix_trend, vix_percentile   <- VIX_History.csv (same as v1)
@@ -42,9 +42,9 @@ Signal coverage in this version:
   periods (e.g. 2022 range-bound bear) once SPX data is available, rather
   than relying on synthetic drift alone -- flagging here rather than silently
   treating this signal as more reliable than this test suggests it is.
-  vix_term_structure                      <- VXV close vs VIX close (NEW,
+  vix_term_structure                      <- VIX3M close vs VIX close (NEW,
                                               exact production formula:
-                                              ratio = vxv/vix, >1=contango)
+                                              ratio = vix3m/vix, >1=contango)
   big_blue_day / capitulation /
   stock_bond_signal_trusted               <- SPX + TLT (NEW, exact production
                                               formula incl. the ECB-informed
@@ -56,7 +56,7 @@ Signal coverage in this version:
                                               single index — lowest priority
                                               of the 9, 1 signal out of 9)
 
-If your CSV is missing spx_close/vxv_close/tlt_close/uup_close columns
+If your CSV is missing spx_close/vix3m_close/tlt_close/uup_close columns
 (i.e. you're still on the v1 merge), this script automatically falls back
 to the v1-style neutralized indicators for whichever signals are missing —
 it won't crash, it'll just tell you what got neutralized and why.
@@ -118,13 +118,13 @@ def _rolling_hurst(close: np.ndarray, window: int = 252) -> np.ndarray:
 def build_indicator_series(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("date").reset_index(drop=True).copy()
     has_spx = "spx_close" in df.columns and df["spx_close"].notna().sum() > 300
-    has_vxv = "vxv_close" in df.columns and df["vxv_close"].notna().sum() > 100
+    has_vix3m = "vix3m_close" in df.columns and df["vix3m_close"].notna().sum() > 100
     has_tlt = "tlt_close" in df.columns and df["tlt_close"].notna().sum() > 300
     has_uup = "uup_close" in df.columns and df["uup_close"].notna().sum() > 300
 
     print("Signal coverage for this run:")
     print(f"  trend_strength / hurst : {'REAL (SPX)' if has_spx else 'NEUTRALIZED (no SPX data)'}")
-    print(f"  vix_term_structure     : {'REAL (VXV)' if has_vxv else 'NEUTRALIZED (no VXV data)'}")
+    print(f"  vix_term_structure     : {'REAL (VIX3M)' if has_vix3m else 'NEUTRALIZED (no VIX3M data)'}")
     print(f"  stock_bond divergence  : {'REAL (TLT)' if (has_spx and has_tlt) else 'NEUTRALIZED (need SPX+TLT)'}")
     print(f"  dollar_stress           : {'REAL (UUP)' if (has_spx and has_uup) else 'NEUTRALIZED (need SPX+UUP)'}")
     print(f"  breadth                 : NEUTRALIZED (always — needs constituent data, not built yet)")
@@ -162,9 +162,9 @@ def build_indicator_series(df: pd.DataFrame) -> pd.DataFrame:
         df["trend_strength"] = 0.5
         df["hurst"] = 0.5
 
-    # --- VIX term structure via VXV (NEW, exact production formula) ---
-    if has_vxv:
-        ratio = df["vxv_close"] / df["vix_close"]
+    # --- VIX term structure via VIX3M (NEW, exact production formula) ---
+    if has_vix3m:
+        ratio = df["vix3m_close"] / df["vix_close"]
         df["vix_term_ratio"] = ratio
         df["vix_term_structure"] = np.where(ratio > 1.0, "contango",
                                      np.where(ratio < 1.0, "backwardation", "flat"))
