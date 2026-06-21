@@ -1172,11 +1172,148 @@ class ShortCallSpread(BaseStrategy):
         )
 
 
+# ---------------------------------------------------------------------------
+# Iron Condor — defined-risk neutral premium-selling structure
+# Sell OTM put + buy lower OTM put (bull put spread)
+#   + sell OTM call + buy higher OTM call (bear call spread), same expiry.
+# This is the defined-risk upgrade to ShortStrangle for neutral-direction
+# tickers: capped max loss instead of the strangle's wide/undefined risk —
+# strictly better for a capital-preservation-first mandate.
+#
+# DESIGN: composes the two ALREADY-HARDENED spread strategies rather than
+# reimplementing leg selection. It runs ShortPutSpread.evaluate() and
+# ShortCallSpread.evaluate() on the same chain, then merges the four legs
+# into one defined-risk signal. This means every check those strategies
+# already enforce (delta window hard-reject, PoP/PoT gate, GEX/volume-profile
+# safety, liquidity) applies to BOTH sides of the condor for free, and any
+# future fix to the underlying spreads automatically flows through.
+#
+# GATED: not in STRATEGY_REGISTRY's default routing — the orchestrator only
+# routes to it after the 30-trade walk-forward milestone AND an explicit
+# iron_condor_enabled flag (see OrchestratorConfig). Building it now keeps it
+# tested and dormant; activation stays a deliberate human decision.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IronCondorConfig:
+    """
+    Config for the iron condor. Delegates per-side leg selection to the
+    underlying ShortPutSpread / ShortCallSpread configs so the condor stays
+    consistent with the standalone spreads (single source of truth for
+    delta targets, DTE window, liquidity, PoP). Only condor-level params
+    live here directly.
+    """
+    put_side:  ShortPutSpreadConfig  = field(default_factory=ShortPutSpreadConfig)
+    call_side: ShortCallSpreadConfig = field(default_factory=ShortCallSpreadConfig)
+    # Condor-level minimum TOTAL credit (both spreads combined). Set a touch
+    # above either single-side min_credit since we collect from both wings.
+    min_total_credit:  float = 0.40
+    stop_multiplier:   float = 2.0    # stop at 2x total credit received
+    profit_target_pct: float = 0.50   # close at 50% of max profit
+
+
+class IronCondor(BaseStrategy):
+    """
+    Defined-risk neutral premium seller.
+
+    Profits when the underlying stays BETWEEN the short put and short call
+    strikes through expiry — i.e. a low-volatility, range-bound view. Both
+    sides are vertical spreads, so max loss is capped at the wider spread
+    width minus total credit (the two sides can't both lose maximally — the
+    underlying can only finish on one side).
+    """
+
+    def __init__(self, config: Optional[IronCondorConfig] = None):
+        super().__init__("iron_condor")
+        self.cfg = config or IronCondorConfig()
+        # Compose the two hardened spread strategies.
+        self._put_spread  = ShortPutSpread(self.cfg.put_side)
+        self._call_spread = ShortCallSpread(self.cfg.call_side)
+
+    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+        # Each side runs its full evaluate() — including its own hard-reject
+        # delta window, PoP/PoT gate, and GEX/volume-profile checks. If either
+        # side can't find a qualifying spread it raises (LiquidityFilterError)
+        # we let that propagate so the condor is only
+        # built when BOTH sides independently qualify. A one-sided "condor"
+        # is just a spread and would defeat the neutral, defined-risk purpose.
+        put_signal  = self._put_spread.evaluate(chain)
+        call_signal = self._call_spread.evaluate(chain)
+
+        # Both sides must share an expiry (they will, since _pick_expiry feeds
+        # a single-expiry chain — but assert it rather than assume).
+        if put_signal.expiry != call_signal.expiry:
+            raise LiquidityFilterError(
+                put_signal.underlying,
+                f"[{self.name}] put/call sides resolved different expiries "
+                f"({put_signal.expiry} vs {call_signal.expiry}) — cannot form condor"
+            )
+
+        total_credit = put_signal.estimated_fill_price + call_signal.estimated_fill_price
+        if total_credit < self.cfg.min_total_credit:
+            raise LiquidityFilterError(
+                put_signal.underlying,
+                f"[{self.name}] total credit {total_credit:.2f} < "
+                f"min {self.cfg.min_total_credit:.2f}"
+            )
+
+        # Max loss for an iron condor = max(put_side_width, call_side_width)
+        # * 100 - total_credit*100. The underlying can only breach ONE side at
+        # expiry, so we lose the WIDER spread's max, offset by the FULL credit
+        # collected from both sides. Using max() (not sum) is the key
+        # capital-efficiency property that makes the condor defined-risk.
+        put_side_max_loss  = put_signal.max_loss_per_contract   # already (width - put_credit)*100
+        call_side_max_loss = call_signal.max_loss_per_contract  # already (width - call_credit)*100
+        # Each side's max_loss already netted its OWN credit; add back the
+        # opposite side's credit since that's collected regardless of which
+        # side is breached.
+        condor_max_loss = max(
+            put_side_max_loss  - call_signal.estimated_fill_price * 100,
+            call_side_max_loss - put_signal.estimated_fill_price  * 100,
+        )
+        # Floor at a small positive value — defined-risk must be > 0 and finite.
+        condor_max_loss = max(condor_max_loss, 1.0)
+
+        # Hard stop on combined credit (2x total credit received).
+        hard_stop = round(total_credit * self.cfg.stop_multiplier, 3)
+        profit_target = round(total_credit * (1.0 - self.cfg.profit_target_pct), 3)
+
+        legs = list(put_signal.legs) + list(call_signal.legs)
+
+        logger.info(
+            "[%s] %s condor: put-side credit=%.2f call-side credit=%.2f "
+            "total=%.2f max_loss=%.2f dte=%s",
+            self.name, put_signal.underlying,
+            put_signal.estimated_fill_price, call_signal.estimated_fill_price,
+            total_credit, condor_max_loss, put_signal.dte,
+        )
+
+        return StrategySignal(
+            strategy_name=self.name,
+            underlying=put_signal.underlying,
+            legs=legs,
+            net_debit_credit=-total_credit,
+            estimated_fill_price=total_credit,
+            max_loss_per_contract=condor_max_loss,
+            hard_stop_price=hard_stop,
+            profit_target_price=profit_target,
+            expiry=put_signal.expiry,
+            dte=put_signal.dte,
+            notes=(
+                f"iron_condor put_side_credit={put_signal.estimated_fill_price:.2f} "
+                f"call_side_credit={call_signal.estimated_fill_price:.2f} "
+                f"total_credit={total_credit:.2f} max_loss={condor_max_loss:.2f}"
+            ),
+            source_contracts=list(put_signal.source_contracts) + list(call_signal.source_contracts),
+        )
+
+
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "csp":               CashSecuredPut,
     "short_put_spread":  ShortPutSpread,
     "short_call_spread": ShortCallSpread,
     "short_strangle":    ShortStrangle,
+    "iron_condor":       IronCondor,
 }
 
 
