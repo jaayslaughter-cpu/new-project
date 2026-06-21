@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import sys
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -54,7 +54,10 @@ def make_option_chain_row(
     open_interest: int = 5000,
     underlying_price: float = 582.50,
 ) -> OptionChainRow:
-    expiry = date.today().replace(day=date.today().day + dte)
+    # AUDIT FIX: was date.today().replace(day=today.day + dte), which throws
+    # "day is out of range for month" whenever today.day + dte exceeds the
+    # current month's length (date-dependent flaky failure). timedelta is correct.
+    expiry = date.today() + timedelta(days=dte)
     return OptionChainRow(
         symbol=symbol,
         underlying=underlying,
