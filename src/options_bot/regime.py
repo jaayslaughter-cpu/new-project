@@ -380,7 +380,8 @@ class RegimeDetector:
 
     def _fetch_vix_term_structure(self) -> dict:
         """
-        Fetch VIX term structure using ^VIX (30-day) and ^VXV (3-month) as proxies.
+        Fetch VIX term structure using ^VIX (30-day) and ^VIX3M (3-month) as proxies.
+        (^VIX3M was formerly ^VXV — CBOE renamed the ticker on 2017-09-18.)
         Adapted from trading-main/src/options/vix_monitor.py.
 
         Contango  (VXV > VIX, slope > 0): Normal market — IV expected to decay.
@@ -403,7 +404,14 @@ class RegimeDetector:
         try:
             import yfinance as yf
             vix_ticker = yf.Ticker("^VIX")
-            vxv_ticker = yf.Ticker("^VXV")
+            # AUDIT FIX: was "^VXV", which Yahoo no longer serves — CBOE
+            # renamed the 3-month vol index ticker from VXV to VIX3M on
+            # 2017-09-18. The stale ticker caused "possibly delisted; no
+            # price data found" on every regime detection, silently
+            # neutralizing the term-structure signal. ^VIX3M is the current
+            # ticker. (Variable names left as vxv* internally to minimize
+            # churn — only the fetched ticker symbol was wrong.)
+            vxv_ticker = yf.Ticker("^VIX3M")
             vix_data = vix_ticker.history(period="2d")
             vxv_data = vxv_ticker.history(period="2d")
             if vix_data.empty or vxv_data.empty:
