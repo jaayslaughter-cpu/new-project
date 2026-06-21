@@ -484,16 +484,34 @@ class GEXEngine:
         gex_by_strike: dict[float, float] = defaultdict(float)
         total_gex = 0.0
 
+        # Today's expiry in OCC YYMMDD form, for the same-day filter below.
+        today_yymmdd = date.today().strftime("%y%m%d")
+
         for symbol, snap in chain.items():
-            # Parse strike and option_type from OCC symbol string
-            # Format: SPY260617C00580000 -> last 9 chars = C00580000
+            # Parse strike, option_type, AND expiry from OCC symbol string.
+            # Format: SPY260617C00580000
+            #   ticker(var) + YYMMDD(6) + C/P(1) + strike*1000 zero-padded(8)
             # Broker returns flat dict: {bid, ask, iv, delta, gamma, theta, vega, rho}
             try:
-                # OCC: ticker(var) + YYMMDD(6) + C/P(1) + strike*1000 zero-padded(8)
                 opt_type_char = symbol[-9]          # 'C' or 'P'
                 strike        = int(symbol[-8:]) / 1000.0
                 opt_type      = "call" if opt_type_char == "C" else "put"
+                # The 6 digits immediately before the C/P are the expiry YYMMDD.
+                exp_yymmdd    = symbol[-15:-9]
             except (IndexError, ValueError):
+                continue
+
+            # AUDIT FIX: Alpaca's options snapshot endpoint returns the FULL
+            # chain across ALL expirations, not just today's (the old comment
+            # claiming "returns today's contracts by default" was wrong). For a
+            # 0DTE GEX scalper the pin strike must reflect ONLY today's gamma
+            # concentration — including longer-dated contracts contaminated the
+            # GEX pin with gamma from expiries we're not trading, anchoring the
+            # same-day spread to a potentially wrong strike. Skip any contract
+            # whose expiry isn't today. (The order legs were always built with
+            # today's date explicitly, so the executed trade was same-day safe;
+            # this fixes the PIN ACCURACY that decides where to place it.)
+            if exp_yymmdd != today_yymmdd:
                 continue
 
             # Gamma comes from flat dict directly (broker normalises greeks)
