@@ -1847,3 +1847,60 @@ class TestParityCheck(unittest.TestCase):
         from options_bot.parity_check import check_parity
         result = check_parity([], rate=self.rate)
         self.assertTrue(result.ok)
+
+class TestZeroDTECircuitBreaker(unittest.TestCase):
+    """Dedicated 0DTE guardrails: daily loss cap + consecutive-losing-day cooldown."""
+
+    def _make_cb(self):
+        from options_bot.strategy_0dte import ZeroDTEConfig
+        from options_bot.zerodte_guard import ZeroDTECircuitBreaker
+        store = {}
+        def load(key, max_age): return store.get(key)
+        def save(key, val, max_age): store[key] = dict(val)
+        return ZeroDTECircuitBreaker(ZeroDTEConfig(), load, save), store
+
+    def test_daily_loss_cap_blocks_over_threshold(self):
+        cb, _ = self._make_cb()
+        d = date(2026, 6, 22)
+        self.assertTrue(cb.check_entry_allowed(d, 100_000, -200).allowed)   # within $500 cap
+        self.assertFalse(cb.check_entry_allowed(d, 100_000, -500).allowed)  # at cap
+        self.assertFalse(cb.check_entry_allowed(d, 100_000, -600).allowed)  # over cap
+
+    def test_three_losing_days_arm_cooldown(self):
+        cb, _ = self._make_cb()
+        cb.record_eod(date(2026, 6, 22), -100)
+        cb.record_eod(date(2026, 6, 23), -100)
+        st = cb.record_eod(date(2026, 6, 24), -100)
+        self.assertIsNotNone(st["cooldown_until_iso"])
+        # entry blocked the next day
+        self.assertFalse(cb.check_entry_allowed(date(2026, 6, 25), 100_000, 0.0).allowed)
+
+    def test_win_resets_streak(self):
+        cb, _ = self._make_cb()
+        cb.record_eod(date(2026, 6, 22), -100)
+        cb.record_eod(date(2026, 6, 23), -100)
+        st = cb.record_eod(date(2026, 6, 24), +50)
+        self.assertEqual(st["consec_losing_days"], 0)
+        self.assertIsNone(st["cooldown_until_iso"])
+
+    def test_flat_day_does_not_count(self):
+        cb, _ = self._make_cb()
+        cb.record_eod(date(2026, 6, 22), -100)
+        st = cb.record_eod(date(2026, 6, 23), 0.0)
+        self.assertEqual(st["consec_losing_days"], 1)
+
+    def test_eod_idempotent_same_day(self):
+        cb, _ = self._make_cb()
+        cb.record_eod(date(2026, 6, 22), -100)
+        st = cb.record_eod(date(2026, 6, 22), -100)
+        self.assertEqual(st["consec_losing_days"], 1)
+
+    def test_cooldown_expires_on_target_date(self):
+        from options_bot.zerodte_guard import _add_trading_days
+        cb, _ = self._make_cb()
+        cb.record_eod(date(2026, 6, 22), -100)
+        cb.record_eod(date(2026, 6, 23), -100)
+        st = cb.record_eod(date(2026, 6, 24), -100)
+        cd_until = date.fromisoformat(st["cooldown_until_iso"])
+        self.assertEqual(cd_until, _add_trading_days(date(2026, 6, 24), 14))
+        self.assertTrue(cb.check_entry_allowed(cd_until, 100_000, 0.0).allowed)
