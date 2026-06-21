@@ -65,6 +65,7 @@ from .metrics import summary as perf_summary
 from .adaptive import AdaptiveTuner
 from .strategy import BaseStrategy, StrategySignal, get_strategy, STRATEGY_REGISTRY
 from .strategy_0dte import ZeroDTEConfig, ZeroDTEStrategy, ZeroDTEMonitor
+from .zerodte_guard import ZeroDTECircuitBreaker
 from .scanner import TickerGate
 from .risk_profiles import RiskLevel, RiskProfile, get_risk_profile, apply_profile
 from .universe import UniverseBuilder
@@ -726,6 +727,32 @@ class TradeDatabase:
         except Exception as exc:
             logger.error("[TradeDB] get_all_closed_pnls failed: %s", exc)
             return []
+        finally:
+            conn.close()
+
+    def get_today_realized_0dte_pnl(self, trade_date: str) -> float:
+        """
+        Sum today's REALIZED P&L from closed 0DTE trades only (strategy
+        LIKE '0dte_%'). Used by the dedicated 0DTE circuit breaker — kept
+        strictly separate from the core book's P&L so the two strategies'
+        risk accounting never co-mingle. Returns 0.0 if none / on error
+        (caller treats 0.0 as "no 0DTE activity today").
+        """
+        conn = self._get_conn()
+        try:
+            cur = self._execute(
+                conn,
+                "SELECT COALESCE(SUM(realized_pnl), 0) FROM trades "
+                "WHERE trade_date = ? "
+                "AND strategy LIKE '0dte_%' "
+                "AND realized_pnl IS NOT NULL",
+                (trade_date,),
+            )
+            row = cur.fetchone()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as exc:
+            logger.error("[TradeDB] get_today_realized_0dte_pnl failed: %s", exc)
+            return 0.0
         finally:
             conn.close()
 
@@ -1742,11 +1769,20 @@ class Orchestrator:
             _0dte_cfg.paper = config.paper
             self.zero_dte = ZeroDTEStrategy(_0dte_cfg, self.broker, self.db)
             self.zero_dte_monitor = ZeroDTEMonitor(_0dte_cfg, self.broker, self.db)
+            # Dedicated 0DTE circuit breaker — daily loss cap + consecutive
+            # losing-day cooldown, persisted via bot_state. Kept entirely
+            # separate from the core book's risk halts.
+            self.zero_dte_cb = ZeroDTECircuitBreaker(
+                _0dte_cfg,
+                load_state=self.db.load_state,
+                save_state=self.db.save_state,
+            )
             logger.info("[Orchestrator] 0DTE GEX scalper enabled (underlying=%s)",
                         _0dte_cfg.underlying)
         else:
             self.zero_dte = None
             self.zero_dte_monitor = None
+            self.zero_dte_cb = None
 
         logger.info(
             "[Orchestrator] Ready: tickers=%s strategy=%s paper=%s",
@@ -1941,6 +1977,27 @@ class Orchestrator:
             logger.debug("[0DTE scan] Max positions (%d) open — skip",
                          self.config.zero_dte_config.max_daily_positions)
             return
+
+        # Dedicated 0DTE circuit breaker — daily loss cap + cooldown.
+        # Blocks NEW 0DTE entries only; never touches the core book or any
+        # already-open 0DTE position (the monitor still manages exits).
+        if self.zero_dte_cb is not None:
+            try:
+                today_str = date.today().isoformat()
+                today_0dte_pnl = self.db.get_today_realized_0dte_pnl(today_str) if self.db else 0.0
+                equity = self.state.equity or self.config.zero_dte_config.starting_capital
+                decision = self.zero_dte_cb.check_entry_allowed(
+                    today=date.today(),
+                    equity=equity,
+                    today_realized_0dte_pnl=today_0dte_pnl,
+                )
+                if not decision.allowed:
+                    logger.info("[0DTE scan] Blocked by guard: %s", decision.reason)
+                    return
+            except Exception as exc:
+                # Fail-CLOSED: if the guard itself errors, do NOT trade 0DTE.
+                logger.warning("[0DTE scan] Guard check errored — blocking 0DTE (fail-closed): %s", exc)
+                return
 
         try:
             order = self.zero_dte.evaluate()
@@ -2411,6 +2468,23 @@ class Orchestrator:
         except Exception as exc:
             equity = self.state.equity if self.state.equity > 0 else self.rm.equity
             logger.warning("[EOD] Equity fetch failed, using cached $%.2f: %s", equity, exc)
+
+        # Record today's 0DTE outcome for the dedicated circuit breaker's
+        # consecutive-losing-day streak (arms the 14-trading-day cooldown
+        # after 3 net-negative 0DTE days in a row). Must run at EOD AFTER
+        # exits have closed, so realized P&L for the day is final.
+        if getattr(self, "zero_dte_cb", None) is not None:
+            try:
+                _today_iso = date.today().isoformat()
+                _0dte_pnl = self.db.get_today_realized_0dte_pnl(_today_iso) if self.db else 0.0
+                _cb_state = self.zero_dte_cb.record_eod(date.today(), _0dte_pnl)
+                logger.info(
+                    "[EOD] 0DTE day recorded: realized=$%.2f streak=%d cooldown_until=%s",
+                    _0dte_pnl, _cb_state.get("consec_losing_days", 0),
+                    _cb_state.get("cooldown_until_iso"),
+                )
+            except Exception as exc:
+                logger.warning("[EOD] 0DTE circuit-breaker record failed (non-fatal): %s", exc)
 
         # Close any positions expiring today before market close
         open_trades = self.db.get_open_trades()
