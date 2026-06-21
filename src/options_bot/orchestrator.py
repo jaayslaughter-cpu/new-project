@@ -55,7 +55,8 @@ from .exceptions import (
     RiskVetoError,
     StalenessError,
 )
-from .greeks import GreeksEnricher
+from .greeks import GreeksEnricher, get_risk_free_rate
+from .parity_check import check_parity
 from .market_data import YFinanceDataLoader
 from .risk import ExecutionGuard, RiskConfig, RiskManager
 from .regime import RegimeDetector, get_regime_policy, REGIME_POLICY
@@ -1004,6 +1005,26 @@ class TradingPipeline:
         if not enriched:
             logger.info("[Pipeline] %s: no enriched rows after delta filter", ticker)
             return None
+
+        # --- Step 2a: Put-call parity data-quality gate ---
+        # Pure-math sanity check that the chain's near-the-money calls and
+        # puts are internally consistent (C - P ≈ S - K·e^(-rT)). NOT an
+        # arbitrage screen — it's a guard against pricing a spread on stale,
+        # crossed, or otherwise broken quotes. Deliberately loose (only trips
+        # on gross >3%-of-spot violations across a majority of NTM pairs) so
+        # legitimate American-exercise/dividend deviations never false-trip.
+        # Fails open on thin/untestable chains (a separate liquidity gate
+        # handles those). Capital-preservation: skip rather than size risk
+        # off data we can't trust.
+        try:
+            parity = check_parity(enriched, rate=get_risk_free_rate())
+            if not parity.ok:
+                logger.warning("[Pipeline] %s parity gate: %s", ticker, parity.reason)
+                return None
+            logger.debug("[Pipeline] %s parity: %s", ticker, parity.reason)
+        except Exception as exc:
+            # Never let the data-quality gate itself crash the scan — fail open.
+            logger.debug("[Pipeline] %s parity check skipped (non-fatal): %s", ticker, exc)
 
         # --- Step 3: IV rank gate (strangles only) ---
         if (self.config.strategy_name == "short_strangle"
