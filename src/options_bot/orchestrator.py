@@ -193,6 +193,20 @@ class OrchestratorConfig:
     zero_dte_enabled: bool = True            # enable intraday 0DTE GEX scalper
     zero_dte_config: ZeroDTEConfig = field(default_factory=ZeroDTEConfig)
 
+    # --- Iron Condor (gated future strategy) ---
+    # Defined-risk neutral premium seller — the upgrade to ShortStrangle for
+    # neutral-direction tickers. Built and tested but DORMANT by default.
+    # TWO gates must BOTH clear before it ever trades:
+    #   1. The 30-trade walk-forward milestone must be passed (block removed
+    #      automatically once >= iron_condor_min_trades closed trades exist).
+    #   2. iron_condor_enabled must be explicitly set True (deliberate human
+    #      go-live decision — the milestone makes it ELIGIBLE, not automatic).
+    # This mirrors how 0DTE was enabled: the gate prevents premature
+    # activation; the flag preserves the human checkpoint at the riskiest
+    # moment (a strategy's first live trades).
+    iron_condor_enabled: bool = False        # explicit human go-live flag
+    iron_condor_min_trades: int = 30         # milestone gate (walk-forward unlock)
+
     # --- Risk profile ---
     risk_level: str = "medium"               # "low", "medium", or "high"
 
@@ -2354,7 +2368,39 @@ class Orchestrator:
                     "strategies will be skipped this scan): %s", exc
                 )
 
-        for extra_name in (self.config.extra_strategies or []):
+        # --- Iron Condor gate (both conditions must clear) ---
+        # Defined-risk neutral strategy, built and tested but DORMANT until:
+        #   (1) the 30-trade walk-forward milestone has passed, AND
+        #   (2) iron_condor_enabled is explicitly True.
+        # When eligible, it joins the NEUTRAL routing bucket (same tickers the
+        # short_strangle serves — it's the defined-risk upgrade to that bet).
+        # The milestone removes the block; the flag is the human go-live
+        # decision. Until both clear, it never trades.
+        _extra_strategies = list(self.config.extra_strategies or [])
+        if getattr(self.config, "iron_condor_enabled", False):
+            try:
+                _n_closed = len(self.db.get_all_closed_pnls()) if self.db else 0
+            except Exception:
+                _n_closed = 0
+            _ic_min = getattr(self.config, "iron_condor_min_trades", 30)
+            if _n_closed >= _ic_min:
+                if "iron_condor" not in _extra_strategies:
+                    _extra_strategies.append("iron_condor")
+                    # Route it to the same neutral bucket as the strangle.
+                    _neutral = _multi_strategy_routes.get("short_strangle", [])
+                    if _neutral:
+                        _multi_strategy_routes["iron_condor"] = list(_neutral)
+                    logger.info(
+                        "[Orchestrator] Iron Condor ACTIVE: %d closed trades >= %d "
+                        "milestone and iron_condor_enabled=True", _n_closed, _ic_min,
+                    )
+            else:
+                logger.info(
+                    "[Orchestrator] Iron Condor enabled but gated: %d/%d closed "
+                    "trades — stays dormant until walk-forward milestone", _n_closed, _ic_min,
+                )
+
+        for extra_name in _extra_strategies:
             if extra_name == self.config.strategy_name:
                 continue  # already ran this one above
 
@@ -2749,7 +2795,11 @@ class Orchestrator:
             20: ("Milestone: 20 trades closed",
                  "10 more trades until the adaptive tuner walk-forward gate opens."),
             30: ("Milestone: 30 trades - WALK-FORWARD UNLOCKED",
-                 "The tuner can now make statistically valid parameter adjustments."),
+                 "The tuner can now make statistically valid parameter adjustments. "
+                 "GATED FEATURES NOW ELIGIBLE: Iron Condor (defined-risk neutral "
+                 "strategy) can be enabled by setting iron_condor_enabled=True "
+                 "AND confirming stat_validation shows genuine edge below. "
+                 "Position rolling can also be revisited per the saved plan."),
             60: ("Milestone: 60 trades (~2 months)",
                  "At least one full market regime cycle covered. Review performance before going live."),
             90: ("Milestone: 90 trades (~3 months)",
