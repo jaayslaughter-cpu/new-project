@@ -1904,3 +1904,66 @@ class TestZeroDTECircuitBreaker(unittest.TestCase):
         cd_until = date.fromisoformat(st["cooldown_until_iso"])
         self.assertEqual(cd_until, _add_trading_days(date(2026, 6, 24), 14))
         self.assertTrue(cb.check_entry_allowed(cd_until, 100_000, 0.0).allowed)
+
+class TestIronCondor(unittest.TestCase):
+    """Iron Condor: defined-risk neutral structure composed from both spreads."""
+
+    def setUp(self):
+        self.chain = make_spy_chain_for_strategy(
+            dte=35,
+            call_strikes=[595, 600, 605, 610, 615, 620, 625, 630, 635, 640],
+        )
+
+    def test_returns_four_leg_signal(self):
+        from options_bot.strategy import IronCondor, StrategySignal
+        sig = IronCondor().evaluate(self.chain)
+        self.assertIsInstance(sig, StrategySignal)
+        self.assertEqual(len(sig.legs), 4)
+
+    def test_has_both_put_and_call_spreads(self):
+        from options_bot.strategy import IronCondor
+        sig = IronCondor().evaluate(self.chain)
+        sides = [(l.side.split('_')[0], l.option_type) for l in sig.legs]
+        self.assertIn(("sell", "put"), sides)
+        self.assertIn(("buy", "put"), sides)
+        self.assertIn(("sell", "call"), sides)
+        self.assertIn(("buy", "call"), sides)
+
+    def test_is_net_credit(self):
+        from options_bot.strategy import IronCondor
+        sig = IronCondor().evaluate(self.chain)
+        self.assertLess(sig.net_debit_credit, 0)  # credit
+        self.assertGreater(sig.estimated_fill_price, 0)
+
+    def test_max_loss_finite_and_positive(self):
+        from options_bot.strategy import IronCondor
+        sig = IronCondor().evaluate(self.chain)
+        self.assertGreater(sig.max_loss_per_contract, 0)
+        self.assertLess(sig.max_loss_per_contract, float('inf'))
+
+    def test_registered_in_registry(self):
+        from options_bot.strategy import STRATEGY_REGISTRY, get_strategy, IronCondor
+        self.assertIn("iron_condor", STRATEGY_REGISTRY)
+        self.assertIsInstance(get_strategy("iron_condor"), IronCondor)
+
+    def test_total_credit_gate_rejects_low_credit(self):
+        from options_bot.strategy import IronCondor, IronCondorConfig
+        from options_bot.exceptions import LiquidityFilterError
+        cfg = IronCondorConfig(min_total_credit=999.0)  # impossible
+        with self.assertRaises(LiquidityFilterError):
+            IronCondor(cfg).evaluate(self.chain)
+
+
+class TestIronCondorGating(unittest.TestCase):
+    """Iron Condor must stay dormant until BOTH gates clear."""
+
+    def test_default_config_disabled(self):
+        from options_bot.orchestrator import OrchestratorConfig
+        cfg = OrchestratorConfig()
+        self.assertFalse(cfg.iron_condor_enabled)
+        self.assertEqual(cfg.iron_condor_min_trades, 30)
+
+    def test_not_in_default_extra_strategies(self):
+        from options_bot.orchestrator import OrchestratorConfig
+        cfg = OrchestratorConfig()
+        self.assertNotIn("iron_condor", cfg.extra_strategies)
