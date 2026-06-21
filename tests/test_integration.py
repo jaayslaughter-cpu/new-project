@@ -1778,3 +1778,72 @@ class TestMarketHoursHelpers(unittest.TestCase):
         result = _market_is_open()
         self.assertIsInstance(result, bool)
 
+
+class TestParityCheck(unittest.TestCase):
+    """Put-call parity data-quality gate (parity_check.check_parity)."""
+
+    def _make_pair(self, strike, c_mid, p_mid, spot, dte, expiry, spread=0.10):
+        from options_bot.contracts import OptionChainRow, EnrichedOptionRow
+        rows = []
+        for otype, mid in (("call", c_mid), ("put", p_mid)):
+            raw = OptionChainRow(
+                symbol=f"SPY{strike}{otype[0].upper()}", underlying="SPY",
+                option_type=otype, strike=strike, expiry=expiry, dte=dte,
+                bid=mid - spread / 2, ask=mid + spread / 2, last_price=mid,
+                mid_price=mid, volume=1000, open_interest=2000,
+                underlying_price=spot, data_timestamp=datetime.now(tz=timezone.utc),
+            )
+            rows.append(EnrichedOptionRow(raw=raw, iv=0.20, delta=0.3))
+        return rows
+
+    def _consistent_mids(self, strike, spot, rate, years):
+        import math
+        theo = spot - strike * math.exp(-rate * years)  # = C - P
+        p = 8.0
+        return p + theo, p
+
+    def setUp(self):
+        self.spot = 582.50
+        self.rate = 0.045
+        self.dte = 30
+        self.expiry = date.today() + timedelta(days=self.dte)
+        self.years = self.dte / 365.0
+
+    def test_clean_chain_passes(self):
+        from options_bot.parity_check import check_parity
+        chain = []
+        for k in [575, 580, 582.5, 585, 590]:
+            c, p = self._consistent_mids(k, self.spot, self.rate, self.years)
+            chain += self._make_pair(k, c, p, self.spot, self.dte, self.expiry)
+        result = check_parity(chain, rate=self.rate)
+        self.assertTrue(result.ok)
+
+    def test_grossly_broken_chain_flagged(self):
+        from options_bot.parity_check import check_parity
+        chain = []
+        for k in [575, 580, 582.5, 585, 590]:
+            c, p = self._consistent_mids(k, self.spot, self.rate, self.years)
+            chain += self._make_pair(k, c + 25.0, p, self.spot, self.dte, self.expiry)
+        result = check_parity(chain, rate=self.rate)
+        self.assertFalse(result.ok)
+
+    def test_thin_chain_fails_open(self):
+        from options_bot.parity_check import check_parity
+        c, p = self._consistent_mids(582.5, self.spot, self.rate, self.years)
+        chain = self._make_pair(582.5, c + 25.0, p, self.spot, self.dte, self.expiry)
+        result = check_parity(chain, rate=self.rate)
+        self.assertTrue(result.ok)  # insufficient pairs -> fail open
+
+    def test_small_deviation_within_tolerance(self):
+        from options_bot.parity_check import check_parity
+        chain = []
+        for k in [575, 580, 582.5, 585, 590]:
+            c, p = self._consistent_mids(k, self.spot, self.rate, self.years)
+            chain += self._make_pair(k, c, p + self.spot * 0.01, self.spot, self.dte, self.expiry)
+        result = check_parity(chain, rate=self.rate)
+        self.assertTrue(result.ok)  # 1% legit deviation must not trip the gate
+
+    def test_empty_chain_fails_open(self):
+        from options_bot.parity_check import check_parity
+        result = check_parity([], rate=self.rate)
+        self.assertTrue(result.ok)
