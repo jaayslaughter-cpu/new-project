@@ -219,6 +219,31 @@ class ZeroDTEConfig:
     vwap_require_reclaim: bool = False       # If True, only enter after a partial VWAP reclaim is detected
     vwap_cooldown_seconds: int = 120         # Min seconds between VWAP stretch signals
 
+    # --- Dedicated 0DTE guardrails (separate from the main 14-60 DTE book) ---
+    # 0DTE is the highest-risk path in the bot (explosive gamma, fast losses)
+    # and is validated SEPARATELY from the core strategies — it has its own
+    # milestones and its own circuit breaker, and must never draw freely on
+    # the main risk budget or contaminate the core strategy's validation.
+    #
+    # Dedicated daily loss cap: a hard ceiling on 0DTE realized losses per
+    # day, set WELL BELOW the account-wide 3% daily-loss halt so a bad 0DTE
+    # day can't consume the whole book's risk budget. Expressed as a fraction
+    # of account equity. 0.5% of $100k = $500/day max 0DTE bleed.
+    max_daily_loss_pct: float = 0.005
+
+    # Consecutive-negative-day circuit breaker: if 0DTE finishes net-negative
+    # (realized) on this many trading days IN A ROW, disable 0DTE entirely for
+    # `cooldown_trading_days` trading days before it can resume. This stops a
+    # losing streak from compounding while still allowing the strategy to
+    # prove itself over time once it recovers.
+    max_consec_losing_days: int = 3
+    cooldown_trading_days: int = 14
+
+    # Separate go-live milestone: 0DTE stays in this many paper-validated
+    # closed trades before it would ever be considered for live capital —
+    # tracked independently from the core strategies' 30-trade milestone.
+    golive_min_closed_trades: int = 30
+
     # --- Misc ---
     discord_webhook_url: str = ""
     paper: bool = True
