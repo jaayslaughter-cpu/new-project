@@ -131,6 +131,13 @@ class StrategySignal:
     # The specific enriched contracts that drove the signal (for logging)
     source_contracts: list[EnrichedOptionRow] = field(default_factory=list)
 
+    # VRP gate sizing multiplier (0..1). Default 1.0 = no shrink. Set by the
+    # (gated) vol-risk-premium gate in the pipeline when active: 1.0 when the
+    # premium is clearly rich, ramping toward 0 as VRP thins. The risk manager
+    # can multiply position size by this. Default 1.0 keeps behavior unchanged
+    # when the gate is inactive.
+    vrp_size_factor: float = 1.0
+
 
 # ---------------------------------------------------------------------------
 # Base strategy
