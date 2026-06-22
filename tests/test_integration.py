@@ -2102,3 +2102,69 @@ class TestGatedRegimeSignalWiring(unittest.TestCase):
         self.assertFalse(c.analyst_revisions_enabled)
         self.assertEqual(c.credit_regime_min_trades, 30)
         self.assertEqual(c.analyst_revisions_min_trades, 30)
+
+class TestVRPGate(unittest.TestCase):
+    """Vol-risk-premium gate: realized vol estimators + gate decision logic."""
+
+    def _series(self, vol=0.20, n=60, seed=7):
+        import numpy as np
+        np.random.seed(seed)
+        rets = np.random.randn(n) * vol * (1/252) ** 0.5
+        close = 100 * np.exp(np.cumsum(rets))
+        high = close * 1.004
+        low = close * 0.996
+        open_ = list(close[:-1]); open_ = [100.0] + open_
+        return list(open_), list(high), list(close * 0 + high*0 + low), list(close)
+
+    def test_rv_recovers_known_vol(self):
+        from options_bot.realized_vol import rv_close_to_close
+        import numpy as np
+        np.random.seed(42)
+        rets = np.random.randn(300) * 0.20 * (1/252) ** 0.5
+        close = list(100 * np.exp(np.cumsum(rets)))
+        rv = rv_close_to_close(close, 63)
+        self.assertTrue(0.14 < rv < 0.26)  # recovers ~0.20 within estimator noise
+
+    def test_rv_insufficient_data_none(self):
+        from options_bot.realized_vol import rv_close_to_close, rv_yang_zhang
+        self.assertIsNone(rv_close_to_close([100, 101], 21))
+        self.assertIsNone(rv_yang_zhang([100]*5, [101]*5, [99]*5, [100]*5, 21))
+
+    def test_vrp_rich_iv_passes(self):
+        from options_bot.vrp_gate import evaluate_vrp_gate
+        o, h, l, c = self._series(vol=0.20)
+        r = evaluate_vrp_gate(0.30, o, h, l, c, estimator="close_to_close")
+        self.assertTrue(r.passes)
+        self.assertGreater(r.size_factor, 0.5)
+
+    def test_vrp_thin_premium_vetoes(self):
+        from options_bot.vrp_gate import evaluate_vrp_gate
+        o, h, l, c = self._series(vol=0.20)
+        r = evaluate_vrp_gate(0.205, o, h, l, c, estimator="close_to_close")
+        self.assertFalse(r.passes)
+        self.assertEqual(r.size_factor, 0.0)
+
+    def test_vrp_negative_vetoes(self):
+        from options_bot.vrp_gate import evaluate_vrp_gate
+        o, h, l, c = self._series(vol=0.20)
+        r = evaluate_vrp_gate(0.15, o, h, l, c, estimator="close_to_close")
+        self.assertFalse(r.passes)
+
+    def test_vrp_invalid_iv_returns_none(self):
+        from options_bot.vrp_gate import evaluate_vrp_gate
+        o, h, l, c = self._series()
+        self.assertIsNone(evaluate_vrp_gate(0.0, o, h, l, c))
+        self.assertIsNone(evaluate_vrp_gate(None, o, h, l, c))
+
+    def test_signal_has_default_vrp_size_factor(self):
+        from options_bot.strategy import StrategySignal
+        import inspect
+        # vrp_size_factor must default to 1.0 (no shrink when gate inactive)
+        sig_fields = {f.name: f.default for f in __import__('dataclasses').fields(StrategySignal)}
+        self.assertIn("vrp_size_factor", sig_fields)
+
+    def test_vrp_config_flags_default_off(self):
+        from options_bot.orchestrator import OrchestratorConfig
+        c = OrchestratorConfig()
+        self.assertFalse(c.vrp_gate_enabled)
+        self.assertEqual(c.vrp_gate_min_trades, 30)
