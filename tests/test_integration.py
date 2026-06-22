@@ -2063,3 +2063,42 @@ class TestGatedSignalsDormant(unittest.TestCase):
         cfg = OrchestratorConfig()
         self.assertFalse(cfg.analyst_revisions_enabled)
         self.assertEqual(cfg.analyst_revisions_min_trades, 30)
+
+class TestGatedRegimeSignalWiring(unittest.TestCase):
+    """credit_regime / analyst_revisions are wired but OFF until both gates clear."""
+
+    def test_regime_detector_signals_off_by_default(self):
+        from options_bot.regime import RegimeDetector
+        d = RegimeDetector()
+        self.assertFalse(d._credit_regime_active)
+        self.assertFalse(d._analyst_revisions_active)
+
+    def test_inactive_credit_regime_not_computed(self):
+        from options_bot.regime import RegimeDetector
+        d = RegimeDetector(credit_regime_active=False)
+        # Guarded path: when inactive the detector must not invoke the fetch.
+        self.assertIsNone(
+            d._compute_credit_regime() if d._credit_regime_active else None
+        )
+
+    def test_zero_credit_adjustment_is_noop(self):
+        from options_bot.regime import RegimeDetector
+        d = RegimeDetector(credit_regime_active=True)
+        base = {
+            "vix_level": 18.0, "vix_trend": "stable", "trend_strength": 0.5,
+            "yield_curve_slope": 0.5, "hurst": 0.5, "_breadth_scores": {},
+            "vix_term_structure": "unknown", "vix_term_ratio": 1.0,
+            "vix_percentile": 50.0,
+        }
+        with_zero = dict(base); with_zero["credit_regime_adjustment"] = 0.0
+        r_zero, _ = d._classify(with_zero)
+        r_missing, _ = d._classify(dict(base))
+        self.assertEqual(r_zero, r_missing)
+
+    def test_config_gating_flags_default_off(self):
+        from options_bot.orchestrator import OrchestratorConfig
+        c = OrchestratorConfig()
+        self.assertFalse(c.credit_regime_enabled)
+        self.assertFalse(c.analyst_revisions_enabled)
+        self.assertEqual(c.credit_regime_min_trades, 30)
+        self.assertEqual(c.analyst_revisions_min_trades, 30)
