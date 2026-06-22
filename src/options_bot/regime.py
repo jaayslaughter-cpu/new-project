@@ -169,11 +169,23 @@ class RegimeDetector:
     sensible defaults are used and the regime is still returned.
     """
 
-    def __init__(self, cache_ttl_seconds: int = _CACHE_TTL_SECONDS):
+    def __init__(self, cache_ttl_seconds: int = _CACHE_TTL_SECONDS,
+                 credit_regime_active: bool = False,
+                 analyst_revisions_active: bool = False):
         self._cache_ttl = cache_ttl_seconds
         self._cached: Optional[dict] = None
         self._cached_at: float = 0.0
-        logger.info("[RegimeDetector] Initialized (cache_ttl=%ds)", cache_ttl_seconds)
+        # Gated regime/signal inputs — OFF by default, preserving current
+        # behavior. The orchestrator passes True only when BOTH gates clear
+        # (>=30 closed trades AND the explicit enable flag), mirroring the
+        # Iron Condor / 0DTE activation pattern. When inactive these signals
+        # are not fetched or scored at all (zero cost, zero score impact).
+        self._credit_regime_active = credit_regime_active
+        self._analyst_revisions_active = analyst_revisions_active
+        logger.info(
+            "[RegimeDetector] Initialized (cache_ttl=%ds, credit_regime=%s, analyst_revisions=%s)",
+            cache_ttl_seconds, credit_regime_active, analyst_revisions_active,
+        )
 
     def detect(self) -> dict:
         """
@@ -256,6 +268,11 @@ class RegimeDetector:
         breadth_scores = composite_to_regime_score(breadth_data)
         stock_bond     = self._compute_stock_bond_divergence()
         dollar_stress  = self._compute_dollar_stress()
+        # Credit-spread regime input (HYG/IEF) — GATED. Only fetched/scored
+        # when active (>=30 trades AND enabled). Returns a bounded defensive
+        # nudge when high-yield credit is widening (risk-off). Fully off and
+        # zero-cost when inactive.
+        credit = self._compute_credit_regime() if self._credit_regime_active else None
 
         return {
             "vix_level":          round(vix_level,      2) if vix_level      is not None else 20.0,
@@ -290,6 +307,13 @@ class RegimeDetector:
             # rigor as the SPY/TLT signal above.
             "dollar_stress_day":          dollar_stress["dollar_stress_day"],
             "uup_spy_correlation_20d":    dollar_stress["uup_spy_correlation_20d"],
+            # Credit-spread regime (HYG/IEF) — GATED. None when inactive; a
+            # CreditRegimeSignal dict when active. credit_regime_adjustment is
+            # the bounded additive nudge applied in _classify (negative =
+            # defensive / down-weight premium selling when credit widens).
+            "credit_regime_state":        (credit.state if credit else "inactive"),
+            "credit_regime_z":            (credit.z_score if credit else None),
+            "credit_regime_adjustment":   (credit.regime_adjustment if credit else 0.0),
         }
 
     def _fetch_vix_level(self) -> Optional[float]:
@@ -752,6 +776,27 @@ class RegimeDetector:
             logger.warning("[RegimeDetector] Dollar stress signal failed: %s", exc)
         return _safe
 
+    def _compute_credit_regime(self):
+        """
+        Credit-spread regime input via the HYG/IEF ratio (high-yield corporate
+        vs Treasury) — a clean credit-stress proxy. GATED: only called when
+        self._credit_regime_active. Returns a CreditRegimeSignal (with a
+        bounded regime_adjustment) or None on any failure / insufficient data
+        — caller treats None as "no credit read" (zero adjustment).
+
+        Pure scoring lives in credit_regime.compute_credit_regime; the network
+        fetch is isolated in credit_regime.fetch_hyg_ief_closes (guarded).
+        """
+        try:
+            from .credit_regime import compute_credit_regime, fetch_hyg_ief_closes
+            hyg, ief = fetch_hyg_ief_closes()
+            if hyg is None or ief is None:
+                return None
+            return compute_credit_regime(hyg, ief)
+        except Exception as exc:
+            logger.warning("[RegimeDetector] Credit regime signal failed: %s", exc)
+            return None
+
     def _compute_vix_percentile(self, current_vix: Optional[float], window_days: int = 252) -> Optional[float]:
         """
         Compute where the current VIX level sits within its own N-day history.
@@ -1053,6 +1098,18 @@ class RegimeDetector:
         # the flag fires.
         if indicators.get("dollar_stress_day"):
             scores["high_volatility"] += 0.10
+
+        # Credit-spread regime (HYG/IEF) — GATED. credit_regime_adjustment is
+        # 0.0 when inactive (no effect). When active and credit is WIDENING
+        # (negative z, risk-off), the adjustment is negative → push toward the
+        # defensive high_volatility regime (which down-weights premium selling
+        # via its lower options_weight). When credit is CALM (positive), a
+        # small nudge the other way. Bounded to +/-0.10 in the signal itself.
+        _credit_adj = indicators.get("credit_regime_adjustment", 0.0) or 0.0
+        if _credit_adj < 0:
+            scores["high_volatility"] += abs(_credit_adj)   # defensive: favor risk-off regime
+        elif _credit_adj > 0:
+            scores["mean_reverting"] += _credit_adj          # calm credit: favor range-bound
 
         # Pick winner
         regime = max(scores, key=scores.__getitem__)
