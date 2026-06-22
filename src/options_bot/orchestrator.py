@@ -207,6 +207,26 @@ class OrchestratorConfig:
     iron_condor_enabled: bool = False        # explicit human go-live flag
     iron_condor_min_trades: int = 30         # milestone gate (walk-forward unlock)
 
+    # --- Gated regime/signal inputs (built, tested, DORMANT) ---
+    # Same two-gate pattern as the Iron Condor: each stays inert until BOTH
+    # (1) >= *_min_trades closed trades (walk-forward milestone removes the
+    # block automatically) AND (2) the *_enabled flag is explicitly True
+    # (deliberate human go-live decision). These are SIGNAL INPUTS that nudge
+    # the regime score / confirm directional reads — not new trade types — so
+    # they serve the capital-preservation + income mandate (avoid bad trades,
+    # better time good ones) without adding new risk surface.
+    #
+    # credit_regime: HYG/IEF credit-spread proxy — pulls the bot defensive
+    #   when credit markets signal stress (a cross-asset read the regime
+    #   detector currently lacks).
+    # analyst_revisions: net analyst upgrade/downgrade momentum over 30d —
+    #   a slower-moving directional confirmation distinct from FinBERT
+    #   headline sentiment.
+    credit_regime_enabled: bool = False
+    credit_regime_min_trades: int = 30
+    analyst_revisions_enabled: bool = False
+    analyst_revisions_min_trades: int = 30
+
     # --- Risk profile ---
     risk_level: str = "medium"               # "low", "medium", or "high"
 
@@ -2797,9 +2817,12 @@ class Orchestrator:
             30: ("Milestone: 30 trades - WALK-FORWARD UNLOCKED",
                  "The tuner can now make statistically valid parameter adjustments. "
                  "GATED FEATURES NOW ELIGIBLE: Iron Condor (defined-risk neutral "
-                 "strategy) can be enabled by setting iron_condor_enabled=True "
-                 "AND confirming stat_validation shows genuine edge below. "
-                 "Position rolling can also be revisited per the saved plan."),
+                 "strategy) via iron_condor_enabled=True; credit_regime (HYG/IEF "
+                 "credit-stress regime input) via credit_regime_enabled=True; "
+                 "analyst_revisions (upgrade/downgrade momentum) via "
+                 "analyst_revisions_enabled=True. Confirm stat_validation shows "
+                 "genuine edge below before enabling. Position rolling can also "
+                 "be revisited per the saved plan."),
             60: ("Milestone: 60 trades (~2 months)",
                  "At least one full market regime cycle covered. Review performance before going live."),
             90: ("Milestone: 90 trades (~3 months)",
