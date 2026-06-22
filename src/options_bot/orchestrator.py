@@ -57,6 +57,7 @@ from .exceptions import (
 )
 from .greeks import GreeksEnricher, get_risk_free_rate
 from .parity_check import check_parity
+from .vrp_gate import evaluate_vrp_gate, PROVISIONAL_RV_WINDOW
 from .market_data import YFinanceDataLoader
 from .risk import ExecutionGuard, RiskConfig, RiskManager
 from .regime import RegimeDetector, get_regime_policy, REGIME_POLICY
@@ -226,6 +227,14 @@ class OrchestratorConfig:
     credit_regime_min_trades: int = 30
     analyst_revisions_enabled: bool = False
     analyst_revisions_min_trades: int = 30
+    #
+    # vrp_gate: vol-risk-premium entry gate. The whole short-premium book lives
+    #   on IV exceeding subsequently-realized vol; this gate confirms IV is
+    #   actually rich vs realized (Yang-Zhang RV from OHLC) before allowing a
+    #   premium-selling entry, and shrinks/vetoes when the premium isn't there.
+    #   A gate, not a trade type. NOT applied to the 0DTE fast path.
+    vrp_gate_enabled: bool = False
+    vrp_gate_min_trades: int = 30
 
     # --- Risk profile ---
     risk_level: str = "medium"               # "low", "medium", or "high"
@@ -1018,6 +1027,47 @@ class TradingPipeline:
             db=db,
             risk_manager=risk_manager,
         )
+        # VRP gate activation — both gates must clear (enabled flag AND the
+        # >=N-trade milestone). Evaluated once at construction from the live
+        # closed-trade count. Mirrors the Iron Condor / credit_regime pattern.
+        try:
+            _n_closed = len(self.db.get_all_closed_pnls()) if self.db else 0
+        except Exception:
+            _n_closed = 0
+        self._vrp_gate_active = (
+            getattr(config, "vrp_gate_enabled", False)
+            and _n_closed >= getattr(config, "vrp_gate_min_trades", 30)
+        )
+        if getattr(config, "vrp_gate_enabled", False) and not self._vrp_gate_active:
+            logger.info(
+                "[Pipeline] vrp_gate enabled but gated: %d/%d closed trades",
+                _n_closed, getattr(config, "vrp_gate_min_trades", 30),
+            )
+
+    def _evaluate_vrp_for_signal(self, ticker: str, signal):
+        """Compute the VRP gate result for a produced signal.
+
+        Uses the signal's short-leg IV as the structure IV, and recent daily
+        OHLC bars for the underlying. Returns a VRPGateResult or None ('no
+        read'). Pure orchestration glue — the math lives in vrp_gate.py.
+        """
+        # Structure IV: prefer the short leg's IV from the source contracts.
+        iv = None
+        for c in (signal.source_contracts or []):
+            if getattr(c, "iv", None):
+                iv = c.iv
+                break
+        if not iv:
+            return None
+        # Recent daily OHLC for the underlying (need > RV_WINDOW bars).
+        bars = self.broker.get_bars(ticker, timeframe="1Day", limit=60)
+        if not bars or len(bars) < PROVISIONAL_RV_WINDOW + 2:
+            return None
+        open_ = [b["o"] for b in bars]
+        high  = [b["h"] for b in bars]
+        low   = [b["l"] for b in bars]
+        close = [b["c"] for b in bars]
+        return evaluate_vrp_gate(iv, open_, high, low, close)
 
     def run_for_ticker(
         self,
@@ -1171,6 +1221,38 @@ class TradingPipeline:
             )
             self.state.record_error(f"{ticker} strategy UNEXPECTED error: {exc}")
             return None
+
+        # --- Step 3b: Vol-risk-premium gate (GATED) ---
+        # The short-premium book profits only when IV exceeds subsequently
+        # realized vol. This gate confirms IV is actually rich vs realized
+        # (Yang-Zhang RV from daily OHLC) before allowing the entry. When the
+        # premium isn't there (thin/negative VRP) it vetoes; otherwise it
+        # passes through a size_factor the risk manager can use to shrink size.
+        # Active only when BOTH gates clear (>=30 trades AND enabled). Fully
+        # off / no-op when inactive. Fail-OPEN on a 'no read' (None) — only an
+        # explicit thin/negative VRP blocks, consistent with the core book's
+        # data-gate posture. NOT applied to the 0DTE path (separate fast path).
+        signal.vrp_size_factor = 1.0  # default: no VRP shrink
+        if getattr(self, "_vrp_gate_active", False):
+            try:
+                vrp_res = self._evaluate_vrp_for_signal(ticker, signal)
+                if vrp_res is not None:
+                    if not vrp_res.passes:
+                        logger.info(
+                            "[Pipeline] %s VRP gate veto: IV=%.3f RV=%.3f vrp=%.3f "
+                            "ratio=%.2f — premium not rich vs realized, skipping",
+                            ticker, vrp_res.iv, vrp_res.rv, vrp_res.vrp, vrp_res.iv_rv_ratio,
+                        )
+                        return None
+                    signal.vrp_size_factor = vrp_res.size_factor
+                    logger.info(
+                        "[Pipeline] %s VRP gate pass: vrp=%.3f size_factor=%.2f",
+                        ticker, vrp_res.vrp, vrp_res.size_factor,
+                    )
+                else:
+                    logger.debug("[Pipeline] %s VRP gate: no read (insufficient RV data) — fail-open", ticker)
+            except Exception as exc:
+                logger.debug("[Pipeline] %s VRP gate skipped (non-fatal): %s", ticker, exc)
 
         # --- Step 4: Risk evaluation ---
         # Update equity from broker before sizing
