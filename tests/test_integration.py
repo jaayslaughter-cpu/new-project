@@ -1967,3 +1967,99 @@ class TestIronCondorGating(unittest.TestCase):
         from options_bot.orchestrator import OrchestratorConfig
         cfg = OrchestratorConfig()
         self.assertNotIn("iron_condor", cfg.extra_strategies)
+
+class TestGatedSignalsCore(unittest.TestCase):
+    """Pure-logic cores for the gated regime/signal inputs (credit_regime,
+    analyst_revisions). No network. Mirrors the author's provided tests plus
+    the gating-default checks."""
+
+    # ---------- credit regime ----------
+    def test_credit_stress_produces_defensive_nudge(self):
+        from options_bot.credit_regime import compute_credit_regime
+        sig = compute_credit_regime([80.0] * 60 + [70.0], [95.0] * 61)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.state, "stress")
+        self.assertLess(sig.regime_adjustment, 0)
+
+    def test_credit_calm_produces_positive_nudge(self):
+        from options_bot.credit_regime import compute_credit_regime
+        sig = compute_credit_regime([80.0] * 60 + [90.0], [95.0] * 61)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.state, "calm")
+        self.assertGreater(sig.regime_adjustment, 0)
+
+    def test_credit_insufficient_history_returns_none(self):
+        from options_bot.credit_regime import compute_credit_regime
+        self.assertIsNone(compute_credit_regime([80.0] * 10, [95.0] * 10))
+
+    def test_credit_flat_series_is_neutral(self):
+        from options_bot.credit_regime import compute_credit_regime
+        sig = compute_credit_regime([80.0] * 61, [95.0] * 61)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.state, "neutral")
+        self.assertLess(abs(sig.regime_adjustment), 0.1)
+
+    def test_credit_adjustment_clamped(self):
+        from options_bot.credit_regime import compute_credit_regime, PROVISIONAL_MAX_ADJUSTMENT
+        sig = compute_credit_regime([80.0] * 60 + [40.0], [95.0] * 61)  # severe collapse
+        self.assertGreaterEqual(sig.regime_adjustment, -PROVISIONAL_MAX_ADJUSTMENT)
+
+    # ---------- analyst revisions ----------
+    def _ev(self, days_ago, frm, to, action="up"):
+        from options_bot.analyst_revisions import RevisionEvent
+        return RevisionEvent(
+            date=datetime.now(timezone.utc) - timedelta(days=days_ago),
+            firm="TestCo", from_grade=frm, to_grade=to, action=action,
+        )
+
+    def test_revisions_cluster_of_upgrades_is_bullish(self):
+        from options_bot.analyst_revisions import score_revisions
+        sig = score_revisions("XLK", [self._ev(2, "Hold", "Buy"),
+                                       self._ev(5, "Sell", "Buy"),
+                                       self._ev(9, "Hold", "Buy")])
+        self.assertEqual(sig.direction, "bullish")
+        self.assertEqual(sig.n_upgrades, 3)
+        self.assertGreater(sig.net_score, 0)
+
+    def test_revisions_downgrades_are_bearish(self):
+        from options_bot.analyst_revisions import score_revisions
+        sig = score_revisions("XLF", [self._ev(1, "Buy", "Sell", "down"),
+                                       self._ev(4, "Buy", "Hold", "down")])
+        self.assertEqual(sig.direction, "bearish")
+        self.assertEqual(sig.n_downgrades, 2)
+
+    def test_revisions_old_events_excluded(self):
+        from options_bot.analyst_revisions import score_revisions
+        sig = score_revisions("SPY", [self._ev(120, "Sell", "Strong Buy"),
+                                       self._ev(200, "Sell", "Buy")])
+        self.assertEqual(sig.direction, "neutral")
+        self.assertEqual(sig.net_score, 0.0)
+
+    def test_revisions_action_fallback_when_grades_unmappable(self):
+        from options_bot.analyst_revisions import score_revisions
+        sig = score_revisions("IWM", [self._ev(3, None, None, "up"),
+                                       self._ev(6, None, None, "up")])
+        self.assertEqual(sig.n_upgrades, 2)
+
+    def test_revisions_reiteration_not_counted(self):
+        from options_bot.analyst_revisions import score_revisions
+        sig = score_revisions("QQQ", [self._ev(2, "Buy", "Buy", "main")])
+        self.assertEqual(sig.net_score, 0.0)
+        self.assertEqual(sig.n_upgrades, 0)
+
+
+class TestGatedSignalsDormant(unittest.TestCase):
+    """Both new signals must be disabled by default (dormant until milestone
+    + explicit enable flag)."""
+
+    def test_credit_regime_disabled_by_default(self):
+        from options_bot.orchestrator import OrchestratorConfig
+        cfg = OrchestratorConfig()
+        self.assertFalse(cfg.credit_regime_enabled)
+        self.assertEqual(cfg.credit_regime_min_trades, 30)
+
+    def test_analyst_revisions_disabled_by_default(self):
+        from options_bot.orchestrator import OrchestratorConfig
+        cfg = OrchestratorConfig()
+        self.assertFalse(cfg.analyst_revisions_enabled)
+        self.assertEqual(cfg.analyst_revisions_min_trades, 30)
