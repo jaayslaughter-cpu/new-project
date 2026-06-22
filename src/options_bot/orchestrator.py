@@ -1762,8 +1762,37 @@ class Orchestrator:
         self.universe_builder = UniverseBuilder() if config.universe_enabled else None
 
         # Regime detector — replaces simple VIX threshold
+        # Gated regime/signal inputs — active only when BOTH the milestone
+        # (>=N closed trades) AND the explicit enable flag clear. Mirrors the
+        # Iron Condor activation pattern: the milestone removes the block; the
+        # flag is the deliberate human go-live decision. Evaluated once at
+        # construction from the current closed-trade count.
+        try:
+            _n_closed = len(self.db.get_all_closed_pnls()) if self.db else 0
+        except Exception:
+            _n_closed = 0
+        _credit_active = (
+            getattr(config, "credit_regime_enabled", False)
+            and _n_closed >= getattr(config, "credit_regime_min_trades", 30)
+        )
+        _revisions_active = (
+            getattr(config, "analyst_revisions_enabled", False)
+            and _n_closed >= getattr(config, "analyst_revisions_min_trades", 30)
+        )
+        if getattr(config, "credit_regime_enabled", False) and not _credit_active:
+            logger.info(
+                "[Orchestrator] credit_regime enabled but gated: %d/%d closed trades",
+                _n_closed, getattr(config, "credit_regime_min_trades", 30),
+            )
+        if getattr(config, "analyst_revisions_enabled", False) and not _revisions_active:
+            logger.info(
+                "[Orchestrator] analyst_revisions enabled but gated: %d/%d closed trades",
+                _n_closed, getattr(config, "analyst_revisions_min_trades", 30),
+            )
         self.regime_detector = RegimeDetector(
-            cache_ttl_seconds=config.regime_cache_ttl
+            cache_ttl_seconds=config.regime_cache_ttl,
+            credit_regime_active=_credit_active,
+            analyst_revisions_active=_revisions_active,
         )
 
         # Pipeline and monitor (needs self.regime_detector, so constructed here)
