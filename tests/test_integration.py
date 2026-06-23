@@ -2168,3 +2168,69 @@ class TestVRPGate(unittest.TestCase):
         c = OrchestratorConfig()
         self.assertFalse(c.vrp_gate_enabled)
         self.assertEqual(c.vrp_gate_min_trades, 30)
+
+
+class TestRegressionThreeLiveBugs(unittest.TestCase):
+    """Regression guards for the three bugs found in the 2026-06-22 Railway
+    logs: (1) extra-strategy pass passed kwargs run_for_ticker doesn't accept,
+    (2) the CBOE GEX fallback returned a dict where a GEXPin was required,
+    (3) LIKE '0dte_%' broke psycopg2 param binding (tuple index out of range).
+    None were covered before; all three silently broke the live trade path."""
+
+    # --- Bug 1: run_for_ticker signature contract ---
+    def test_run_for_ticker_signature_contract(self):
+        import inspect
+        from options_bot.orchestrator import TradingPipeline
+        params = set(inspect.signature(TradingPipeline.run_for_ticker).parameters)
+        # The contract the extra-strategy pass must honor:
+        self.assertIn("regime_name", params)
+        self.assertIn("regime_options_weight", params)
+        # The kwargs the buggy call site invented — must NOT silently reappear:
+        for bad in ("regime", "open_trades", "sentiment_signals"):
+            self.assertNotIn(bad, params,
+                             f"run_for_ticker gained '{bad}' — update call sites or this guard")
+
+    # --- Bug 2: CBOE fallback dict -> GEXPin adapter ---
+    def _engine(self):
+        from options_bot.strategy_0dte import GEXEngine, ZeroDTEConfig
+        return GEXEngine(broker=MagicMock(), config=ZeroDTEConfig())
+
+    def test_cboe_to_pin_returns_gexpin_consumable_by_select_strikes(self):
+        from options_bot.strategy_0dte import GEXPin
+        eng = self._engine()
+        cboe = {"spot": 500.0, "net_gex_usd": -1.2e9, "call_wall": 505.0,
+                "put_wall": 498.0, "negative_gamma": True, "source": "cboe_delayed"}
+        pin = eng._cboe_to_pin(cboe)
+        self.assertIsInstance(pin, GEXPin)
+        # nearest wall to spot (498 is 2 away vs 505's 5) -> put_wall
+        self.assertEqual(pin.strike, 498.0)
+        self.assertAlmostEqual(pin.distance_from_spot, 2.0)
+        self.assertEqual(pin.side, "BELOW")
+        self.assertEqual(pin.regime, "NEGATIVE_GAMMA")
+        # The crash was pin.distance_from_spot on a dict — prove attr access works
+        self.assertTrue(hasattr(pin, "distance_from_spot"))
+
+    def test_cboe_to_pin_guards_missing_data(self):
+        eng = self._engine()
+        self.assertIsNone(eng._cboe_to_pin({"call_wall": 1, "put_wall": 2}))  # no spot
+        self.assertIsNone(eng._cboe_to_pin({"spot": 500.0}))                  # no walls
+
+    # --- Bug 3: psycopg2 literal-% escaping ---
+    def test_execute_escapes_literal_percent_for_pg(self):
+        from options_bot.orchestrator import TradeDatabase
+        captured = {}
+
+        class FakeCur:
+            def execute(self, sql, params): captured["sql"] = sql; captured["params"] = params
+        class FakeConn:
+            def cursor(self): return FakeCur()
+
+        db = TradeDatabase.__new__(TradeDatabase)   # bypass __init__/real conn
+        db._use_pg = True
+        db._execute(FakeConn(),
+                    "SELECT 1 FROM trades WHERE trade_date = ? AND strategy LIKE '0dte_%'",
+                    ("2026-06-22",))
+        # literal % doubled, ? -> %s, exactly one bind target
+        self.assertIn("LIKE '0dte_%%'", captured["sql"])
+        self.assertIn("trade_date = %s", captured["sql"])
+        self.assertEqual(captured["sql"].count("%s"), 1)
