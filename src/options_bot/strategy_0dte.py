@@ -583,8 +583,17 @@ class GEXEngine:
                 from .gex_analysis import fetch_cboe_gex
                 cboe_result = fetch_cboe_gex(self.cfg.underlying)
                 if cboe_result:
-                    logger.info("[GEX] CBOE fallback succeeded: %s", cboe_result)
-                    return cboe_result
+                    # fetch_cboe_gex returns a DICT; select_strikes expects a
+                    # GEXPin and does pin.distance_from_spot. Returning the raw
+                    # dict crashed every 0DTE cycle. Adapt it to a GEXPin.
+                    pin = self._cboe_to_pin(cboe_result)
+                    if pin is not None:
+                        logger.info(
+                            "[GEX] CBOE fallback pin=%s distance=%.2f regime=%s",
+                            pin.strike, pin.distance_from_spot, pin.regime,
+                        )
+                        return pin
+                    logger.debug("[GEX] CBOE fallback returned no usable wall")
             except Exception as cboe_exc:
                 logger.debug("[GEX] CBOE fallback failed: %s", cboe_exc)
             return None
@@ -614,6 +623,33 @@ class GEXEngine:
         return GEXPin(
             strike=pin_strike,
             gex_value=pin_gex,
+            distance_from_spot=abs(spot - pin_strike),
+            side=side,
+            regime=regime,
+        )
+
+    def _cboe_to_pin(self, cboe: dict) -> Optional[GEXPin]:
+        """
+        Adapt the CBOE fallback dict (from fetch_cboe_gex) into a GEXPin so the
+        downstream select_strikes() — which expects a GEXPin — works unchanged.
+
+        fetch_cboe_gex returns: spot, net_gex_usd, gex_sign, pc_oi, pc_vol,
+        call_wall, put_wall, negative_gamma, source. We pick the gamma wall
+        nearest spot as the pin (mirrors the live path's 'strike with the
+        strongest GEX near spot'). Returns None if spot or both walls missing.
+        """
+        spot = cboe.get("spot")
+        if not spot:
+            return None
+        walls = [w for w in (cboe.get("call_wall"), cboe.get("put_wall")) if w]
+        if not walls:
+            return None
+        pin_strike = min(walls, key=lambda w: abs(w - spot))
+        regime = "NEGATIVE_GAMMA" if cboe.get("negative_gamma") else "POSITIVE_GAMMA"
+        side = "ABOVE" if pin_strike > spot else "BELOW"
+        return GEXPin(
+            strike=pin_strike,
+            gex_value=float(cboe.get("net_gex_usd") or 0.0),
             distance_from_spot=abs(spot - pin_strike),
             side=side,
             regime=regime,
