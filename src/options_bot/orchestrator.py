@@ -390,7 +390,11 @@ class TradeDatabase:
         SQL must use ? placeholders — they are rewritten to %s for psycopg2.
         """
         if self._use_pg:
-            sql = sql.replace("?", "%s")
+            # psycopg2 uses %-style param formatting, so any LITERAL % in the
+            # SQL (e.g. LIKE '0dte_%') is read as a format target and throws
+            # "tuple index out of range". Double literal % FIRST, then rewrite
+            # ? -> %s (the placeholder we actually want bound).
+            sql = sql.replace("%", "%%").replace("?", "%s")
             cur = conn.cursor()
             cur.execute(sql, params)
             return cur
@@ -2575,13 +2579,17 @@ class Orchestrator:
                         break
 
                     try:
+                        # NOTE: run_for_ticker's signature is
+                        # (ticker, regime_name="", regime_options_weight=0.0).
+                        # The earlier call here passed regime=/open_trades=/
+                        # sentiment_signals= — none of which exist on the method —
+                        # so EVERY extra-strategy eval (csp, short_call_spread,
+                        # short_strangle) raised TypeError and 3 of 4 live
+                        # strategies never traded. Match the working main pass.
                         filled = self.pipeline.run_for_ticker(
-                            ticker=ticker,
-                            regime=regime,
+                            ticker,
                             regime_name=regime_name,
                             regime_options_weight=options_weight,
-                            open_trades=self.db.get_open_trades(),
-                            sentiment_signals=sentiment_signals,
                         )
                         if filled:
                             filled_orders.append(filled)
