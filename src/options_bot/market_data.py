@@ -214,10 +214,47 @@ class YFinanceDataLoader:
                     rows.append(chain_row)
 
         self._fetch_time = fetch_time
+
+        # Enrich open interest from Massive (real OI) when configured. yfinance
+        # OI is unreliable (often 0) and Alpaca has no OI field; Massive's free
+        # tier provides real end-of-day OI. Fails open: if Massive is not
+        # configured or errors, rows keep their yfinance OI and the (softened)
+        # OI gate defers to the spread gate exactly as before.
+        rows = self._enrich_open_interest(rows, expiry)
+
         logger.info(
             "[YFinanceDataLoader] Chain %s %s: %d rows fetched",
             self.ticker_str, expiry, len(rows)
         )
+        return rows
+
+    def _enrich_open_interest(
+        self, rows: list[OptionChainRow], expiry: str
+    ) -> list[OptionChainRow]:
+        """Override each row's open_interest with Massive's real OI when present.
+        Matched by bare OCC symbol. No-op (returns rows unchanged) if Massive is
+        unavailable or returns nothing for a contract."""
+        try:
+            from .massive_data import get_open_interest_map
+            oi_map = get_open_interest_map(self.ticker_str, expiry)
+        except Exception as exc:  # defensive — enrichment must never break a scan
+            logger.debug("[YFinanceDataLoader] OI enrichment skipped: %s", exc)
+            return rows
+
+        if not oi_map:
+            return rows
+
+        enriched = 0
+        for row in rows:
+            real_oi = oi_map.get(row.symbol)
+            if real_oi is not None and real_oi != row.open_interest:
+                row.open_interest = real_oi
+                enriched += 1
+        if enriched:
+            logger.info(
+                "[YFinanceDataLoader] Massive OI applied to %d/%d %s contracts",
+                enriched, len(rows), self.ticker_str
+            )
         return rows
 
     def get_full_chain(self) -> dict[str, list[OptionChainRow]]:

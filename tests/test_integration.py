@@ -2285,3 +2285,83 @@ class TestLiquidityFilterOIFix(unittest.TestCase):
         out = self._loader(rows).get_chain_filtered("2026-07-31",
                                                     min_open_interest=100, max_spread_pct=0.20)
         self.assertEqual(len(out), 2)
+
+
+class TestMassiveOpenInterest(unittest.TestCase):
+    """Massive (Polygon) free-tier OI source. Must fail open (no key / error ->
+    empty map, never raises) and must enrich the chain's open_interest from real
+    Massive data when available, matched by bare OCC symbol."""
+
+    def setUp(self):
+        import options_bot.massive_data as md
+        md._cache.clear()
+        md._warned_no_key = False
+
+    def _fake_resp(self, payload):
+        import io, json
+        class _Ctx:
+            def __enter__(self_):
+                return self_
+            def __exit__(self_, *a):
+                return False
+            def read(self_):
+                return json.dumps(payload).encode()
+        return _Ctx()
+
+    def test_no_key_returns_empty_failopen(self):
+        import options_bot.massive_data as md
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(md.get_open_interest_map("SPY", "2026-07-31"), {})
+
+    def test_parses_oi_map_and_strips_prefix(self):
+        import options_bot.massive_data as md
+        payload = {"results": [
+            {"details": {"ticker": "O:SPY260731P00500000"}, "open_interest": 1234},
+            {"details": {"ticker": "O:SPY260731C00600000"}, "open_interest": 0},
+        ], "status": "OK"}
+        with patch.dict("os.environ", {"MASSIVE_API_KEY": "k"}, clear=False):
+            with patch("urllib.request.urlopen", return_value=self._fake_resp(payload)):
+                m = md.get_open_interest_map("SPY", "2026-07-31")
+        self.assertEqual(m, {"SPY260731P00500000": 1234, "SPY260731C00600000": 0})
+
+    def test_daily_cache_avoids_refetch(self):
+        import options_bot.massive_data as md
+        payload = {"results": [{"details": {"ticker": "O:SPY260731P00500000"},
+                                "open_interest": 50}]}
+        with patch.dict("os.environ", {"MASSIVE_API_KEY": "k"}, clear=False):
+            with patch("urllib.request.urlopen", return_value=self._fake_resp(payload)) as op:
+                md.get_open_interest_map("SPY", "2026-07-31")
+                md.get_open_interest_map("SPY", "2026-07-31")  # cached
+                self.assertEqual(op.call_count, 1)
+
+    def test_http_error_failopen(self):
+        import options_bot.massive_data as md
+        import urllib.error
+        def boom(*a, **k):
+            raise urllib.error.HTTPError("u", 429, "rate", {}, None)
+        with patch.dict("os.environ", {"MASSIVE_API_KEY": "k"}, clear=False):
+            with patch("urllib.request.urlopen", side_effect=boom):
+                self.assertEqual(md.get_open_interest_map("SPY", "2026-07-31"), {})
+
+    def test_enrichment_overrides_zero_oi(self):
+        from options_bot.market_data import YFinanceDataLoader
+        ld = YFinanceDataLoader.__new__(YFinanceDataLoader)
+        ld.ticker_str = "SPY"
+        rows = [
+            make_option_chain_row(symbol="SPY260731P00500000", open_interest=0),
+            make_option_chain_row(symbol="SPY260731C00600000", open_interest=0),
+        ]
+        with patch("options_bot.massive_data.get_open_interest_map",
+                   return_value={"SPY260731P00500000": 4200}):
+            out = ld._enrich_open_interest(rows, "2026-07-31")
+        self.assertEqual(out[0].open_interest, 4200)   # enriched
+        self.assertEqual(out[1].open_interest, 0)      # untouched (not in map)
+
+    def test_enrichment_noop_when_massive_empty(self):
+        from options_bot.market_data import YFinanceDataLoader
+        ld = YFinanceDataLoader.__new__(YFinanceDataLoader)
+        ld.ticker_str = "SPY"
+        rows = [make_option_chain_row(symbol="SPY260731P00500000", open_interest=7)]
+        with patch("options_bot.massive_data.get_open_interest_map", return_value={}):
+            out = ld._enrich_open_interest(rows, "2026-07-31")
+        self.assertEqual(out[0].open_interest, 7)      # unchanged, fail-open
