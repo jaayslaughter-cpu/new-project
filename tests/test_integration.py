@@ -2234,3 +2234,54 @@ class TestRegressionThreeLiveBugs(unittest.TestCase):
         self.assertIn("LIKE '0dte_%%'", captured["sql"])
         self.assertIn("trade_date = %s", captured["sql"])
         self.assertEqual(captured["sql"].count("%s"), 1)
+
+
+class TestLiquidityFilterOIFix(unittest.TestCase):
+    """The 2026-06-22 logs showed every ticker (incl. SPY/IWM) rejected at the
+    liquidity gate. Root cause: yfinance returns open_interest=0, and the gate
+    rejected 0 < min_oi. Alpaca has no OI field at all, so OI=0/None is now
+    treated as 'unknown' and the spread gate decides. These guard that fix and
+    the new per-reason rejection breakdown."""
+
+    def _loader(self, rows):
+        from options_bot.market_data import YFinanceDataLoader
+        ld = YFinanceDataLoader.__new__(YFinanceDataLoader)   # bypass network init
+        ld.ticker_str = "SPY"
+        ld.get_chain = lambda expiry: rows
+        return ld
+
+    def test_zero_oi_not_rejected_when_spread_ok(self):
+        # tight-spread contract with OI=0 (the yfinance failure) must be accepted
+        rows = [make_option_chain_row(open_interest=0, bid=9.33, ask=9.53)]
+        out = self._loader(rows).get_chain_filtered("2026-07-31", min_open_interest=100)
+        self.assertEqual(len(out), 1)
+
+    def test_none_oi_not_rejected_when_spread_ok(self):
+        rows = [make_option_chain_row(open_interest=None, bid=9.33, ask=9.53)]
+        out = self._loader(rows).get_chain_filtered("2026-07-31", min_open_interest=100)
+        self.assertEqual(len(out), 1)
+
+    def test_positive_oi_below_threshold_still_rejected(self):
+        from options_bot.exceptions import LiquidityFilterError
+        rows = [make_option_chain_row(open_interest=5, bid=9.33, ask=9.53)]
+        with self.assertRaises(LiquidityFilterError) as ctx:
+            self._loader(rows).get_chain_filtered("2026-07-31", min_open_interest=100)
+        self.assertIn("oi=1", str(ctx.exception))  # reason breakdown present
+
+    def test_wide_spread_rejected_with_reason(self):
+        from options_bot.exceptions import LiquidityFilterError
+        # OI fine, but spread ~50% — the real liquidity guard should fire
+        rows = [make_option_chain_row(open_interest=5000, bid=1.00, ask=3.00)]
+        with self.assertRaises(LiquidityFilterError) as ctx:
+            self._loader(rows).get_chain_filtered("2026-07-31", max_spread_pct=0.20)
+        self.assertIn("spread=1", str(ctx.exception))
+
+    def test_mixed_chain_accepts_only_tradeable(self):
+        rows = [
+            make_option_chain_row(symbol="A", open_interest=0, bid=9.33, ask=9.53),   # ok (OI unknown)
+            make_option_chain_row(symbol="B", open_interest=5000, bid=1.00, ask=3.00), # wide spread -> reject
+            make_option_chain_row(symbol="C", open_interest=5000, bid=4.20, ask=4.40), # ok
+        ]
+        out = self._loader(rows).get_chain_filtered("2026-07-31",
+                                                    min_open_interest=100, max_spread_pct=0.20)
+        self.assertEqual(len(out), 2)

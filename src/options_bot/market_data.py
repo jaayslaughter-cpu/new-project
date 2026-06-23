@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import date, datetime, timezone
 from typing import Optional
 
@@ -282,7 +283,10 @@ class YFinanceDataLoader:
         raw_rows = self.get_chain(expiry)
 
         accepted: list[OptionChainRow] = []
-        rejected = 0
+        # Track WHY contracts are rejected. Previously the per-reason detail was
+        # logged at debug (invisible at Railway's info level), so the
+        # 2026-06-22 "all N contracts rejected" logs never said which gate fired.
+        reasons: Counter = Counter()
 
         for row in raw_rows:
             # Option type filter
@@ -291,7 +295,7 @@ class YFinanceDataLoader:
 
             # DTE gate
             if row.dte < min_dte:
-                rejected += 1
+                reasons["dte"] += 1
                 logger.debug(
                     "[LiquidityFilter] Rejected %s: dte=%d < min_dte=%d",
                     row.symbol, row.dte, min_dte
@@ -300,7 +304,7 @@ class YFinanceDataLoader:
 
             # Bid/ask presence
             if row.bid is None or row.ask is None:
-                rejected += 1
+                reasons["no_quote"] += 1
                 logger.debug(
                     "[LiquidityFilter] Rejected %s: missing bid/ask", row.symbol
                 )
@@ -308,24 +312,31 @@ class YFinanceDataLoader:
 
             # Zero bid AND zero ask — not tradeable
             if row.bid == 0 and row.ask == 0:
-                rejected += 1
+                reasons["zero_quote"] += 1
                 logger.debug(
                     "[LiquidityFilter] Rejected %s: zero bid and ask", row.symbol
                 )
                 continue
 
-            # Open interest gate
-            if row.open_interest is not None and row.open_interest < min_open_interest:
-                rejected += 1
+            # Open interest gate.
+            # NOTE: neither data source gives reliable OI. yfinance frequently
+            # returns 0 (the root cause of the 2026-06-22 all-rejected scan on
+            # SPY/IWM/SMH — impossibly illiquid only if the data is wrong), and
+            # Alpaca's option snapshot carries NO open_interest field at all.
+            # So OI of 0 or None is treated as "unknown" and we defer to the
+            # spread gate (the real fill-quality guard). Only a POSITIVE OI
+            # below the threshold is a genuine liquidity rejection.
+            if row.open_interest and row.open_interest < min_open_interest:
+                reasons["oi"] += 1
                 logger.debug(
                     "[LiquidityFilter] Rejected %s: OI=%d < min=%d",
                     row.symbol, row.open_interest, min_open_interest
                 )
                 continue
 
-            # Spread gate
+            # Spread gate — the primary, data-reliable liquidity guard.
             if row.spread_pct is not None and row.spread_pct > max_spread_pct:
-                rejected += 1
+                reasons["spread"] += 1
                 logger.debug(
                     "[LiquidityFilter] Rejected %s: spread=%.1f%% > max=%.1f%%",
                     row.symbol, row.spread_pct * 100, max_spread_pct * 100
@@ -334,16 +345,21 @@ class YFinanceDataLoader:
 
             accepted.append(row)
 
+        rejected = sum(reasons.values())
+        # INFO-level breakdown so Railway logs show exactly which gate fired.
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())) or "none"
         logger.info(
-            "[YFinanceDataLoader] Filter result %s %s: %d accepted, %d rejected",
-            self.ticker_str, expiry, len(accepted), rejected
+            "[YFinanceDataLoader] Filter result %s %s: %d accepted, %d rejected "
+            "(by reason: %s)",
+            self.ticker_str, expiry, len(accepted), rejected, breakdown
         )
 
         if not accepted:
             raise LiquidityFilterError(
                 f"{self.ticker_str} {expiry}",
                 f"All {len(raw_rows)} contracts failed liquidity filters "
-                f"(min_oi={min_open_interest}, max_spread={max_spread_pct:.0%})"
+                f"(min_oi={min_open_interest}, max_spread={max_spread_pct:.0%}; "
+                f"rejections by reason: {breakdown})"
             )
 
         return accepted
