@@ -220,12 +220,62 @@ class YFinanceDataLoader:
         # tier provides real end-of-day OI. Fails open: if Massive is not
         # configured or errors, rows keep their yfinance OI and the (softened)
         # OI gate defers to the spread gate exactly as before.
+        # Overlay Alpaca's real-time bid/ask first (yfinance quotes are
+        # frequently 0/0 — the 2026-06-23 zero_quote wall), then real OI from
+        # Massive. Both are keyed by OCC symbol and both fail open.
+        rows = self._enrich_quotes(rows, expiry)
         rows = self._enrich_open_interest(rows, expiry)
 
         logger.info(
             "[YFinanceDataLoader] Chain %s %s: %d rows fetched",
             self.ticker_str, expiry, len(rows)
         )
+        return rows
+
+    def _enrich_quotes(
+        self, rows: list[OptionChainRow], expiry: str
+    ) -> list[OptionChainRow]:
+        """Overlay Alpaca's live bid/ask onto each row (matched by OCC symbol)
+        and recompute mid_price/spread_pct. yfinance option quotes are
+        unreliable — frequently 0/0, the 2026-06-23 zero_quote wall — while
+        Alpaca is the execution venue and returns real quotes. A row is
+        overwritten only when Alpaca returns a usable quote (present and not
+        0/0); otherwise it keeps its yfinance quote (fail-open, per row). No-op
+        if Alpaca is unavailable or returns nothing."""
+        try:
+            from .alpaca_quotes import get_quote_map
+            qmap = get_quote_map(self.ticker_str, expiry)
+        except Exception as exc:  # defensive — enrichment must never break a scan
+            logger.debug("[YFinanceDataLoader] quote enrichment skipped: %s", exc)
+            return rows
+
+        if not qmap:
+            return rows
+
+        enriched = 0
+        for row in rows:
+            q = qmap.get(row.symbol)
+            if q is None:
+                continue
+            bid, ask = q
+            # Skip if Alpaca has no usable quote either (fail-open, per row).
+            if (bid is None and ask is None) or ((bid or 0) == 0 and (ask or 0) == 0):
+                continue
+            row.bid = bid
+            row.ask = ask
+            # Recompute derived fields (mirrors OptionChainRow.__post_init__).
+            if bid is not None and ask is not None and bid + ask > 0:
+                row.mid_price = (bid + ask) / 2.0
+                row.spread_pct = (
+                    (ask - bid) / row.mid_price if row.mid_price > 0 else None
+                )
+            row.source = "yfinance+alpaca_quote"
+            enriched += 1
+        if enriched:
+            logger.info(
+                "[YFinanceDataLoader] Alpaca quotes applied to %d/%d %s contracts",
+                enriched, len(rows), self.ticker_str
+            )
         return rows
 
     def _enrich_open_interest(

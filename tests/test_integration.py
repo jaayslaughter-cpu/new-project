@@ -2365,3 +2365,109 @@ class TestMassiveOpenInterest(unittest.TestCase):
         with patch("options_bot.massive_data.get_open_interest_map", return_value={}):
             out = ld._enrich_open_interest(rows, "2026-07-31")
         self.assertEqual(out[0].open_interest, 7)      # unchanged, fail-open
+
+
+class TestAlpacaQuoteEnrichment(unittest.TestCase):
+    """Alpaca real-time quote source for the liquidity gate. Must fail open
+    (no creds / disabled / error -> empty map, never raises) and must overlay
+    Alpaca bid/ask onto chain rows (recomputing mid/spread), matched by OCC
+    symbol, only when Alpaca returns a usable quote (present, not 0/0)."""
+
+    def setUp(self):
+        import options_bot.alpaca_quotes as aq
+        aq._client = None
+        aq._warned_no_key = False
+
+    class _Q:
+        def __init__(self, bid, ask):
+            self.bid_price = bid
+            self.ask_price = ask
+
+    class _Snap:
+        def __init__(self, bid, ask):
+            self.latest_quote = TestAlpacaQuoteEnrichment._Q(bid, ask)
+
+    class _Client:
+        def __init__(self, mapping):
+            self._m = mapping
+        def get_option_chain(self, req):
+            return self._m
+
+    def test_no_creds_returns_empty_failopen(self):
+        import options_bot.alpaca_quotes as aq
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(aq.get_quote_map("SPY", "2026-07-31"), {})
+
+    def test_disabled_kill_switch_returns_empty(self):
+        import options_bot.alpaca_quotes as aq
+        with patch.dict("os.environ",
+                        {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s",
+                         "ALPACA_QUOTE_ENRICH": "false"}, clear=False):
+            self.assertEqual(aq.get_quote_map("SPY", "2026-07-31"), {})
+
+    def test_parses_quote_map(self):
+        import options_bot.alpaca_quotes as aq
+        fake = self._Client({
+            "SPY260731P00500000": self._Snap(1.28, 1.29),
+            "SPY260731C00600000": self._Snap(None, None),
+        })
+        with patch.dict("os.environ",
+                        {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s"}, clear=False):
+            with patch("options_bot.alpaca_quotes._get_client", return_value=fake):
+                m = aq.get_quote_map("SPY", "2026-07-31")
+        self.assertEqual(m["SPY260731P00500000"], (1.28, 1.29))
+        self.assertEqual(m["SPY260731C00600000"], (None, None))
+
+    def test_error_failopen(self):
+        import options_bot.alpaca_quotes as aq
+        class _Boom:
+            def get_option_chain(self, req):
+                raise RuntimeError("network")
+        with patch.dict("os.environ",
+                        {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s"}, clear=False):
+            with patch("options_bot.alpaca_quotes._get_client", return_value=_Boom()):
+                self.assertEqual(aq.get_quote_map("SPY", "2026-07-31"), {})
+
+    def test_enrichment_overrides_zero_quote_and_recomputes(self):
+        from options_bot.market_data import YFinanceDataLoader
+        ld = YFinanceDataLoader.__new__(YFinanceDataLoader)
+        ld.ticker_str = "SPY"
+        rows = [
+            make_option_chain_row(symbol="SPY260731P00500000", bid=0.0, ask=0.0),
+            make_option_chain_row(symbol="SPY260731C00600000", bid=0.0, ask=0.0),
+        ]
+        with patch("options_bot.alpaca_quotes.get_quote_map",
+                   return_value={"SPY260731P00500000": (1.28, 1.29)}):
+            out = ld._enrich_quotes(rows, "2026-07-31")
+        self.assertEqual(out[0].bid, 1.28)
+        self.assertEqual(out[0].ask, 1.29)
+        self.assertAlmostEqual(out[0].mid_price, 1.285, places=4)
+        self.assertIsNotNone(out[0].spread_pct)
+        self.assertTrue(out[0].spread_pct < 0.05)   # ~0.78% — clears the spread gate
+        self.assertEqual(out[0].source, "yfinance+alpaca_quote")
+        self.assertEqual(out[1].bid, 0.0)            # untouched (not in map)
+
+    def test_enrichment_skips_alpaca_zero_quote(self):
+        # Alpaca also returns 0/0 -> leave the row alone (fail-open, per row).
+        from options_bot.market_data import YFinanceDataLoader
+        ld = YFinanceDataLoader.__new__(YFinanceDataLoader)
+        ld.ticker_str = "SPY"
+        rows = [make_option_chain_row(symbol="SPY260731P00500000", bid=2.0, ask=2.1)]
+        with patch("options_bot.alpaca_quotes.get_quote_map",
+                   return_value={"SPY260731P00500000": (0.0, 0.0)}):
+            out = ld._enrich_quotes(rows, "2026-07-31")
+        self.assertEqual(out[0].bid, 2.0)            # unchanged
+        self.assertEqual(out[0].ask, 2.1)
+
+    def test_enrichment_noop_when_alpaca_empty(self):
+        from options_bot.market_data import YFinanceDataLoader
+        ld = YFinanceDataLoader.__new__(YFinanceDataLoader)
+        ld.ticker_str = "SPY"
+        rows = [make_option_chain_row(symbol="SPY260731P00500000", bid=0.0, ask=0.0)]
+        with patch("options_bot.alpaca_quotes.get_quote_map", return_value={}):
+            out = ld._enrich_quotes(rows, "2026-07-31")
+        self.assertEqual(out[0].bid, 0.0)            # unchanged, fail-open
+
+
+if __name__ == "__main__":
+    unittest.main()
