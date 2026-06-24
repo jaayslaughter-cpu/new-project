@@ -80,6 +80,47 @@ from .stat_validation import run_all_validations, format_validation_discord
 logger = logging.getLogger(__name__)
 
 
+# Extra strategies that share the PRIMARY strategy's bullish/neutral thesis and
+# may therefore reuse the bullish shortlist when the directional router gives
+# them no dedicated bucket. csp (naked puts) is the same directional bet as
+# short_put_spread, so it has no bearish/neutral router bucket and the bullish
+# shortlist is correct for it. Every OTHER non-primary strategy is
+# direction-specific: see _select_extra_tickers.
+_BULLISH_EQUIVALENT_STRATEGIES = frozenset({"csp", "cash_secured_put"})
+
+
+def _select_extra_tickers(
+    extra_name: str,
+    routes: dict[str, list[str]],
+    routing_ran: bool,
+    scan_tickers: list[str],
+) -> list[str]:
+    """Pick the ticker list for one extra-strategy pass.
+
+    Returns ``[]`` to mean "skip this strategy this scan".
+
+    The rule that matters: a direction-specific strategy (short_call_spread,
+    short_strangle, iron_condor, …) is SKIPPED when routing ran but assigned it
+    no tickers — rather than falling back to the bullish shortlist. Selling call
+    spreads on tickers the scorer just confirmed bullish fights the trend; that
+    "structurally backwards" fallback is the bug this guards against.
+
+    The bullish shortlist (``scan_tickers``) is reused only when:
+      * routing did NOT run (ticker_gate disabled / routing errored) — in that
+        case ``scan_tickers`` is the unfiltered candidate pool, not a bullish
+        subset, so it's a safe legacy fallback; or
+      * the strategy is bullish-equivalent (csp) and has no router bucket.
+    """
+    routed = routes.get(extra_name, [])
+    if routed:
+        return routed
+    if not routing_ran:
+        return scan_tickers
+    if extra_name in _BULLISH_EQUIVALENT_STRATEGIES:
+        return scan_tickers
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator configuration
 # ---------------------------------------------------------------------------
@@ -2489,6 +2530,7 @@ class Orchestrator:
         # Each extra strategy uses its own default config, independent of the
         # main strategy. Respects daily position caps across all strategies.
         _multi_strategy_routes: dict[str, list[str]] = {}
+        _routing_ran = False
         if self.ticker_gate is not None and self.config.extra_strategies:
             try:
                 _routed = self.ticker_gate.filter_ranked_multi_strategy(
@@ -2497,6 +2539,7 @@ class Orchestrator:
                 )
                 for _t, _strategy_name in _routed:
                     _multi_strategy_routes.setdefault(_strategy_name, []).append(_t)
+                _routing_ran = True
             except Exception as exc:
                 logger.warning(
                     "[Orchestrator] Multi-strategy routing failed (extra "
@@ -2540,10 +2583,14 @@ class Orchestrator:
                 continue  # already ran this one above
 
             # Direction-appropriate shortlist for this specific strategy.
-            # Falls back to the bullish shortlist only if routing produced
-            # nothing (e.g. ticker_gate disabled) rather than silently
-            # skipping the strategy entirely.
-            extra_tickers = _multi_strategy_routes.get(extra_name, []) or scan_tickers
+            # A direction-specific strategy whose router bucket is empty is
+            # SKIPPED (returns []), not run against the bullish shortlist — the
+            # previous `... or scan_tickers` fallback did exactly that, selling
+            # e.g. call spreads on tickers just confirmed bullish. See
+            # _select_extra_tickers for the full rule.
+            extra_tickers = _select_extra_tickers(
+                extra_name, _multi_strategy_routes, _routing_ran, scan_tickers
+            )
             if not extra_tickers:
                 logger.info(
                     "[Orchestrator] No tickers routed to %s this scan — skipping",
