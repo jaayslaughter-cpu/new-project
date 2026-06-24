@@ -1636,6 +1636,48 @@ class TestTradeDatabase(unittest.TestCase):
         self.assertIsNotNone(cur.fetchone())
         conn.close()
 
+    def test_save_fill_pg_placeholders_not_double_escaped(self):
+        """Regression: the PostgreSQL save_fill path must emit clean %s binds.
+
+        The first real trade (2026-06-24) failed with 'syntax error at or near
+        %' because save_fill hardcoded %s placeholders, which _execute escapes
+        % -> %% into %%s — Postgres then receives literal '%s' text. Every write
+        path must use ? placeholders. This forces the PG branch without a live
+        Postgres and inspects the SQL _execute actually hands to the cursor."""
+        captured = {}
+
+        class _FakeCursor:
+            def execute(self, sql, params=None):
+                captured["sql"] = sql
+                captured["params"] = params
+            def fetchone(self):
+                return None
+            def fetchall(self):
+                return []
+            def close(self):
+                pass
+
+        class _FakeConn:
+            def cursor(self):
+                return _FakeCursor()
+            def commit(self):
+                pass
+            def close(self):
+                pass
+
+        filled = self._make_filled()
+        # Force the PostgreSQL code path; substitute a fake connection so no
+        # real database is needed. _execute still runs its ? -> %s rewrite.
+        self.db._use_pg = True
+        self.db._get_conn = lambda: _FakeConn()
+        self.db.save_fill(filled)
+
+        sql = captured.get("sql", "")
+        self.assertIn("INSERT INTO trades", sql)
+        self.assertNotIn("%%", sql)              # the bug signature (double-escape)
+        self.assertEqual(sql.count("%s"), 22)    # 22 clean binds
+        self.assertEqual(len(captured.get("params") or ()), 22)
+
 
 class TestDiscordNotifier(unittest.TestCase):
 
