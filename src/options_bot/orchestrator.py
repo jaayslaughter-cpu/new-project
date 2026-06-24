@@ -691,7 +691,11 @@ class TradeDatabase:
         if src:
             _expiry_str = src.expiry.isoformat() if hasattr(src, "expiry") and src.expiry else None
 
-        # PostgreSQL uses INSERT ... ON CONFLICT; SQLite uses INSERT OR REPLACE
+        # PostgreSQL uses INSERT ... ON CONFLICT; SQLite uses INSERT OR REPLACE.
+        # BOTH branches use ? placeholders — _execute() rewrites ? -> %s for
+        # psycopg2. Writing %s here directly is a bug: _execute escapes % -> %%
+        # first, turning %s into %%s, which Postgres receives as literal "%s"
+        # text ("syntax error at or near %").
         if self._use_pg:
             sql = """
                 INSERT INTO trades
@@ -700,7 +704,7 @@ class TradeDatabase:
                  net_credit, status, broker, created_at, updated_at,
                  delta, vega, theta, underlying_price, expiry,
                  profit_target_price, profit_target_pct)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT (id) DO UPDATE SET
                   updated_at = EXCLUDED.updated_at,
                   status     = EXCLUDED.status
