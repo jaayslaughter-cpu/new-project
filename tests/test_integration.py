@@ -2520,5 +2520,76 @@ class TestExtraStrategyRouting(unittest.TestCase):
         self.assertEqual(out, ["SPY", "XLE"])
 
 
+class TestMacroBlackout(unittest.TestCase):
+    """Macro-event blackout gate: block new premium-selling entries in the
+    lookahead window before a high-impact event (FOMC etc.) through the event
+    day, never after, and fail open on bad data."""
+
+    def setUp(self):
+        from options_bot import macro_blackout as mb
+        self.mb = mb
+        from datetime import date
+        self.date = date
+
+    def test_default_events_are_fomc_dates(self):
+        evs = self.mb.default_events()
+        self.assertEqual(len(evs), 16)  # 8 FOMC decisions x 2026, 2027
+        self.assertTrue(all(e.impact == "high" for e in evs))
+        self.assertIn(self.date(2026, 6, 17), [e.on for e in evs])
+
+    def test_blocks_on_event_day(self):
+        r = self.mb.check_macro_blackout(as_of=self.date(2026, 6, 17), lookahead_days=1)
+        self.assertTrue(r.in_blackout)
+        self.assertEqual(r.days_until, 0)
+        self.assertIn("FOMC", r.event_label)
+
+    def test_blocks_day_before_with_lookahead_1(self):
+        r = self.mb.check_macro_blackout(as_of=self.date(2026, 6, 16), lookahead_days=1)
+        self.assertTrue(r.in_blackout)
+        self.assertEqual(r.days_until, 1)
+
+    def test_clear_two_days_before_with_lookahead_1(self):
+        r = self.mb.check_macro_blackout(as_of=self.date(2026, 6, 15), lookahead_days=1)
+        self.assertFalse(r.in_blackout)
+
+    def test_clear_day_after_event(self):
+        # Window must NOT extend past the event (post-event vol collapse is fine).
+        r = self.mb.check_macro_blackout(as_of=self.date(2026, 6, 18), lookahead_days=1)
+        self.assertFalse(r.in_blackout)
+
+    def test_lookahead_zero_blocks_only_event_day(self):
+        self.assertFalse(
+            self.mb.check_macro_blackout(as_of=self.date(2026, 6, 16), lookahead_days=0).in_blackout
+        )
+        self.assertTrue(
+            self.mb.check_macro_blackout(as_of=self.date(2026, 6, 17), lookahead_days=0).in_blackout
+        )
+
+    def test_extra_events_with_label(self):
+        # CPI print added via config; blackout the day before with lookahead 1.
+        r = self.mb.check_macro_blackout(
+            as_of=self.date(2026, 7, 14),
+            lookahead_days=1,
+            extra_events=("2026-07-15:CPI",),
+            events=[],  # isolate from FOMC defaults
+        )
+        self.assertTrue(r.in_blackout)
+        self.assertIn("CPI", r.event_label)
+
+    def test_malformed_extra_event_is_ignored_failopen(self):
+        # Bad date string must not raise; just no blackout from it.
+        r = self.mb.check_macro_blackout(
+            as_of=self.date(2026, 7, 14),
+            lookahead_days=1,
+            extra_events=("not-a-date", "2026/07/15", 12345),
+            events=[],
+        )
+        self.assertFalse(r.in_blackout)
+
+    def test_no_event_nearby(self):
+        r = self.mb.check_macro_blackout(as_of=self.date(2026, 5, 1), lookahead_days=1)
+        self.assertFalse(r.in_blackout)
+
+
 if __name__ == "__main__":
     unittest.main()
