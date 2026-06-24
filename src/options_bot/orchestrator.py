@@ -277,6 +277,17 @@ class OrchestratorConfig:
     vrp_gate_enabled: bool = False
     vrp_gate_min_trades: int = 30
 
+    # macro_blackout: don't open NEW premium-selling positions into a scheduled
+    #   high-impact macro event (FOMC by default; add CPI/jobs/PCE/GDP via
+    #   macro_blackout_extra_events as 'YYYY-MM-DD:Label'). Pure risk-reducer
+    #   (only ever vetoes an entry), so it is intentionally NOT milestone-gated:
+    #   you want event protection active during the paper-trading window so
+    #   event-driven entries don't pollute the edge estimate. Dormant by default;
+    #   fail-open; NOT applied to the 0DTE fast path. See macro_blackout.py.
+    macro_blackout_enabled: bool = False
+    macro_blackout_lookahead_days: int = 1
+    macro_blackout_extra_events: tuple[str, ...] = ()
+
     # --- Risk profile ---
     risk_level: str = "medium"               # "low", "medium", or "high"
 
@@ -1089,6 +1100,16 @@ class TradingPipeline:
                 _n_closed, getattr(config, "vrp_gate_min_trades", 30),
             )
 
+        # Macro-event blackout — enable-flag only (no milestone gate; it's a
+        # pure risk-reducer, see macro_blackout.py).
+        self._macro_blackout_active = getattr(config, "macro_blackout_enabled", False)
+        if self._macro_blackout_active:
+            logger.info(
+                "[Pipeline] macro_blackout ACTIVE: vetoing new entries within "
+                "%d day(s) of a high-impact macro event",
+                getattr(config, "macro_blackout_lookahead_days", 1),
+            )
+
     def _evaluate_vrp_for_signal(self, ticker: str, signal):
         """Compute the VRP gate result for a produced signal.
 
@@ -1125,6 +1146,30 @@ class TradingPipeline:
         Returns FilledOrder if a trade was entered, None otherwise.
         """
         logger.info("[Pipeline] Running for %s", ticker)
+
+        # --- Macro-event blackout (capital preservation) ---
+        # Veto a NEW entry into a scheduled high-impact macro event (FOMC, etc.)
+        # before doing any chain work. Pure risk-reducer; fail-open.
+        if getattr(self, "_macro_blackout_active", False):
+            try:
+                from .macro_blackout import check_macro_blackout
+                _bo = check_macro_blackout(
+                    lookahead_days=getattr(
+                        self.config, "macro_blackout_lookahead_days", 1
+                    ),
+                    extra_events=getattr(
+                        self.config, "macro_blackout_extra_events", ()
+                    ),
+                )
+                if _bo.in_blackout:
+                    logger.info(
+                        "[Pipeline] %s: macro blackout — %s in %s day(s); "
+                        "skipping new entry",
+                        ticker, _bo.event_label, _bo.days_until,
+                    )
+                    return None
+            except Exception as exc:  # noqa: BLE001 — fail-open
+                logger.debug("[Pipeline] macro blackout check skipped: %s", exc)
 
         # --- Step 1: Fetch chain ---
         try:
