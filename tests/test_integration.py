@@ -2469,5 +2469,56 @@ class TestAlpacaQuoteEnrichment(unittest.TestCase):
         self.assertEqual(out[0].bid, 0.0)            # unchanged, fail-open
 
 
+class TestExtraStrategyRouting(unittest.TestCase):
+    """_select_extra_tickers must never run a direction-specific strategy
+    against the bullish shortlist. The 2026-06-23 bug: the call-spread bucket
+    was empty (no ticker bearish enough), so `... or scan_tickers` ran call
+    spreads on the bullish names — fighting the trend."""
+
+    def setUp(self):
+        from options_bot.orchestrator import _select_extra_tickers
+        self.sel = _select_extra_tickers
+        # The 06-23 routing result: 9 bullish -> put_spread, QQQ -> strangle,
+        # nothing bearish enough for call_spread.
+        self.bullish = ["XBI", "XLF", "IWM", "XLV", "SMH", "XLI", "TLT", "HYG", "EEM"]
+        self.routes = {
+            "short_put_spread": list(self.bullish),
+            "short_strangle": ["QQQ"],
+        }
+
+    def test_callspread_empty_bucket_skips_not_bullish_fallback(self):
+        # THE BUG: routing ran, no ticker routed to call spreads -> SKIP ([]),
+        # must NOT fall back to the bullish shortlist.
+        out = self.sel("short_call_spread", self.routes, True, self.bullish)
+        self.assertEqual(out, [])
+
+    def test_strangle_uses_its_routed_bucket(self):
+        out = self.sel("short_strangle", self.routes, True, self.bullish)
+        self.assertEqual(out, ["QQQ"])
+
+    def test_csp_reuses_bullish_shortlist(self):
+        # csp shares the primary's bullish/neutral thesis and has no router
+        # bucket -> bullish shortlist is correct.
+        out = self.sel("csp", self.routes, True, self.bullish)
+        self.assertEqual(out, self.bullish)
+
+    def test_iron_condor_empty_bucket_skips(self):
+        # iron_condor is neutral/defined-risk, NOT bullish-equivalent -> skip
+        # when routing assigned it nothing (don't run it on bullish names).
+        out = self.sel("iron_condor", self.routes, True, self.bullish)
+        self.assertEqual(out, [])
+
+    def test_routing_not_run_falls_back_for_callspread(self):
+        # When routing never ran (ticker_gate disabled / errored), scan_tickers
+        # is the unfiltered pool, so the legacy fallback is acceptable.
+        out = self.sel("short_call_spread", {}, False, ["SPY", "QQQ", "IWM"])
+        self.assertEqual(out, ["SPY", "QQQ", "IWM"])
+
+    def test_routed_bucket_takes_precedence(self):
+        routes = {"short_call_spread": ["SPY", "XLE"]}
+        out = self.sel("short_call_spread", routes, True, self.bullish)
+        self.assertEqual(out, ["SPY", "XLE"])
+
+
 if __name__ == "__main__":
     unittest.main()
