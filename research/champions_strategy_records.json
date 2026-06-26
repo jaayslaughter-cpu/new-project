@@ -1,0 +1,665 @@
+[
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Delta Neutral Hedge: Short Underlying + Long 2x ATM Options",
+    "strategy_family": "hedged",
+    "market_bias": "neutral",
+    "market_regime": ["high_iv", "trend", "unknown"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "futures/underlying", "qty": 1, "note": "short directional position"},
+        {"action": "buy", "type": "call", "strike": "ATM", "qty": 2, "note": "2x ATM calls to achieve delta neutral"}
+      ],
+      "position_type": "synthetic",
+      "dte_range": "up to 30 days (Fontanills typical trade duration)"
+    },
+    "greeks": {
+      "delta": "near zero at initiation (delta neutral)",
+      "gamma": "positive (net long 2 calls)",
+      "theta": "negative (long options hurt by time decay)",
+      "vega": "positive (long options benefit from vol increase)"
+    },
+    "risk_profile": {
+      "max_profit": "unlimited if underlying moves sharply in either direction (long gamma)",
+      "max_loss": "premium paid for 2 ATM calls (if underlying stays flat and vol collapses)",
+      "defined_risk": true,
+      "assignment_risk": "low"
+    },
+    "entry_conditions": [
+      "volatility and momentum at extreme levels — 'something is really out of whack' (Fontanills)",
+      "contrarian setup: consensus is strongly one-directional",
+      "high-volatility market preferred (S&P, bonds, gold, oil, currencies per Fontanills)",
+      "existing directional position needs hedge"
+    ],
+    "exit_rules": [
+      "close within 30 days maximum (Fontanills typical hold)",
+      "exit if flat/range-bound — theta decay destroys long option value without movement"
+    ],
+    "adjustment_rules": [
+      "add or remove call legs to maintain delta neutrality as underlying moves"
+    ],
+    "failure_modes": [
+      "underlying stays flat — theta destroys long option premium with no directional gain",
+      "IV collapse after entry reduces long call value even if underlying moves moderately",
+      "over-hedging with too many long calls creates net long gamma position that is expensive"
+    ],
+    "evidence": {
+      "finding_summary": "Fontanills: used options to go delta neutral on futures positions — 'I could hedge myself in both directions and still sleep well at night.' Example given: short wheat + long 2 ATM wheat calls. If wheat falls, profits on short; if wheat rises, call delta accelerates. 'My greatest returns are made when something is really out of whack.' Trade duration up to 30 days maximum.",
+      "sample_period": null,
+      "notes": "Qualitative practitioner interview, 1996. Futures-specific example but concept applies to ETF options. Not directly portable — bot trades ETF options, not futures combos. Concept value: vol-extreme contrarian entry + options to manage directional risk."
+    },
+    "model_features": [
+      "iv_percentile_rank (extreme high = Fontanills entry trigger)",
+      "momentum_divergence_flag (vol + price momentum both extreme)",
+      "consensus_positioning_z_score (contrarian entry when crowd is one-sided)",
+      "delta_neutral_flag"
+    ],
+    "confidence": 0.62
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Volpat Outside Day Reversal: Contrarian Buy After Bearish Outside Day",
+    "strategy_family": "directional",
+    "market_bias": "bullish",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [
+        {"action": "buy", "type": "underlying or options", "note": "next morning if market opens up after bearish outside day"}
+      ],
+      "position_type": "unknown",
+      "dte_range": "1-3 days (Gettess typical hold)"
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": "unknown — open-ended",
+      "max_loss": "controlled stop below outside day low",
+      "defined_risk": false,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "outside day: today's high exceeds prior high AND today's low is below prior low",
+      "outside day closes on or near the lows (bearish appearance)",
+      "next session opens to the upside (signal confirmation)",
+      "underlying must have active volatility — Volpat = volatility + pattern"
+    ],
+    "exit_rules": [
+      "hold 1-3 days (Gettess typical)",
+      "take profit when market gives it — 'if all the market is going to give you is $500, you have to take it'",
+      "exit if next-day open confirms direction (gap up = confirmation)"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "outside day closes on lows AND next session opens lower (no reversal) — do not enter",
+      "entering in low-volatility markets — Volpat requires active market movement",
+      "holding too long after initial move — 1-3 day hold only"
+    ],
+    "evidence": {
+      "finding_summary": "Gettess (Volpat system, rated top 10 by Futures Truth): 'A big outside day, closing on the lows... most market lore says this is very bearish. What I found is if the market starts up the next day you probably want to buy it.' Volpat = volatility (active market) + pattern recognition (short-term objective patterns). Trade duration 1-3 days.",
+      "sample_period": null,
+      "notes": "Volpat was picked by Futures Truth as one of the top 10 trading systems of all time (as of 1996). Qualitative interview — no specific backtest statistics provided. For bot: applicable as a short-term momentum signal on underlying ETFs. Outside day closing on lows with next-day gap up = bullish CSP / ShortCallSpread entry signal."
+    },
+    "model_features": [
+      "outside_day_flag (high > prev_high AND low < prev_low)",
+      "close_location_in_range (close near low of outside day)",
+      "next_open_vs_prior_close (gap direction confirmation)",
+      "atr_percentile (market must have active volatility — Volpat requirement)",
+      "underlying_adv_check"
+    ],
+    "confidence": 0.65
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Commitments of Traders (COT): Commercial Net Position as Regime Signal",
+    "strategy_family": "macro",
+    "market_bias": "unknown",
+    "market_regime": ["trend", "macro_stress", "unknown"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "commercials moving from net short to net long: bullish signal for that market",
+      "commercials moving from net long to net short: distribution signal, bearish",
+      "signal applies across futures markets including S&P 500, T-bonds, currencies"
+    ],
+    "exit_rules": [
+      "watch for commercial positioning reversal as exit/fade signal"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "COT data has 3-day reporting lag (released each Friday for positions as of prior Tuesday)",
+      "commercials can be wrong on direction in the near term — signal is intermediate-term (weeks to months)",
+      "position changes are gradual — accumulation/distribution takes time; not a precise timing tool"
+    ],
+    "evidence": {
+      "finding_summary": "Williams: 'When commercials go from net long to net short — that is usually a good buy signal [on subsequent reversal back]. Commercials don't try to pick tops and bottoms — they accumulate and distribute.' COT data released by CFTC every two weeks (biweekly in 1996, now weekly). Williams: 'When I'm losing in the market I pull back a little and catch my wind.' In bonds: 'Commercials are moving close to being net long — that's pretty bullish.'",
+      "sample_period": null,
+      "notes": "Williams parlayed $10,000 into $1,100,000 in the 1987 Robins World Cup Championship. COT data available free from CFTC (cftc.gov). For bot: S&P 500 futures commercial net positioning is a cross-asset macro regime signal for SPY/QQQ. If commercials are net long S&P futures, regime is more favorable for ShortPutSpread; net short = caution. New signal type not currently in bot."
+    },
+    "model_features": [
+      "cot_commercial_net_position (long - short contracts for key futures: SP500, bonds, gold)",
+      "cot_commercial_net_change_4w (direction of change over 4 weeks)",
+      "cot_commercial_net_pct_oi (position relative to total open interest)",
+      "cot_extreme_flag (commercials at multi-year net long or short extreme)"
+    ],
+    "confidence": 0.70
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Event Trading: Catalyst Reaction Signal (Close Position in Range After Report)",
+    "strategy_family": "directional",
+    "market_bias": "unknown",
+    "market_regime": ["event_risk"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": "1-5 days (Warwick typical)"
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "economic report released (employment, durable goods, PPI, CPI, etc.)",
+      "bullish signal: market rallies on news AND closes in upper 20% of the day's range",
+      "bearish signal: fundamentally bullish report but market closes in lower 20% of range = sell signal",
+      "do NOT enter immediately after report: 'getting in immediately after the number is a 50-50 game'",
+      "signal requires close-of-day confirmation — intraday reaction is noise"
+    ],
+    "exit_rules": [
+      "hold 1-5 days following the signal day",
+      "exit at close if position is not working within the first 1-2 days"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "entering immediately at report release instead of waiting for EOD close confirmation",
+      "ignoring close-in-range condition — directional pop without end-of-day confirmation is unreliable",
+      "report-driven moves in illiquid markets are noisier"
+    ],
+    "evidence": {
+      "finding_summary": "Warwick (event trading method, published book 1996): 'If the market rallies on the number and by the end of the day it closes in the upper 20% of its range, I take that as a buy signal.' A fundamentally bullish report that results in a close in the lower 20% of range = sell signal. 'I concentrate on how the market reacts to that bit of information.' Trade duration 1-5 days. Most effective reports per Warwick: durable goods orders and employment for bond market.",
+      "sample_period": null,
+      "notes": "Warwick's event trading was developed over 6 years prior to 1996. Close position in range (upper/lower 20%) after economic release is the signal. For bot: applicable as a same-day entry filter — on FOMC/CPI/NFP days, if ETF closes in top/bottom 20% of day range, that signals follow-through direction for next 1-5 days. Could refine macro_blackout to allow entry AFTER the report if reaction is directionally confirmed."
+    },
+    "model_features": [
+      "close_position_in_range (close / (high - low) — upper 20% = 0.80+, lower 20% = 0.20-)",
+      "economic_report_day_flag",
+      "report_type (employment, CPI, FOMC, durable goods)",
+      "intraday_range_vs_atr (large-range day = high information content)",
+      "prior_trend_direction (trend acts as baseline — trade in direction of reaction + trend)"
+    ],
+    "confidence": 0.68
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Dev-Stop: Volatility-Adjusted Stop Placement",
+    "strategy_family": "income",
+    "market_bias": "unknown",
+    "market_regime": ["trend", "range_bound", "high_iv", "unknown"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": "3-10 days (Kase typical trade duration)"
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": "capped by Dev-Stop distance (volatility-scaled)",
+      "defined_risk": true,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "enter on PeakOscillator signal (momentum indicator, cross-comparable between markets)",
+      "Kase: 'My trading techniques are very focused on exit strategies, not entry points'",
+      "momentum divergence between price and oscillator: entry on reassertion"
+    ],
+    "exit_rules": [
+      "primary exit: Dev-Stop (volatility-adjusted stop — stop distance = function of recent volatility, not fixed dollar amount)",
+      "partial profit exit on 'danger signals' such as reversal patterns and momentum divergences",
+      "Kase: 'I take profits more quickly. I take a lot more winning trades, but the wins are smaller'",
+      "take partial profits at first sign of reversal pattern rather than waiting for stop to be hit"
+    ],
+    "adjustment_rules": [
+      "trail Dev-Stop as position moves in favor",
+      "take partial position off on reversal candle or momentum divergence — don't wait for full stop"
+    ],
+    "failure_modes": [
+      "fixed-dollar stops in volatile markets lead to premature exit — volatility-adjusted stop prevents this",
+      "holding too long waiting for maximum profit — momentum divergence is an earlier, more reliable exit signal",
+      "applying same stop distance across markets with different volatility profiles"
+    ],
+    "evidence": {
+      "finding_summary": "Kase: Dev-Stop is a 'volatility-adjusted stop technique.' PeakOscillator is a momentum indicator 'that can be cross-compared between markets.' Kase: 'My trading techniques are very focused on exit strategies, not entry points.' 'I take partial profits on danger signals, such as reversal patterns and momentum divergences.' Trade duration 3-10 days. Published in Futures Magazine April/May/June 1996.",
+      "sample_period": null,
+      "notes": "Kase's approach aligns with the bot's Yang-Zhang realized vol estimators — the Dev-Stop concept of scaling stop distance to market volatility is consistent. For bot: stop-loss thresholds on short spreads could be volatility-adjusted (e.g., 2x current ATR rather than fixed credit multiple). Also: partial early close on reversal signal rather than full position management."
+    },
+    "model_features": [
+      "atr_n (ATR over N periods — basis for volatility-adjusted stop)",
+      "stop_distance_as_atr_multiple (Dev-Stop concept: stop = f(vol) not fixed $)",
+      "momentum_oscillator_divergence_flag (PeakOscillator concept: price new high, oscillator not)",
+      "reversal_pattern_flag (candlestick reversal or price pattern — partial exit trigger)"
+    ],
+    "confidence": 0.63
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Momentum Retracement Entry: Trend Direction + Countertrend Pullback",
+    "strategy_family": "directional",
+    "market_bias": "bullish",
+    "market_regime": ["trend"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": "2-4 days (Bierovic typical hold)"
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": "open (trend continuation)",
+      "max_loss": "defined by stop below retracement low",
+      "defined_risk": true,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "must have recently had a strong directional trend (Bierovic: 'real price upthrust in the market')",
+      "countertrend retracement occurs — pullback from trend high",
+      "trend reasserts itself (price resumes in original trend direction)",
+      "minimum liquidity: underlying ADV >= 5,000 contracts, open interest >= 20,000 (Bierovic citing Chuck LeBeau)"
+    ],
+    "exit_rules": [
+      "exit if market returns to today's high by tomorrow (Bierovic: 'If I get in today, I'd get out tomorrow if the market returns to today's high')",
+      "target: doubled the amount risked (Bierovic: 'a good trade is when I doubled what I risk')",
+      "2:1 reward/risk minimum; 40% win rate with 2:1 R/R is profitable"
+    ],
+    "adjustment_rules": [
+      "trail stop intraday (Bierovic watches intraday even on daily-chart setups)",
+      "use discretion on exits — take profits on close if 'enough money made'"
+    ],
+    "failure_modes": [
+      "entering without prior strong trend — 'I won't take a trade unless the market has recently had a strong directional trend'",
+      "using in illiquid markets — TA works worse in thin markets",
+      "holding too long — most profitable trades are captured quickly; 'markets take profits away nine out of 10 times'"
+    ],
+    "evidence": {
+      "finding_summary": "Bierovic: 'momentum retracement trading method involves knowing the direction and quality of the trend, knowing how to measure countertrend reactions and when the trend has reasserted itself.' Trade duration 2-4 days. Win rate target: 40% minimum with 2:1 reward/risk ratio. Minimum liquidity: ADV >= 5,000 contracts, OI >= 20,000.",
+      "sample_period": null,
+      "notes": "Bierovic manages 'a couple of million dollars' as of 1996. For bot: momentum retracement concept can refine entry timing on ShortPutSpread entries — enter after a pullback in an uptrending ETF rather than chasing momentum. Countertrend dip in an uptrend = better put spread entry than entering at high of trend."
+    },
+    "model_features": [
+      "trend_quality_score (strong vs. weak trend — ADX value)",
+      "retracement_depth_pct (how deep the pullback is as % of prior trend leg)",
+      "trend_reassertion_flag (price breaks back above prior retracement level)",
+      "reward_risk_ratio_at_entry (2:1 minimum)",
+      "underlying_adv",
+      "open_interest_total"
+    ],
+    "confidence": 0.67
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Cycle + Oscillator Regime: Higher-Timeframe Cycle Sets Trend Bias, Lower-Timeframe Oscillator Sets Entry",
+    "strategy_family": "directional",
+    "market_bias": "unknown",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "determine higher-timeframe cycle direction (weekly cycle sets daily trend bias per Bressert)",
+      "oscillator reading: above 80-90 = probable top; below 10-20-30 = probable bottom",
+      "when trend is up: buy dips (oscillator oversold within uptrend)",
+      "when trend is down: sell rallies (oscillator overbought within downtrend)",
+      "do NOT hold positions going into major scheduled reports — 'that's gambling; the unexpected can happen'"
+    ],
+    "exit_rules": [
+      "exit on oscillator signal in opposite direction",
+      "exit before major scheduled economic reports"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "using oscillator in isolation without higher-timeframe cycle context — oscillators can stay overbought/oversold in trending markets",
+      "holding through macro catalyst events — Bressert: big reports take away the odds"
+    ],
+    "evidence": {
+      "finding_summary": "Bressert: 'Cycles give you the time. Oscillators pick up overbought/oversold energy.' Oscillator > 80-90 = probable top; < 30-20-10 = probable bottom. 'The trend for the daily chart is determined by the weekly cycle.' Key rule: 'when the trend is up, buy dips; when the trend is down, sell rallies.' Does not hold positions going into major economic reports.",
+      "sample_period": null,
+      "notes": "Bressert's rule about avoiding positions through major reports directly supports the bot's macro_blackout module. For bot: higher-timeframe oscillator signal (weekly RSI/stochastic) can act as regime context for daily strategy selection — overbought weekly = avoid ShortCallSpread; oversold weekly = avoid ShortPutSpread."
+    },
+    "model_features": [
+      "weekly_rsi (higher-timeframe momentum for regime context)",
+      "daily_stochastic_pct_d (lower-timeframe entry timing)",
+      "oscillator_divergence (price makes new high, oscillator does not = exhaustion)",
+      "days_to_next_major_report (Bressert blackout rule)",
+      "cycle_phase_estimate"
+    ],
+    "confidence": 0.65
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Wyckoff Volume Effort-Result Analysis: Distribution and Accumulation Signals",
+    "strategy_family": "directional",
+    "market_bias": "unknown",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "accumulation signal: volume rising + price gains shrinking = buying demand being absorbed, not accelerating (caution)",
+      "distribution top signal: successive days show increasing volume but decreasing price gain per unit volume",
+      "Redmont example: Day 1: 10k shares +1pt, Day 2: 10k +1pt, Day 3: 20k +1pt (double effort, same result), Day 4: 40k +0.5pt, Day 5: 80k flat = distribution top",
+      "supply is always present; when demand burns out, prices fall rapidly"
+    ],
+    "exit_rules": [
+      "exit when effort-result divergence appears: rising volume producing diminishing price gain"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "volume data quality issues (ETFs can have misleading volume on creation/redemption days)",
+      "short-term volume spikes from news or index rebalancing can trigger false signals",
+      "Wyckoff requires analysis over multiple days/bars — single-bar volume spike is noise"
+    ],
+    "evidence": {
+      "finding_summary": "Redmont (Wyckoff method): 'The key to analyzing supply and demand is that the demand side burns itself out.' Example: Day 1-2: 10k shares, +1pt each. Day 3: 20k, +1pt. Day 4: 40k, +0.5pt. Day 5: 80k, flat. Rising volume + diminishing price gain = distribution top. 'When the buying is through and satisfied — there is always supply there.' Also: Fibonacci 61.8% and 38.2% retracements are valid because 'markets started connecting' them as they became widely used.",
+      "sample_period": null,
+      "notes": "Redmont trades primarily OEX options (directional, buys calls and puts — not spreads). Wyckoff volume analysis is cross-applicable to ETF volume data. For bot: volume efficiency metric (price gain per unit of additional volume) is a non-standard model feature not in current signal stack. Could supplement the existing volume profile module."
+    },
+    "model_features": [
+      "volume_price_efficiency (price_change / log_volume — diminishing ratio = distribution)",
+      "volume_price_divergence_flag (volume making new highs, price gains shrinking)",
+      "multi_day_cumulative_effort_result (5-day running ratio of volume to price change)",
+      "fibonacci_retracement_proximity (38.2%, 61.8% levels as support/resistance)"
+    ],
+    "confidence": 0.63
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Contrarian Mass Media Sentiment: Cover Story as Top/Bottom Signal",
+    "strategy_family": "macro",
+    "market_bias": "unknown",
+    "market_regime": ["macro_stress", "unknown"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": "3-5 months (Noble: 'markets are relatively easy to call over a 3-5 month period')"
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "major mainstream media cover story about a market = contrarian top or bottom signal",
+      "media turns very bullish on an asset class = look for top (Noble: NY Times wheat cover = topping day)",
+      "media repeatedly negative about an asset class = contrarian buy signal",
+      "signal works on 3-5 month time horizon (not intraday)"
+    ],
+    "exit_rules": [
+      "hold 3-5 months after the contrarian signal",
+      "exit when media sentiment reverses"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "media saturation is rare and hard to systematize — requires manual monitoring",
+      "timing is imprecise — cover story signals a zone, not a precise date",
+      "works on 3-5 month horizon only — not useful for short-term options entry timing"
+    ],
+    "evidence": {
+      "finding_summary": "Noble: 'The media seem to unfailingly know when there is a top or bottom — it is the best contrarian indicator.' NY Times wheat cover story = topping day in wheat (April 1996). Multiple media stories saying stock market is 'terrible' = buy signal that led to 50% two-year rise. 'Bonds are starting a 6-month rally' triggered by 10-15 negative bond stories in a few weeks.",
+      "sample_period": null,
+      "notes": "1996 qualitative practitioner view. For bot: FinBERT already scores financial news sentiment. Mass media saturation could be approximated by: unusually high FinBERT article volume + extreme sentiment reading for a given ETF sector over rolling 14-day window. Not a precise entry signal but a regime filter — avoid counter-trend entries when sentiment is extreme."
+    },
+    "model_features": [
+      "finbert_sentiment_14d_ma (rolling average for extreme readings)",
+      "news_volume_spike_flag (article count per ticker in past 14d vs 90d baseline)",
+      "finbert_sentiment_z_score (standard deviations from rolling mean — extreme = contrarian signal)",
+      "contrarian_media_flag (sentiment z-score beyond ±2 for 5+ consecutive days)"
+    ],
+    "confidence": 0.55
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Stowell Cups and Caps: 3-Bar Reversal Pattern",
+    "strategy_family": "directional",
+    "market_bias": "unknown",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": "2-3 days (Stowell: 'two profitable closes')"
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": "open (at least 2 profitable closes per Stowell)",
+      "max_loss": "stop set to extreme of the 3-bar formation",
+      "defined_risk": true,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "CUP (bearish reversal after rally): 3-bar pattern where middle bar has LOWER close/low than bars 1 and 3",
+      "cup trigger: daily close below all 3 lows of the cup formation = SELL signal",
+      "CAP (bullish reversal after decline): opposite of cup — middle bar has HIGHER close/high",
+      "cap trigger: daily close above all 3 highs of the cap formation = BUY signal",
+      "prior move must exist: cup requires prior rally; cap requires prior decline"
+    ],
+    "exit_rules": [
+      "look for two profitable closes then exit",
+      "stop at extreme of the 3-bar formation (cup: stop = highest high of the 3 bars; cap: stop = lowest low)",
+      "remove stop in front of economic reports to avoid stop-running on news spikes"
+    ],
+    "adjustment_rules": [
+      "trail stop after first profitable close"
+    ],
+    "failure_modes": [
+      "pattern without prior trend — cups after sideways consolidation, not after rallies, are less reliable",
+      "stop too tight relative to market volatility — Stowell: remove stop during economic reports",
+      "holding through economic reports — 'inviting the market to pick your stop off and you get huge slippage'"
+    ],
+    "evidence": {
+      "finding_summary": "Stowell: cup = 3-bar pattern where middle bar has lower close/low, bars 1 and 3 have higher closes/lows. Trigger: close below all 3 lows. Cap = opposite. Developed in 1984. Grew $5,000 to $100,000 in just over 2 years (1985-1987) using cups and caps only. Applied to Treasury bond futures. Holds for 'two profitable closes.' Stop = extreme of the 3-bar formation.",
+      "sample_period": "1985-1987 (confirmed profitable with real account)",
+      "notes": "Stowell applied primarily to Treasury bond futures. For bot: 3-bar reversal pattern is applicable to ETF daily price data. Cup pattern = underlying has rallied and may be reversing = watch for ShortCallSpread entry opportunity. Cap pattern = underlying has fallen and may be reversing = watch for ShortPutSpread entry opportunity."
+    },
+    "model_features": [
+      "cup_pattern_flag (3-bar: bar1.low < bar2.low > bar3.low AND close < min(bar1.low, bar2.low, bar3.low))",
+      "cap_pattern_flag (3-bar: bar1.high > bar2.high < bar3.high AND close > max(bar1.high, bar2.high, bar3.high))",
+      "prior_trend_bars (cups require prior rally; caps require prior decline)",
+      "formation_extreme (stop reference: max high for cup, min low for cap)",
+      "days_to_next_economic_report (remove stop near reports per Stowell)"
+    ],
+    "confidence": 0.68
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Candlestick Real Body Analysis: Open-Close Relationship as Sentiment Signal",
+    "strategy_family": "directional",
+    "market_bias": "unknown",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "white candle (empty body): close above open = bulls won the day's battle",
+      "black candle (filled body): close below open = bears won the day's battle",
+      "real body size: large real body = decisive sentiment; small real body (doji) = indecision",
+      "shadows: long upper shadow = selling pressure rejected the rally; long lower shadow = buying absorbed the dip",
+      "combine with Western indicators (moving averages, stochastics, trendlines) for confirmation"
+    ],
+    "exit_rules": [
+      "bearish reversal candlestick pattern (e.g., large black candle after white candles) = partial or full exit trigger",
+      "doji after trend run = indecision, consider tightening stop"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "candlestick patterns require context — a bearish candle in a strong uptrend is noise, not a reversal signal",
+      "in highly liquid ETFs with program trading, candle patterns may be less reliable than in individual stocks",
+      "Wagner: moved from day-trading to position trading as large institutional players changed intraday dynamics"
+    ],
+    "evidence": {
+      "finding_summary": "Wagner: candlesticks are 'a mathematical expression of psychological market sentiment.' Key distinction: Western TA focuses on close-to-close; candlesticks show open-to-close relationship (real body). White candle = close above open; black candle = close below open. After incorporating candlesticks, 'my trading vastly improved. I started making money and my clients started making money.' Combine with Western TA tools (MA, stochastics, trendlines). 'The most profitable way to trade is with the trend.'",
+      "sample_period": null,
+      "notes": "For bot: open-to-close relationship (real body direction and size) is an additional price action feature. Real body as % of total range provides a normalized sentiment signal distinct from simple close-to-close return. Implementable as daily feature: real_body_pct = abs(open - close) / (high - low)."
+    },
+    "model_features": [
+      "real_body_pct (abs(open-close) / (high-low) — large = decisive; small = indecision)",
+      "candle_direction (close > open = bullish body; close < open = bearish body)",
+      "upper_shadow_pct ((high - max(open, close)) / (high - low) — large = selling pressure at highs)",
+      "lower_shadow_pct ((min(open, close) - low) / (high - low) — large = buying support at lows)",
+      "doji_flag (real_body_pct < 0.1 — indecision candle)"
+    ],
+    "confidence": 0.62
+  },
+  {
+    "source_title": "Champions of Trading Profits (FWN Trader Profiles, 1996)",
+    "source_type": "guide",
+    "strategy_name": "Market Selection Pre-Filter: Volatility and Liquidity Minimum Thresholds",
+    "strategy_family": "income",
+    "market_bias": "unknown",
+    "market_regime": ["unknown"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "Angell: both volatility AND liquidity must be present — one without the other is insufficient",
+      "Gettess/Bierovic/Reynolds/Wagner: avoid illiquid markets (pork bellies, lumber, OJ, coffee, cotton)",
+      "Bierovic (citing LeBeau): minimum ADV >= 5,000 contracts, open interest >= 20,000",
+      "Gettess: 'Volpat' requires an active market — if market isn't moving, you can't make money",
+      "multiple traders: large liquid markets are less subject to manipulation, better TA signal quality"
+    ],
+    "exit_rules": [
+      "exit any market where volatility has 'dried up' — Angell: gold market died in 1980 when both vol and liquidity declined"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "entering illiquid markets: 'a big fish can move a little pond' — Bierovic",
+      "entering low-volatility markets: insufficient premium / movement to profit",
+      "staying in a market after volatility drops (Angell: 'markets die on you')"
+    ],
+    "evidence": {
+      "finding_summary": "Multiple traders across all 18 profiles independently emphasize: trade only liquid, volatile markets. Angell: 'Liquidity and volatility are the two things you have to have.' Bierovic (LeBeau threshold): ADV >= 5,000, OI >= 20,000. Reynolds: 'The bigger the market, the better your fills are and the better technical analysis works.' Gettess: markets must be actively moving for Volpat to work. Wagner: avoids coffee and cotton due to liquidity/slippage.",
+      "sample_period": null,
+      "notes": "Cross-validated by 7+ independent traders in the same interview set. Minimum liquidity thresholds are for futures contracts; for ETF options, equivalent thresholds are already in bot (underlying ADV >= 500k, option OI >= 100/500). For bot: consider adding a volatility floor to market selection — minimum 20-day realized vol threshold before entry, beyond just IV rank."
+    },
+    "model_features": [
+      "underlying_adv_check (min threshold varies: futures ADV >= 5,000; ETF equiv >= 500k shares)",
+      "option_open_interest_check (bot already has this: >= 100, prefer 500+)",
+      "realized_vol_20d_floor (minimum realized vol — avoid entering when market is truly dead)",
+      "bid_ask_spread_pct (options spread as % of mid — liquidity proxy)",
+      "volume_regime_flag (vol + liquidity both above threshold = tradeable)"
+    ],
+    "confidence": 0.75
+  }
+]
