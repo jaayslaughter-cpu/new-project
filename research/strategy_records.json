@@ -1,0 +1,1039 @@
+[
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Cash-Secured Put (Short Naked Put)",
+    "strategy_family": "income",
+    "market_bias": "bullish",
+    "market_regime": ["trend", "low_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "put", "strike": "OTM below current price", "qty": 1}
+      ],
+      "position_type": "credit",
+      "dte_range": "30 days or less"
+    },
+    "greeks": {
+      "delta": "positive (net long exposure)",
+      "gamma": "negative (short option)",
+      "theta": "positive (time decay helps seller)",
+      "vega": "negative (rising vol hurts seller)"
+    },
+    "risk_profile": {
+      "max_profit": "put premium received",
+      "max_loss": "put strike minus premium received (stock to zero)",
+      "defined_risk": false,
+      "assignment_risk": "high"
+    },
+    "entry_conditions": [
+      "uptrend or sideways price action confirmed",
+      "clear area of support identified at or below strike",
+      "open interest >= 100 (prefer 500+)",
+      "underlying ADV >= 500k shares",
+      "sell OTM strike below current price"
+    ],
+    "exit_rules": [
+      "let expire worthless if underlying holds above strike",
+      "buy back early if 50-80% of max profit achieved",
+      "buy back immediately if underlying breaches stop-loss level"
+    ],
+    "adjustment_rules": [
+      "roll down and out (lower strike, later expiry) if short strike threatened"
+    ],
+    "failure_modes": [
+      "gap-down through strike on news/macro event",
+      "IV spike inflates mark-to-market loss before expiry",
+      "assignment forces buying falling stock at strike"
+    ],
+    "evidence": {
+      "finding_summary": "Standard income strategy; Cohen classifies as intermediate proficiency. Return on risk example: 4.38% with 12.43% cushion from breakeven.",
+      "sample_period": null,
+      "notes": "Cohen: only sell on stocks you would be willing to own at the strike price. Position strike around strong support within a rising trend."
+    },
+    "model_features": [
+      "underlying_trend_direction",
+      "distance_to_nearest_support",
+      "underlying_adv",
+      "option_open_interest",
+      "iv_rank_at_entry",
+      "dte_at_entry",
+      "delta_of_short_put"
+    ],
+    "confidence": 0.95
+  },
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Bull Put Spread (Short Put Spread)",
+    "strategy_family": "income",
+    "market_bias": "bullish",
+    "market_regime": ["trend", "range_bound", "high_iv", "low_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "put", "strike": "higher OTM strike", "qty": 1},
+        {"action": "buy", "type": "put", "strike": "lower OTM strike", "qty": 1}
+      ],
+      "position_type": "credit",
+      "dte_range": "30 days preferred"
+    },
+    "greeks": {
+      "delta": "positive (net bullish)",
+      "gamma": "negative",
+      "theta": "positive",
+      "vega": "negative"
+    },
+    "risk_profile": {
+      "max_profit": "net credit received",
+      "max_loss": "spread width minus net credit",
+      "defined_risk": true,
+      "assignment_risk": "medium"
+    },
+    "entry_conditions": [
+      "bullish or neutral directional outlook",
+      "short strike at or below key support level",
+      "elevated IV preferred for higher credit",
+      "both strikes OTM at entry"
+    ],
+    "exit_rules": [
+      "let expire worthless if underlying holds above short strike",
+      "close early at 50% of max profit to reduce gamma risk",
+      "close or roll if underlying trades through short strike with DTE remaining"
+    ],
+    "adjustment_rules": [
+      "roll spread down and out if short strike breached (lower strikes, later expiry)",
+      "close losing leg first, then reopen at improved strike"
+    ],
+    "failure_modes": [
+      "underlying breaks through short put strike",
+      "IV spike widens mark-to-market loss",
+      "entering into earnings or macro event causes gap risk",
+      "early assignment on short put leg if deep ITM near ex-dividend"
+    ],
+    "evidence": {
+      "finding_summary": "DERA (2024): vertical put spreads comprise 34% of ETP complex options volume — most common complex structure in ETF universe. Cohen: classified as income strategy, intermediate proficiency.",
+      "sample_period": "2016-2018 (DERA ETP data)",
+      "notes": "Cohen formula: max_loss = spread_width - net_credit; breakeven = short_strike - net_credit."
+    },
+    "model_features": [
+      "underlying_trend_direction",
+      "iv_rank_at_entry",
+      "delta_of_short_put",
+      "distance_short_strike_to_support",
+      "spread_width",
+      "credit_as_pct_of_spread_width",
+      "dte_at_entry",
+      "vix_level"
+    ],
+    "confidence": 0.97
+  },
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Bear Call Spread (Short Call Spread)",
+    "strategy_family": "income",
+    "market_bias": "bearish",
+    "market_regime": ["trend", "range_bound", "high_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "call", "strike": "lower OTM strike", "qty": 1},
+        {"action": "buy", "type": "call", "strike": "higher OTM strike", "qty": 1}
+      ],
+      "position_type": "credit",
+      "dte_range": "30 days preferred"
+    },
+    "greeks": {
+      "delta": "negative (net bearish)",
+      "gamma": "negative",
+      "theta": "positive",
+      "vega": "negative"
+    },
+    "risk_profile": {
+      "max_profit": "net credit received",
+      "max_loss": "spread width minus net credit",
+      "defined_risk": true,
+      "assignment_risk": "medium"
+    },
+    "entry_conditions": [
+      "bearish or neutral directional outlook",
+      "short strike at or above key resistance level",
+      "elevated IV preferred",
+      "both strikes OTM at entry",
+      "downtrend or rangebound price action confirmed"
+    ],
+    "exit_rules": [
+      "let expire worthless if underlying holds below short strike",
+      "close early at 50% of max profit",
+      "close or roll if underlying rallies through short strike"
+    ],
+    "adjustment_rules": [
+      "roll up and out (higher strikes, later expiry) if short call strike breached",
+      "close full position and accept loss if trend is strongly bullish"
+    ],
+    "failure_modes": [
+      "underlying rallies through short call strike",
+      "IV spike after entry worsens position",
+      "catalyst event (earnings, FOMC) causes gap through short strike",
+      "early assignment on short call if deep ITM"
+    ],
+    "evidence": {
+      "finding_summary": "DERA (2024): vertical call spreads are the most common complex stock option structure (36% of stock complex volume). Call spread volume is positively predicted by recent positive underlying returns — directional alignment is essential.",
+      "sample_period": "2016-2018 (DERA)",
+      "notes": "Cohen: breakeven = short_call_strike + net_credit; max_loss = spread_width - net_credit."
+    },
+    "model_features": [
+      "underlying_trend_direction",
+      "iv_rank_at_entry",
+      "delta_of_short_call",
+      "distance_short_strike_to_resistance",
+      "recent_5d_return_of_underlying",
+      "spread_width",
+      "credit_as_pct_of_spread_width",
+      "dte_at_entry",
+      "adx_value"
+    ],
+    "confidence": 0.97
+  },
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Long Iron Condor (Iron Condor)",
+    "strategy_family": "neutral",
+    "market_bias": "neutral",
+    "market_regime": ["range_bound", "high_iv", "low_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "put", "strike": "OTM put short strike"},
+        {"action": "buy", "type": "put", "strike": "lower OTM put long strike"},
+        {"action": "sell", "type": "call", "strike": "OTM call short strike"},
+        {"action": "buy", "type": "call", "strike": "higher OTM call long strike"}
+      ],
+      "position_type": "credit",
+      "dte_range": "30-45 days"
+    },
+    "greeks": {
+      "delta": "near zero at initiation",
+      "gamma": "negative (losses accelerate with large moves in either direction)",
+      "theta": "positive (both short legs decay)",
+      "vega": "negative (IV spike is primary risk)"
+    },
+    "risk_profile": {
+      "max_profit": "total net credit from both spreads",
+      "max_loss": "width of wider spread minus total net credit (one side only)",
+      "defined_risk": true,
+      "assignment_risk": "low"
+    },
+    "entry_conditions": [
+      "neutral/rangebound market outlook",
+      "IV rank elevated vs historical (prefer IV rank > 30%)",
+      "short strikes outside expected 1-standard-deviation move",
+      "both short strikes OTM at entry",
+      "credit >= 30-33% of spread width",
+      "no major catalyst events within DTE window"
+    ],
+    "exit_rules": [
+      "close at 50% of max profit to eliminate gamma risk",
+      "close full position if net loss exceeds 2x initial credit received",
+      "manage individual threatened wing before full position close"
+    ],
+    "adjustment_rules": [
+      "roll threatened wing further OTM and/or further out in time",
+      "if both wings threatened (vol spike), close entire position — do not fight large directional move",
+      "never widen a losing spread — max loss must not increase on adjustment"
+    ],
+    "failure_modes": [
+      "sharp directional move through either short strike",
+      "IV spike after entry (negative vega)",
+      "overnight gap risk from macro or earnings event",
+      "pin risk at short strikes near expiration"
+    ],
+    "evidence": {
+      "finding_summary": "DERA (2024): iron condors are predominantly sold in ETP options. Cohen: intermediate proficiency, defined-risk version of short straddle. Strictly preferred over short strangle from capital-preservation standpoint.",
+      "sample_period": "2016-2018 (DERA)",
+      "notes": "Cohen lower breakeven = short_put_strike - net_credit; upper breakeven = short_call_strike + net_credit. Iron condor = bull put spread + bear call spread on same underlying/expiry."
+    },
+    "model_features": [
+      "iv_rank_at_entry",
+      "vix_level",
+      "expected_move_1sd",
+      "distance_short_put_to_spot",
+      "distance_short_call_to_spot",
+      "net_credit_as_pct_of_spread_width",
+      "adx_value",
+      "underlying_realized_vol_20d",
+      "days_to_nearest_catalyst"
+    ],
+    "confidence": 0.95
+  },
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Short Strangle",
+    "strategy_family": "neutral",
+    "market_bias": "neutral",
+    "market_regime": ["range_bound", "high_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "call", "strike": "OTM", "qty": 1},
+        {"action": "sell", "type": "put", "strike": "OTM", "qty": 1}
+      ],
+      "position_type": "credit",
+      "dte_range": "30-45 days"
+    },
+    "greeks": {
+      "delta": "near zero at initiation",
+      "gamma": "strongly negative",
+      "theta": "strongly positive",
+      "vega": "strongly negative (largest risk factor)"
+    },
+    "risk_profile": {
+      "max_profit": "total premium received from both legs",
+      "max_loss": "unlimited on upside; downside limited by underlying going to zero",
+      "defined_risk": false,
+      "assignment_risk": "high"
+    },
+    "entry_conditions": [
+      "neutral outlook; underlying expected to remain in range",
+      "high IV environment — IV must be elevated vs history",
+      "short strikes outside expected 1-standard-deviation move",
+      "underlying not in strong trend (ADX < 25 preferred)"
+    ],
+    "exit_rules": [
+      "close at 50% of max profit",
+      "close or roll if either short strike is approached",
+      "hard stop if loss exceeds 2x credit received"
+    ],
+    "adjustment_rules": [
+      "roll threatened leg further OTM and/or out in time",
+      "convert to iron condor by adding long wings if IV spikes unexpectedly"
+    ],
+    "failure_modes": [
+      "large directional move through either short strike — undefined loss",
+      "IV spike inflates both short legs simultaneously",
+      "margin call risk due to undefined risk profile",
+      "entering in low IV — premium insufficient to justify undefined risk"
+    ],
+    "evidence": {
+      "finding_summary": "Cohen: advanced proficiency due to unlimited risk. DERA (2024): strangles are predominantly sold in ETP options but represent only ~6% of complex volume. Iron condor strictly preferred from risk perspective.",
+      "sample_period": "2016-2018 (DERA)",
+      "notes": "Upper breakeven = call_strike + total_premium; lower breakeven = put_strike - total_premium. Cohen rates as advanced due to uncapped risk."
+    },
+    "model_features": [
+      "iv_rank_at_entry",
+      "vix_level",
+      "adx_value",
+      "realized_vol_20d",
+      "iv_vs_rv_ratio",
+      "distance_short_put_to_spot",
+      "distance_short_call_to_spot"
+    ],
+    "confidence": 0.93
+  },
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Short Straddle",
+    "strategy_family": "neutral",
+    "market_bias": "neutral",
+    "market_regime": ["range_bound", "high_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "call", "strike": "ATM", "qty": 1},
+        {"action": "sell", "type": "put", "strike": "ATM (same as call)", "qty": 1}
+      ],
+      "position_type": "credit",
+      "dte_range": "30 days or less"
+    },
+    "greeks": {
+      "delta": "near zero at initiation",
+      "gamma": "strongly negative (peaks at ATM)",
+      "theta": "strongly positive",
+      "vega": "strongly negative"
+    },
+    "risk_profile": {
+      "max_profit": "total premium received",
+      "max_loss": "unlimited upside; strike minus premium to downside",
+      "defined_risk": false,
+      "assignment_risk": "high"
+    },
+    "entry_conditions": [
+      "strongly neutral outlook",
+      "very high IV environment",
+      "underlying at or near ATM strike"
+    ],
+    "exit_rules": [
+      "close at 50% of max profit",
+      "close immediately on large directional move"
+    ],
+    "adjustment_rules": [
+      "convert to strangle by moving strikes OTM",
+      "add wings to convert to iron butterfly (defined risk)"
+    ],
+    "failure_modes": [
+      "any large directional move — most painful options position on a gap",
+      "ATM strikes mean delta shifts rapidly in either direction",
+      "IV spike doubles pain (both legs expand)"
+    ],
+    "evidence": {
+      "finding_summary": "Cohen: advanced proficiency. Higher premium than strangle but much tighter profit zone. ATM gamma is highest — position most sensitive to moves near strike.",
+      "sample_period": null,
+      "notes": "Upper breakeven = ATM_strike + total_premium; lower breakeven = ATM_strike - total_premium. Cohen rates as advanced/expert."
+    },
+    "model_features": [
+      "iv_rank_at_entry",
+      "vix_level",
+      "realized_vol_20d",
+      "adx_value",
+      "days_to_catalyst"
+    ],
+    "confidence": 0.90
+  },
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Calendar Call (Time Spread)",
+    "strategy_family": "income",
+    "market_bias": "bullish",
+    "market_regime": ["range_bound", "low_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "call", "strike": "ATM or slight OTM", "expiry": "near-term front month"},
+        {"action": "buy", "type": "call", "strike": "same strike", "expiry": "further out back month"}
+      ],
+      "position_type": "debit",
+      "dte_range": "sell near-term; buy further out"
+    },
+    "greeks": {
+      "delta": "slightly positive (mildly bullish)",
+      "gamma": "net negative (short near-term gamma)",
+      "theta": "positive (front month decays faster than back month)",
+      "vega": "positive (long vega — benefits from IV increase, unlike most income strategies)"
+    },
+    "risk_profile": {
+      "max_profit": "when underlying is at strike at front-month expiry (max time value differential)",
+      "max_loss": "net debit paid",
+      "defined_risk": true,
+      "assignment_risk": "medium"
+    },
+    "entry_conditions": [
+      "mildly bullish or neutral outlook",
+      "low IV environment (long vega benefits from subsequent IV expansion)",
+      "underlying near strike at entry"
+    ],
+    "exit_rules": [
+      "close near front-month expiry",
+      "sell back month if position achieves profit target"
+    ],
+    "adjustment_rules": [
+      "roll front-month short leg to next expiry if underlying has not moved"
+    ],
+    "failure_modes": [
+      "large move away from strike collapses time-value differential",
+      "IV crush after entry reduces back-month value"
+    ],
+    "evidence": {
+      "finding_summary": "DERA (2024): calendar spreads account for 22% of stock complex volume and 12% of ETP complex volume. Primary use is rolling expiring positions, not harvesting payoff. Near leg of calendar predominantly closes existing positions; far leg opens new ones.",
+      "sample_period": "2016-2018 (DERA)",
+      "notes": "Unique among income strategies: positive vega. Cohen: intermediate proficiency."
+    },
+    "model_features": [
+      "iv_rank_at_entry",
+      "iv_term_structure_slope",
+      "distance_underlying_to_strike",
+      "dte_front_month",
+      "dte_back_month"
+    ],
+    "confidence": 0.88
+  },
+  {
+    "source_title": "The Bible of Options Strategies",
+    "source_type": "book",
+    "strategy_name": "Diagonal Call",
+    "strategy_family": "income",
+    "market_bias": "bullish",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "call", "strike": "near OTM", "expiry": "near-term"},
+        {"action": "buy", "type": "call", "strike": "different (further OTM)", "expiry": "further out"}
+      ],
+      "position_type": "debit",
+      "dte_range": "sell near-term; buy longer-dated"
+    },
+    "greeks": {
+      "delta": "positive",
+      "gamma": "net negative near-term",
+      "theta": "positive",
+      "vega": "positive (net long)"
+    },
+    "risk_profile": {
+      "max_profit": "variable — depends on both strike and expiry movement",
+      "max_loss": "net debit paid",
+      "defined_risk": true,
+      "assignment_risk": "medium"
+    },
+    "entry_conditions": [
+      "bullish outlook with expectation underlying stays below short call strike near-term",
+      "IV term structure in contango (near-term IV lower than far-term)"
+    ],
+    "exit_rules": [
+      "roll short leg repeatedly at expiry",
+      "close both legs if underlying rallies above short strike"
+    ],
+    "adjustment_rules": [
+      "roll short leg up and out if underlying approaches short strike"
+    ],
+    "failure_modes": [
+      "underlying rallies sharply through short strike",
+      "IV collapse reduces back-month value"
+    ],
+    "evidence": {
+      "finding_summary": "DERA (2024): diagonal spreads account for part of the 57% spread complex volume in ETPs. Volume spikes when underlying makes large move — primarily used to roll strikes away from spot.",
+      "sample_period": "2016-2018 (DERA)",
+      "notes": "Cohen: intermediate proficiency. DERA: diagonal near leg closes existing position; far leg opens new position."
+    },
+    "model_features": [
+      "iv_term_structure_slope",
+      "delta_of_short_leg",
+      "underlying_trend_direction",
+      "dte_near_leg",
+      "dte_far_leg"
+    ],
+    "confidence": 0.85
+  },
+  {
+    "source_title": "Simple Roles for Complex Options (DERA Working Paper)",
+    "source_type": "study",
+    "strategy_name": "ETP Vertical Spread Dominance Finding",
+    "strategy_family": "income",
+    "market_bias": "unknown",
+    "market_regime": ["unknown"],
+    "structure": {
+      "legs": [],
+      "position_type": "spread",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": true,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [],
+    "exit_rules": [],
+    "adjustment_rules": [],
+    "failure_modes": [],
+    "evidence": {
+      "finding_summary": "Vertical spreads (call and put combined) account for 34% of ETP complex options volume; all spread types (vertical, calendar, diagonal, vertical ratio, roll) account for 57% of ETP complex volume. Straddles/strangles/butterflies/condors combined = max 6% of ETP complex volume. ETPs have higher complex ratio (36%) than stocks (24%). HYG complex ratio = 65%, SLV = 14% (lowest).",
+      "sample_period": "2016-01-04 to 2018-12-31",
+      "notes": "Sample: top 30 stock + 30 ETP options classes by volume. Data: OPRA intraday + OptionMetrics. OTM-OTM is most common vertical configuration; ITM-ITM is least common."
+    },
+    "model_features": [
+      "complex_ratio_of_underlying (proxy for adjustment activity)",
+      "etp_vs_stock_flag (ETPs have structurally higher complex volume)",
+      "otm_both_legs_flag (most common configuration)",
+      "underlying_price_level (higher price -> higher complex ratio)"
+    ],
+    "confidence": 0.97
+  },
+  {
+    "source_title": "Simple Roles for Complex Options (DERA Working Paper)",
+    "source_type": "study",
+    "strategy_name": "Rolling Trigger: Moneyness-Based Adjustment",
+    "strategy_family": "income",
+    "market_bias": "unknown",
+    "market_regime": ["unknown"],
+    "structure": {
+      "legs": [],
+      "position_type": "spread",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [],
+    "exit_rules": [],
+    "adjustment_rules": [
+      "primary trigger for rolling is moneyness change — short strike approaching ITM — not DTE alone",
+      "call spread volume increases with positive underlying returns (short call strike threatened)",
+      "put spread volume increases with negative underlying returns (short put strike threatened)",
+      "near-expiry calendar/diagonal legs predominantly close existing positions; far legs open new ones",
+      "calendar/diagonal volume spikes on expiration week (35% near leg expiring same Friday on Monday, 50% by Friday)"
+    ],
+    "failure_modes": [
+      "rolling driven by DTE alone (without moneyness trigger) does not reflect empirical market behavior",
+      "rolling a losing position to wider strikes increases max loss — never widen a spread on adjustment"
+    ],
+    "evidence": {
+      "finding_summary": "Call spread volume is positively and put spread volume is negatively related to recent underlying returns (8 predictive regressions, stock and ETP samples, class and date fixed effects). ITM leg closes, OTM leg opens in vertical adjustments. Calendar near leg closes, far leg opens. This mechanism — not payoff harvesting — is the primary driver of complex options volume.",
+      "sample_period": "2016-2018",
+      "notes": "Regression results statistically significant at class and date fixed effects level. Pattern consistent across stocks and ETPs."
+    },
+    "model_features": [
+      "delta_of_short_leg (primary roll trigger: exceeds threshold e.g. 0.40)",
+      "underlying_5d_return (predictive of which spread type is rolled)",
+      "dte_at_roll (secondary floor condition)",
+      "one_leg_itm_flag (strongest roll signal per DERA)",
+      "days_to_expiry_near_leg (expiry week spikes in calendar/diagonal rolls)"
+    ],
+    "confidence": 0.95
+  },
+  {
+    "source_title": "Simple Roles for Complex Options (DERA Working Paper)",
+    "source_type": "study",
+    "strategy_name": "ETP Put Skew and Volatility Selling",
+    "strategy_family": "neutral",
+    "market_bias": "neutral",
+    "market_regime": ["high_iv"],
+    "structure": {
+      "legs": [],
+      "position_type": "credit",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": "negative (vol sellers dominate strangles, iron condors, iron butterflies in ETPs)"
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [],
+    "exit_rules": [],
+    "adjustment_rules": [],
+    "failure_modes": [],
+    "evidence": {
+      "finding_summary": "ETP options skew toward puts (put volume > call volume for IWM, HYG, SPY, QQQ in both simple and complex trades) — consistent with investors using ETP options to hedge downside. In ETP volatility trades: strangles, iron condors, and iron butterflies are predominantly sold (negative vega initiation); straddles are more often bought (positive vega). Short premium on ETF puts sells into natural structural demand from hedgers.",
+      "sample_period": "2016-2018",
+      "notes": "Stock options skew toward calls (levered upside bets). ETP options skew toward puts (downside hedging). This structural asymmetry makes ETP put premium selling (ShortPutSpread, CSP) a flow-consistent strategy."
+    },
+    "model_features": [
+      "put_call_ratio_of_underlying",
+      "etp_flag",
+      "skew_metric (OTM put IV minus ATM IV)",
+      "vega_direction_of_initiating_flow"
+    ],
+    "confidence": 0.93
+  },
+  {
+    "source_title": "Simple Roles for Complex Options (DERA Working Paper)",
+    "source_type": "study",
+    "strategy_name": "Complex Order Execution Cost Finding",
+    "strategy_family": "income",
+    "market_bias": "unknown",
+    "market_regime": ["unknown"],
+    "structure": {
+      "legs": [],
+      "position_type": "spread",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "always use multi-leg complex orders — never leg into spreads separately"
+    ],
+    "exit_rules": [],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "legging into spreads separately can cost up to 83% more in transaction costs",
+      "S-LOB execution is costliest electronic complex protocol",
+      "C-LOB is middle ground; C-PIAs provide best price improvement"
+    ],
+    "evidence": {
+      "finding_summary": "Buying vertical spreads through complex orders rather than two single-leg trades saves up to 83% on transaction costs (Li, Musto and Pearson, 2023). C-PIAs provide best price improvement among electronic protocols. C-LOB is more cost-effective than S-LOB for complex orders.",
+      "sample_period": "2016-2018",
+      "notes": "This applies directly to bot execution: multi-leg limit orders are required, never leg separately."
+    },
+    "model_features": [
+      "execution_protocol_type",
+      "bid_ask_spread_net_vs_per_leg",
+      "slippage_on_complex_vs_single_leg"
+    ],
+    "confidence": 0.95
+  },
+  {
+    "source_title": "The U.S. Treasury Yield Curve: 1961 to the Present (Fed FEDS 2006-28)",
+    "source_type": "study",
+    "strategy_name": "Yield Curve Slope as Macro Regime Filter",
+    "strategy_family": "macro",
+    "market_bias": "unknown",
+    "market_regime": ["macro_stress", "trend"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "yield curve slope (10y minus 2y) > 0: normal/steepening — standard premium selling allowed",
+      "yield curve slope near zero or flattening: elevated macro risk — tighten IV and delta requirements",
+      "yield curve inverted (2y > 10y, T10Y2Y < 0): recession risk elevated — maximum selectivity, reduce position sizing"
+    ],
+    "exit_rules": [
+      "rapid curve inversion (flattening > 50bps in 30 days) is a macro stress signal — reduce exposure"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "ignoring curve inversion as a regime signal — yield curve inversion preceded every US recession since 1961",
+      "treating yield curve data as static — curve updates daily"
+    ],
+    "evidence": {
+      "finding_summary": "GSW model produces daily Treasury yield curve estimates from 1961 to present using Nelson-Siegel-Svensson smoothing. Data available via Federal Reserve website (updated daily) and FRED. Key FRED tickers: T10Y2Y (10y-2y spread), DGS2, DGS5, DGS10, DGS3MO, T10Y3M.",
+      "sample_period": "1961-06-14 to 2006 (updated continuously)",
+      "notes": "Yield curve inversion has preceded every US recession since 1961. Bot already consumes T10Y2Y via FRED for credit regime signal. No new data integration required — methodology paper only."
+    },
+    "model_features": [
+      "T10Y2Y (10y minus 2y spread — primary slope metric)",
+      "T10Y3M (10y minus 3m spread — alternative inversion signal)",
+      "yield_curve_slope_30d_change (steepening/flattening velocity)",
+      "inversion_flag (T10Y2Y < 0)",
+      "deep_inversion_flag (T10Y2Y < -0.50)"
+    ],
+    "confidence": 0.92
+  },
+  {
+    "source_title": "The U.S. Treasury Yield Curve: 1961 to the Present (Fed FEDS 2006-28)",
+    "source_type": "study",
+    "strategy_name": "Yield Curve Forward Rate as Macro Stress Signal",
+    "strategy_family": "macro",
+    "market_bias": "unknown",
+    "market_regime": ["macro_stress"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "negative term premium (investors accepting lower yield for safety) — risk-off macro regime",
+      "near-term forward rates above long-term forward rates — inversion signal"
+    ],
+    "exit_rules": [],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "relying solely on on-the-run Treasury yields (GSW uses off-the-run to avoid liquidity premium distortion)"
+    ],
+    "evidence": {
+      "finding_summary": "GSW model provides instantaneous forward rates and n-by-m forward rates for any maturity. Term premium embedded in yield curve: when negative, investors prefer safety — risk-off signal. Off-the-run yield curve used to avoid on-the-run liquidity premium distortion.",
+      "sample_period": "1961 to present",
+      "notes": "Daily frequency. Forward rates available from the Fed website. Advanced macro signal — term premium extraction requires GSW model output not currently pulled by bot."
+    },
+    "model_features": [
+      "term_premium_estimate",
+      "1y1y_forward_rate",
+      "5y5y_forward_rate",
+      "forward_curve_inversion_flag"
+    ],
+    "confidence": 0.85
+  },
+  {
+    "source_title": "Technical Analysis for Options Trading (Fidelity Investments Webinar)",
+    "source_type": "guide",
+    "strategy_name": "Bollinger Band Squeeze as Regime Filter",
+    "strategy_family": "neutral",
+    "market_bias": "unknown",
+    "market_regime": ["range_bound", "event_risk"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "wide Bollinger Bands (expanded bandwidth) = elevated vol = favorable for short premium entry",
+      "narrow Bollinger Bands (squeeze = bandwidth at multi-week low) = do NOT enter iron condor or short strangle — large move imminent"
+    ],
+    "exit_rules": [
+      "BB expansion after position entry signals vol risk to short positions — consider early close"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "entering short-premium position during BB squeeze — underlying about to break out",
+      "BB width is backward-looking — does not predict direction of breakout, only imminence"
+    ],
+    "evidence": {
+      "finding_summary": "Fidelity guide identifies Bollinger Bands as one of five key TA concepts for options traders. Squeeze (narrow bands) precedes large moves — adverse for short-premium (negative vega) strategies. Wide bands indicate elevated recent realized vol — favorable environment for premium selling.",
+      "sample_period": null,
+      "notes": "Standard: 20-period SMA ± 2 standard deviations. Bandwidth = (upper band - lower band) / middle band."
+    },
+    "model_features": [
+      "bb_bandwidth (primary squeeze metric)",
+      "bb_bandwidth_percentile_52w (normalized squeeze signal)",
+      "bb_price_position (underlying at upper/lower band = overextended)",
+      "bb_expansion_flag"
+    ],
+    "confidence": 0.88
+  },
+  {
+    "source_title": "Technical Analysis for Options Trading (Fidelity Investments Webinar)",
+    "source_type": "guide",
+    "strategy_name": "Trend + Support/Resistance for Strike Selection",
+    "strategy_family": "directional",
+    "market_bias": "unknown",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [],
+      "position_type": "unknown",
+      "dte_range": null
+    },
+    "greeks": {
+      "delta": null,
+      "gamma": null,
+      "theta": null,
+      "vega": null
+    },
+    "risk_profile": {
+      "max_profit": null,
+      "max_loss": null,
+      "defined_risk": null,
+      "assignment_risk": "unknown"
+    },
+    "entry_conditions": [
+      "uptrend (higher highs + higher lows): favor bullish strategies — CSP, ShortPutSpread; place short put strike at or below support",
+      "downtrend (lower highs + lower lows): favor bearish strategies — ShortCallSpread; place short call strike at or above resistance",
+      "sideways trend: favor neutral strategies — IronCondor, ShortStrangle; short strikes outside S/R boundaries",
+      "moving average crossover (e.g. 50-day crosses above 200-day) confirms trend regime shift"
+    ],
+    "exit_rules": [
+      "adverse trend change post-entry is a signal for early exit or adjustment",
+      "underlying breaching moving average support = risk trigger for bullish short-put positions"
+    ],
+    "adjustment_rules": [
+      "if support breaks post-entry on ShortPutSpread, roll short leg to new support level"
+    ],
+    "failure_modes": [
+      "entering a trend-based strategy in a rangebound market (ADX < 20) — false signals",
+      "using only one TA indicator without confirmation from trend context",
+      "TA patterns are never mechanically precise — require contextual interpretation"
+    ],
+    "evidence": {
+      "finding_summary": "Fidelity guide: trend direction defines strategy bias; support/resistance defines strike placement. Technical analysis is the key interface between price action and options strike selection. Key rule: trend is assumed to continue rather than reverse.",
+      "sample_period": null,
+      "notes": "Five core concepts: trends, support/resistance, moving averages, breakouts, Bollinger Bands. Strike selection is primary application for options traders."
+    },
+    "model_features": [
+      "trend_direction (up/down/sideways based on highs/lows)",
+      "adx_value (trend strength; > 25 = trending, < 20 = rangebound)",
+      "sma_50_200_crossover_signal",
+      "price_distance_to_support (for put spread strike selection)",
+      "price_distance_to_resistance (for call spread strike selection)",
+      "price_relative_to_sma_200 (long-term regime)"
+    ],
+    "confidence": 0.87
+  },
+  {
+    "source_title": "25 Proven Strategies for Trading Options on CME Group Futures",
+    "source_type": "guide",
+    "strategy_name": "Short Put (Futures Options)",
+    "strategy_family": "income",
+    "market_bias": "bullish",
+    "market_regime": ["trend", "range_bound"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "put", "strike": "OTM below current futures price", "qty": 1}
+      ],
+      "position_type": "credit",
+      "dte_range": "near-term"
+    },
+    "greeks": {
+      "delta": "positive",
+      "gamma": "negative",
+      "theta": "positive",
+      "vega": "negative"
+    },
+    "risk_profile": {
+      "max_profit": "put premium received",
+      "max_loss": "substantial as market falls (futures to zero)",
+      "defined_risk": false,
+      "assignment_risk": "high"
+    },
+    "entry_conditions": [
+      "bullish on futures market",
+      "uncertain about volatility"
+    ],
+    "exit_rules": [
+      "buy back if market falls through stop",
+      "let expire worthless if market remains above strike"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "futures market drops sharply through strike",
+      "no early assignment risk for American-style futures options vs equity options"
+    ],
+    "evidence": {
+      "finding_summary": "CME booklet: strategy #10. Decay characteristics: positive (time decay helps). Pattern evolution diagrams show position at 4 months, 1 month, expiry.",
+      "sample_period": null,
+      "notes": "Futures options — no early assignment risk (European-style settlement). Mechanically similar to equity short put but different margin treatment. Synthetics: long call A + short call A (synthetic long futures) is equivalent."
+    },
+    "model_features": [
+      "market_trend_direction",
+      "dte_at_entry",
+      "delta_of_short_put"
+    ],
+    "confidence": 0.82
+  },
+  {
+    "source_title": "25 Proven Strategies for Trading Options on CME Group Futures",
+    "source_type": "guide",
+    "strategy_name": "Short Strangle (Futures Options)",
+    "strategy_family": "neutral",
+    "market_bias": "neutral",
+    "market_regime": ["range_bound", "high_iv"],
+    "structure": {
+      "legs": [
+        {"action": "sell", "type": "call", "strike": "OTM", "qty": 1},
+        {"action": "sell", "type": "put", "strike": "OTM", "qty": 1}
+      ],
+      "position_type": "credit",
+      "dte_range": "near-term"
+    },
+    "greeks": {
+      "delta": "near zero",
+      "gamma": "strongly negative",
+      "theta": "strongly positive",
+      "vega": "strongly negative"
+    },
+    "risk_profile": {
+      "max_profit": "total premium received",
+      "max_loss": "unlimited in either direction",
+      "defined_risk": false,
+      "assignment_risk": "high"
+    },
+    "entry_conditions": [
+      "neutral market outlook",
+      "uncertain about direction but expecting range-bound behavior",
+      "high IV environment"
+    ],
+    "exit_rules": [
+      "buy back both legs if either strike is breached",
+      "let expire worthless if market remains within range"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "large directional move in either direction",
+      "IV spike after entry"
+    ],
+    "evidence": {
+      "finding_summary": "CME booklet: strategy #20. Wider profit zone than short straddle but less premium. Pattern evolution shows position value decaying toward max profit at expiry if underlying remains between strikes.",
+      "sample_period": null,
+      "notes": "Futures version: no early assignment, cash-settled. Mechanically identical to equity short strangle in concept. Breakeven: upper = call_strike + total_premium; lower = put_strike - total_premium."
+    },
+    "model_features": [
+      "iv_rank_at_entry",
+      "distance_strikes_to_spot",
+      "realized_vol_20d"
+    ],
+    "confidence": 0.80
+  },
+  {
+    "source_title": "25 Proven Strategies for Trading Options on CME Group Futures",
+    "source_type": "guide",
+    "strategy_name": "Bull Spread (Futures Options)",
+    "strategy_family": "directional",
+    "market_bias": "bullish",
+    "market_regime": ["trend"],
+    "structure": {
+      "legs": [
+        {"action": "buy", "type": "call or put", "strike": "lower strike"},
+        {"action": "sell", "type": "call or put", "strike": "higher strike"}
+      ],
+      "position_type": "spread",
+      "dte_range": "near-term to medium"
+    },
+    "greeks": {
+      "delta": "positive",
+      "gamma": "positive near lower strike, negative near higher",
+      "theta": "variable",
+      "vega": "variable (depends on net position)"
+    },
+    "risk_profile": {
+      "max_profit": "spread width minus net cost (call debit) or net credit (put credit)",
+      "max_loss": "net debit (call debit spread) or spread width minus credit (put credit spread)",
+      "defined_risk": true,
+      "assignment_risk": "low"
+    },
+    "entry_conditions": [
+      "bullish on futures market"
+    ],
+    "exit_rules": [
+      "let expire if profitable at expiry",
+      "close early if significant profit achieved"
+    ],
+    "adjustment_rules": [],
+    "failure_modes": [
+      "market fails to rally above lower strike — full debit lost"
+    ],
+    "evidence": {
+      "finding_summary": "CME booklet: strategy #11. Can be implemented as call debit spread (long lower call, short higher call) or put credit spread (short higher put, long lower put). Pattern evolution shows profit zone development as expiry approaches.",
+      "sample_period": null,
+      "notes": "CME context is futures options. Directly analogous to equity bull call spread / bull put spread."
+    },
+    "model_features": [
+      "underlying_trend_direction",
+      "delta_of_long_leg",
+      "spread_width_as_pct_of_underlying"
+    ],
+    "confidence": 0.78
+  }
+]
