@@ -1472,6 +1472,24 @@ class TestPaperBroker(unittest.TestCase):
         snap = self.broker.get_option_snapshots(["SPY260620C00580000"])
         self.assertIn("SPY260620C00580000", snap)
 
+    def test_get_positions_asset_class_is_plain_string(self):
+        """asset_class must be the raw value string 'us_option', never the
+        enum repr 'AssetClass.US_OPTION'.  Regression test for the bug where
+        str(AlpacaAssetClass.US_OPTION) returns 'AssetClass.US_OPTION' in
+        alpaca-py 0.43.x, causing every asset_class == 'us_option' filter to
+        silently return zero results (reconcile, monitor, position cap)."""
+        self.broker.submit(self.order)
+        positions = self.broker.get_positions()
+        self.assertGreater(len(positions), 0, "expected at least one position")
+        for pos in positions:
+            ac = pos.get("asset_class", "")
+            self.assertEqual(
+                ac, "us_option",
+                f"asset_class should be 'us_option', got {repr(ac)}. "
+                "Fix: use getattr(pos.asset_class, 'value', str(pos.asset_class)) "
+                "in AlpacaBroker.get_positions()."
+            )
+
 
 # ---------------------------------------------------------------------------
 # Test: AlpacaBroker raises without credentials
