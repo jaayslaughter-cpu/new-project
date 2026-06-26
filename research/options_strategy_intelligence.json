@@ -1,0 +1,800 @@
+{
+  "extraction_metadata": {
+    "task": "Options strategy intelligence extraction for trading research database",
+    "source_documents": 5,
+    "extraction_date": "2026-06-26",
+    "schema_version": "1.0"
+  },
+  "documents": [
+    {
+      "id": "dera_2024",
+      "title": "Simple Roles for Complex Options",
+      "authors": [
+        "Su Li (U.S. Securities and Exchange Commission)",
+        "David K. Musto (Wharton School, University of Pennsylvania)",
+        "Neil D. Pearson (University of Illinois at Urbana-Champaign)"
+      ],
+      "year": 2024,
+      "first_draft": "2022-11-18",
+      "type": "study",
+      "publisher": "DERA Working Paper Series, U.S. Securities and Exchange Commission",
+      "jel_codes": ["G13", "G23", "G24"],
+      "sample_period": {
+        "primary": "2016-01-04 to 2018-12-31",
+        "splits_analysis": "2011-07 to 2021-12"
+      },
+      "data_sources": [
+        "OPRA (Options Price Reporting Authority) intraday trade data via MDR (CBOE subsidiary)",
+        "OptionMetrics end-of-day data via WRDS"
+      ],
+      "universe": {
+        "stocks": "31 stock options classes (top 30 by volume + Alphabet GOOG/GOOGL)",
+        "etps": "30 ETP options classes (top 30 by volume)",
+        "notable_etps": ["SPY", "QQQ", "IWM", "HYG", "GLD", "SLV", "XLF", "EEM", "TLT", "VXX"]
+      },
+      "strategies_studied": [
+        "Vertical spread (call and put)",
+        "Vertical ratio spread",
+        "Vertical roll",
+        "Calendar spread (call and put)",
+        "Diagonal spread",
+        "Straddle",
+        "Strangle",
+        "Butterfly (long and iron)",
+        "Iron condor",
+        "Buy-write (covered call)"
+      ],
+      "major_findings": [
+        {
+          "finding": "Vertical spreads dominate complex options volume",
+          "detail": "Simple vertical call and put spreads comprise 36% of stock complex volume and 34% of ETP complex volume. All spread types combined (vertical, calendar, diagonal, vertical ratio, vertical roll) account for 66% of stock complex volume and 57% of ETP complex volume.",
+          "implication_for_bot": "Validates ShortPutSpread and ShortCallSpread as primary strategy focus — these are the most traded complex structures in the ETP universe."
+        },
+        {
+          "finding": "Volatility trades are a small fraction of complex volume",
+          "detail": "Straddles, strangles, butterflies, iron butterflies, and iron condors combined account for at most 6% of complex volume for both stocks and ETPs. Even counting ambiguous straddle/combination trades, the maximum is 16%.",
+          "implication_for_bot": "ShortStrangle as secondary strategy is correctly subordinate; iron condor as gated strategy is appropriate given low market prevalence."
+        },
+        {
+          "finding": "ETP options have higher complex ratios than stock options",
+          "detail": "Complex trades account for 36% of ETP option volume versus 24% of stock option volume. HYG had the highest complex ratio at 65%; SLV the lowest at 14%.",
+          "implication_for_bot": "ETF universe experiences more complex/spread activity than single stocks — liquidity in spread execution is structurally higher for the bot's universe."
+        },
+        {
+          "finding": "ETP options skew toward puts; stock options skew toward calls",
+          "detail": "Simple and complex put volumes exceed call volumes for many ETP classes, especially IWM, HYG, SPY, and QQQ. Stock options tend strongly toward calls. Consistent with investors using index/ETP options primarily to hedge downside.",
+          "implication_for_bot": "ShortPutSpread as primary strategy is consistent with the dominant directional flow in ETP options; the bot is selling into the dominant demand."
+        },
+        {
+          "finding": "Primary motivation for spread trades is position adjustment (rolling), not payoff harvesting",
+          "detail": "Most spread trades close one simple position and open another — adjusting strike or expiration after moneyness change. Call spread volume is positively predicted by recent positive returns; put spread volume by recent negative returns. Near-expiry calendar and diagonal legs predominantly close existing positions; far legs open new ones.",
+          "implication_for_bot": "When rolling is built (post-30-trade milestone), the primary trigger should be moneyness change (short leg approaching ITM), not DTE threshold alone. DTE-only triggers miss the primary mechanism driving real rolling behavior."
+        },
+        {
+          "finding": "OTM-OTM is the most common vertical spread configuration; ITM-ITM is least common",
+          "detail": "Both legs OTM is the most frequent moneyness bucket for vertical and vertical ratio spreads, consistent with either pushing strikes further OTM or entering for capped-loss directional bets. Both legs ITM is rare.",
+          "implication_for_bot": "OTM delta targets (short leg ~0.15-0.25 delta) for ShortPutSpread and ShortCallSpread are consistent with market norms."
+        },
+        {
+          "finding": "Complex volume increases with underlying price (budget constraint effect)",
+          "detail": "Higher-priced underlyings have higher complex ratios. After stock splits (exogenous price reduction), complex ratios drop significantly and proportionally to split factor. Causal evidence that absolute price drives investors toward spreads to reduce capital outlay.",
+          "implication_for_bot": "Confirms that spread structures are preferred over simple options for higher-priced ETFs even beyond risk management — capital efficiency is a real driver."
+        },
+        {
+          "finding": "Volatility sellers dominate strangles and iron condors in ETP options",
+          "detail": "In ETP options, strangles, butterflies, iron condors, and iron butterflies are associated more with position-opening in the selling direction (negative vega initiation). Straddles are more often bought (positive vega).",
+          "implication_for_bot": "Short strangle (ShortStrangle) and short iron condor (IronCondor) are consistent with the dominant institutional flow in ETP volatility trades."
+        },
+        {
+          "finding": "Calendar/diagonal spread volume spikes around expiration week",
+          "detail": "35% of calendar/diagonal trades have their near leg expiring that same Friday on Monday; this rises to 50% by Friday. Consistent with end-of-week rolling of expiring positions.",
+          "implication_for_bot": "EOD cleanup logic (3:45 PM scan) and expiration monitoring are structurally sound. High near-expiry roll volume confirms importance of position monitoring near expiry."
+        },
+        {
+          "finding": "Transaction costs strongly favor complex order routing over leg-by-leg execution",
+          "detail": "Buying vertical spreads through complex orders rather than two single-leg trades can save up to 83% on transaction costs (Li, Musto and Pearson, 2023). C-PIAs (complex price improvement auctions) provide best execution among electronic protocols.",
+          "implication_for_bot": "Multi-leg limit orders (as currently implemented via Alpaca 2-leg orders) are the correct execution approach — never leg into spreads separately."
+        }
+      ],
+      "practical_implications": [
+        "Vertical spreads are the dominant real-world complex strategy — bot's primary strategy choice is empirically validated",
+        "Rolling trigger should be moneyness-based (short leg approaching ITM) not DTE-only",
+        "ETP put skew means ShortPutSpread sells into natural structural demand",
+        "OTM-OTM configuration is market norm — current delta targeting is appropriate",
+        "Multi-leg order routing is essential for cost efficiency; never leg into spreads separately",
+        "Iron condor activation (gated) is consistent with institutional ETP strangle/condor selling behavior",
+        "High HYG complex ratio (65%) warrants monitoring that spread liquidity is adequate pre-trade"
+      ]
+    },
+    {
+      "id": "cohen_2005",
+      "title": "The Bible of Options Strategies: The Definitive Guide for Practical Trading Strategies",
+      "authors": ["Guy Cohen"],
+      "year": 2005,
+      "isbn": "0-13-171066-4",
+      "publisher": "FT Press (Pearson Education)",
+      "type": "book",
+      "total_strategies": 58,
+      "chapters": [
+        "Ch1: Four Basic Strategies (Long/Short Call, Long/Short Put)",
+        "Ch2: Income Strategies (Covered Call, CSP, Bull Put Spread, Bear Call Spread, Iron Butterfly, Iron Condor, Calendar, Diagonal)",
+        "Ch3: Vertical Spreads (Bull Call, Bear Put, Ladders)",
+        "Ch4: Volatility Strategies (Straddle, Strangle, Strip, Strap, Butterflies, Condors)",
+        "Ch5: Sideways Strategies (Short Straddle, Short Strangle, Long Butterflies, Long Condors)",
+        "Ch6: Leveraged Strategies (Ratio Spreads, Backspreads)",
+        "Ch7: Synthetic Strategies (Collar, Synthetic Call/Put, Combos, Box)",
+        "Ch8: Taxation"
+      ],
+      "rules_of_thumb": [
+        "Time decay accelerates exponentially in the last 30 days before expiration — option sellers want to sell with ~30 DTE, option buyers want at least 90 DTE",
+        "ATM options have Delta of ~0.5 (calls) and ~-0.5 (puts) — Delta approximates probability of expiring ITM",
+        "Deep OTM and deep ITM options have near-zero Gamma — moneyness change risk is concentrated near the strike",
+        "Short options: positive Theta (time decay helps); long options: negative Theta (time decay hurts)",
+        "Short options: negative Vega (volatility rise hurts); long options: positive Vega (volatility rise helps)",
+        "Loss of opportunity is preferable to loss of capital (Cohen's core philosophy, citing DiNapoli)",
+        "Liquidity floor: underlying ADV > 500,000 shares; option open interest > 100 (preferably 500+)",
+        "Complex spreads eliminate unlimited risk compared to naked short options — prefer defined-risk structures",
+        "Rule of the Opposites: if time decay hurts buyers, it helps sellers; if volatility hurts sellers, it helps buyers",
+        "When buying options, longer-dated options cost less per month than shorter-dated — divide price by months remaining"
+      ],
+      "strategies": [
+        {
+          "name": "Short (Naked) Put / Cash-Secured Put",
+          "chapter": "1.4 / 2.2",
+          "category": "Income",
+          "direction_bias": "Bullish to neutral",
+          "proficiency": "Intermediate",
+          "volatility_preference": "Low (benefits from declining vol after entry)",
+          "risk_profile": "Capped (to strike - premium received), reward capped to premium",
+          "legs": [
+            {"action": "Sell", "type": "Put", "strike": "OTM or ATM", "expiry": "Near-term (~30 DTE)"}
+          ],
+          "max_profit": "Net premium received",
+          "max_loss": "Strike price minus premium received (if underlying goes to zero)",
+          "breakeven": "Strike minus premium received",
+          "greeks": {
+            "delta": "Positive (bullish exposure)",
+            "theta": "Positive (time decay helps seller)",
+            "vega": "Negative (rising vol hurts seller)"
+          },
+          "entry_rules": [
+            "Bullish or neutral market outlook",
+            "Willing to own the underlying at the strike price (cash-secured version)",
+            "Sell put with ~30 DTE or less to maximize theta capture",
+            "Select OTM strike to provide a buffer; ATM for higher premium"
+          ],
+          "exit_rules": [
+            "Let expire worthless if underlying stays above strike",
+            "Buy back early if position achieves 50-80% of max profit",
+            "Buy back to cut loss if underlying breaks key support"
+          ],
+          "adjustment_rules": [
+            "Roll down and out (sell new put at lower strike, further expiry) if position threatens assignment"
+          ],
+          "risk_notes": [
+            "If underlying goes to zero, loss = strike - premium. Not truly unlimited but can be very large.",
+            "Assignment risk if stock drops below strike — must be capitalized to buy 100 shares at strike",
+            "Earnings events can cause gap risk — avoid around earnings announcements"
+          ]
+        },
+        {
+          "name": "Bull Put Spread (Short Put Spread)",
+          "chapter": "2.3 / 3.3",
+          "category": "Income / Vertical Spread",
+          "direction_bias": "Bullish to neutral",
+          "proficiency": "Intermediate",
+          "volatility_preference": "Low (declining vol after entry)",
+          "risk_profile": "Capped risk and capped reward",
+          "legs": [
+            {"action": "Sell", "type": "Put", "strike": "Higher OTM strike (short strike)", "expiry": "Same expiry"},
+            {"action": "Buy", "type": "Put", "strike": "Lower OTM strike (long strike, protection)", "expiry": "Same expiry"}
+          ],
+          "max_profit": "Net premium received (credit)",
+          "max_loss": "Spread width minus net credit received",
+          "breakeven": "Short strike minus net credit",
+          "greeks": {
+            "delta": "Positive (net bullish)",
+            "theta": "Positive (time decay helps)",
+            "vega": "Negative (rising vol hurts)"
+          },
+          "entry_rules": [
+            "Bullish or neutral directional outlook on underlying",
+            "Elevated IV environment preferred (sell premium at higher prices)",
+            "Select short strike at or below key support level",
+            "Width of spread controls max loss — wider = more premium but more risk",
+            "~30 DTE preferred for theta capture balance"
+          ],
+          "exit_rules": [
+            "Let expire worthless if underlying stays above short strike",
+            "Close early at 50% of max profit to reduce gamma risk",
+            "Close/roll if underlying breaches short strike with meaningful DTE remaining"
+          ],
+          "adjustment_rules": [
+            "Roll the spread down and out (lower strikes, later expiry) if short strike threatened",
+            "Close losing leg first, then reopen at better strike if rolling"
+          ],
+          "risk_notes": [
+            "Max loss is defined at entry — capital risk is fixed",
+            "Early assignment risk on short put if it goes deep ITM (especially near ex-dividend)",
+            "Avoid entering into earnings events on the underlying"
+          ]
+        },
+        {
+          "name": "Bear Call Spread (Short Call Spread)",
+          "chapter": "2.4 / 3.4",
+          "category": "Income / Vertical Spread",
+          "direction_bias": "Bearish to neutral",
+          "proficiency": "Intermediate",
+          "volatility_preference": "Low (declining vol after entry)",
+          "risk_profile": "Capped risk and capped reward",
+          "legs": [
+            {"action": "Sell", "type": "Call", "strike": "Lower OTM strike (short strike)", "expiry": "Same expiry"},
+            {"action": "Buy", "type": "Call", "strike": "Higher OTM strike (long strike, protection)", "expiry": "Same expiry"}
+          ],
+          "max_profit": "Net premium received (credit)",
+          "max_loss": "Spread width minus net credit received",
+          "breakeven": "Short strike plus net credit",
+          "greeks": {
+            "delta": "Negative (net bearish)",
+            "theta": "Positive (time decay helps)",
+            "vega": "Negative (rising vol hurts)"
+          },
+          "entry_rules": [
+            "Bearish or neutral directional outlook",
+            "Select short strike at or above key resistance level",
+            "Elevated IV preferred",
+            "~30 DTE preferred"
+          ],
+          "exit_rules": [
+            "Let expire worthless if underlying stays below short strike",
+            "Close early at 50% of max profit",
+            "Close/roll if underlying rallies through short strike"
+          ],
+          "adjustment_rules": [
+            "Roll up and out if short strike is breached (higher strikes, later expiry)",
+            "Alternatively, close entire spread and accept loss"
+          ],
+          "risk_notes": [
+            "Max loss is defined — capital risk fixed at entry",
+            "Directional risk: underlying must not rally through short strike",
+            "Avoid entering into catalyst events (earnings, FOMC) on the underlying"
+          ]
+        },
+        {
+          "name": "Long Iron Condor (a.k.a. Iron Condor)",
+          "chapter": "2.6 / 5.11",
+          "category": "Income / Sideways",
+          "direction_bias": "Direction neutral (range-bound)",
+          "proficiency": "Intermediate",
+          "volatility_preference": "Low (declining vol strongly benefits — short vega)",
+          "risk_profile": "Capped risk and capped reward",
+          "legs": [
+            {"action": "Sell", "type": "Put", "strike": "OTM put short strike"},
+            {"action": "Buy", "type": "Put", "strike": "Lower OTM put long strike (protection)"},
+            {"action": "Sell", "type": "Call", "strike": "OTM call short strike"},
+            {"action": "Buy", "type": "Call", "strike": "Higher OTM call long strike (protection)"}
+          ],
+          "structure": "Bull put spread + bear call spread on same underlying and expiry",
+          "max_profit": "Total net premium received (both spreads combined)",
+          "max_loss": "Width of wider spread minus total net credit (loss on one side only, assuming non-overlapping wings)",
+          "breakeven": {
+            "lower": "Short put strike minus net credit",
+            "upper": "Short call strike plus net credit"
+          },
+          "profit_zone": "Underlying remains between the two short strikes at expiration",
+          "greeks": {
+            "delta": "Near zero at initiation (delta-neutral)",
+            "theta": "Positive (time decay helps both short legs)",
+            "vega": "Negative (rising vol is the primary risk — hurts both short legs)",
+            "gamma": "Negative (position loses money as underlying moves sharply in either direction)"
+          },
+          "entry_rules": [
+            "Neutral/rangebound market outlook",
+            "Elevated IV — ideally IV rank > 30% or VIX elevated vs. recent history",
+            "Select short strikes at meaningful support/resistance outside expected range",
+            "Short strikes typically 1-2 standard deviation OTM from current price",
+            "~30-45 DTE at entry",
+            "Aim for credit representing at least 30-33% of spread width"
+          ],
+          "exit_rules": [
+            "Close at 50% of max profit (take profit early to eliminate gamma risk)",
+            "Close entire position if net loss reaches 2x initial credit received (stop-loss)",
+            "Manage threatened side individually if one wing is approached"
+          ],
+          "adjustment_rules": [
+            "If one side is threatened, roll that spread further OTM and/or further out in time",
+            "If both sides threatened (vol spike), close entire position — do not fight a large directional move",
+            "Never roll a losing side to a wider spread — increases max loss"
+          ],
+          "risk_notes": [
+            "Primary risk is a sharp directional move or volatility spike — both are painful",
+            "Negative gamma means losses accelerate as underlying moves further from center",
+            "Earnings or macro events can cause overnight gap risk — avoid entering pre-event",
+            "At expiration, risk of pin risk near short strikes requires monitoring",
+            "Iron condor is strictly preferable to short strangle from risk perspective (defined vs. undefined loss)",
+            "Lower premium than short strangle for same strikes — tradeoff: safety vs. income"
+          ]
+        },
+        {
+          "name": "Short Strangle",
+          "chapter": "5.2",
+          "category": "Sideways / Income",
+          "direction_bias": "Direction neutral",
+          "proficiency": "Advanced",
+          "volatility_preference": "Low (must decline for max profit)",
+          "risk_profile": "Uncapped risk on both sides, capped reward",
+          "legs": [
+            {"action": "Sell", "type": "Call", "strike": "OTM call strike"},
+            {"action": "Sell", "type": "Put", "strike": "OTM put strike"}
+          ],
+          "max_profit": "Total premium received from both legs",
+          "max_loss": "Theoretically unlimited (upside unlimited; downside to underlying going to zero)",
+          "breakeven": {
+            "upper": "Call strike plus total premium received",
+            "lower": "Put strike minus total premium received"
+          },
+          "greeks": {
+            "delta": "Near zero at initiation",
+            "theta": "Strongly positive",
+            "vega": "Strongly negative (largest risk factor)"
+          },
+          "entry_rules": [
+            "Neutral outlook; underlying expected to remain in a range",
+            "High IV environment strongly preferred — IV should be elevated vs. history",
+            "Select OTM strikes outside expected 1 standard deviation move",
+            "~30-45 DTE preferred",
+            "Requires significant margin — undefined risk"
+          ],
+          "exit_rules": [
+            "Close at 50% of max profit",
+            "Close or roll if either strike is approached with meaningful DTE remaining",
+            "Hard stop if loss exceeds 2x credit received"
+          ],
+          "adjustment_rules": [
+            "Roll threatened leg further OTM and/or out in time",
+            "Convert to iron condor by adding long wings if vol spikes dramatically"
+          ],
+          "risk_notes": [
+            "Undefined risk — margin can balloon on a large move in either direction",
+            "Iron condor is strictly preferred from capital preservation standpoint",
+            "IV spike is the primary killer — entering in low-IV environments is extremely dangerous",
+            "Not suitable without careful position sizing and stop-loss discipline"
+          ]
+        },
+        {
+          "name": "Short Straddle",
+          "chapter": "5.1",
+          "category": "Sideways / Income",
+          "direction_bias": "Direction neutral",
+          "proficiency": "Advanced",
+          "volatility_preference": "Low (must decline for max profit)",
+          "risk_profile": "Uncapped risk, capped reward",
+          "legs": [
+            {"action": "Sell", "type": "Call", "strike": "ATM"},
+            {"action": "Sell", "type": "Put", "strike": "ATM (same strike as call)"}
+          ],
+          "max_profit": "Total premium received",
+          "max_loss": "Unlimited upside; strike minus total premium to downside",
+          "breakeven": {
+            "upper": "Strike plus total premium",
+            "lower": "Strike minus total premium"
+          },
+          "risk_notes": [
+            "Higher premium than strangle but much tighter profit zone",
+            "Extreme negative gamma — painful on any large move",
+            "ATM position means delta can shift quickly in either direction",
+            "Expert-level risk; not recommended without hedges"
+          ]
+        },
+        {
+          "name": "Covered Call",
+          "chapter": "2.1",
+          "category": "Income",
+          "direction_bias": "Bullish to neutral",
+          "proficiency": "Novice",
+          "risk_profile": "Partially capped (still long stock downside)",
+          "legs": [
+            {"action": "Long", "type": "Stock", "quantity": "100 shares"},
+            {"action": "Sell", "type": "Call", "strike": "OTM", "expiry": "Near-term"}
+          ],
+          "max_profit": "Premium received plus (call strike minus stock purchase price)",
+          "max_loss": "Stock purchase price minus premium received (stock goes to zero)",
+          "risk_notes": [
+            "Full downside exposure to stock price — premium only partially offsets loss",
+            "Requires holding underlying equity — not applicable to pure options bot without equity positions"
+          ]
+        },
+        {
+          "name": "Calendar Call / Calendar Put (Time Spread)",
+          "chapter": "2.9 / 2.11",
+          "category": "Income",
+          "direction_bias": "Bullish (call) / Bearish (put) to neutral",
+          "proficiency": "Intermediate",
+          "legs": [
+            {"action": "Sell", "type": "Call or Put", "strike": "ATM or slight OTM", "expiry": "Near-term (front month)"},
+            {"action": "Buy", "type": "Same type", "strike": "Same strike", "expiry": "Further out (back month)"}
+          ],
+          "max_profit": "When underlying is at strike at front-month expiration (maximum time value differential)",
+          "max_loss": "Net debit paid",
+          "greeks": {
+            "theta": "Positive (front month decays faster than back month)",
+            "vega": "Positive (long vega — benefits from IV increase in back month)"
+          },
+          "risk_notes": [
+            "Unlike other income strategies, calendar spreads are long vega — benefits from IV increase",
+            "Risk is limited to net debit paid",
+            "DERA study confirms calendars are often used to roll expiring positions rather than for payoff"
+          ]
+        },
+        {
+          "name": "Collar",
+          "chapter": "7.1",
+          "category": "Protective / Synthetic",
+          "direction_bias": "Bullish (capped upside)",
+          "proficiency": "Intermediate",
+          "legs": [
+            {"action": "Long", "type": "Stock", "quantity": "100 shares"},
+            {"action": "Buy", "type": "Put", "strike": "OTM (protection)"},
+            {"action": "Sell", "type": "Call", "strike": "OTM (income to offset put cost)"}
+          ],
+          "risk_notes": [
+            "Effectively a covered call + protective put",
+            "Not applicable to pure options bot without equity positions"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cme_25strategies",
+      "title": "25 Proven Strategies for Trading Options on CME Group Futures",
+      "authors": ["CME Group"],
+      "year": null,
+      "type": "reference",
+      "publisher": "CME Group",
+      "note": "Futures options context — mechanics differ slightly from equity options (no early assignment, cash-settled, different margin rules). Conceptually applicable but not directly portable to equity ETF options.",
+      "strategies": [
+        {
+          "number": 1, "name": "Long Futures",
+          "category": "Directional",
+          "direction": "Bullish",
+          "decay": "None",
+          "synthetics": "Long call A + short put A",
+          "use_case": "Bullish on market, uncertain about volatility"
+        },
+        {
+          "number": 2, "name": "Short Futures",
+          "category": "Directional",
+          "direction": "Bearish",
+          "decay": "None",
+          "synthetics": "Long put A + short call A",
+          "use_case": "Bearish on market, uncertain about volatility"
+        },
+        {
+          "number": 3, "name": "Long Synthetic Futures",
+          "category": "Directional",
+          "direction": "Bullish",
+          "legs": ["Long call A", "Short put A"],
+          "decay": "None",
+          "use_case": "Bullish; can be traded into from initial long call or short put to strengthen position"
+        },
+        {
+          "number": 4, "name": "Short Synthetic Futures",
+          "category": "Directional",
+          "direction": "Bearish",
+          "legs": ["Short call A", "Long put A"],
+          "decay": "None"
+        },
+        {
+          "number": 5, "name": "Long Risk Reversal (Squash / Combo)",
+          "category": "Directional",
+          "direction": "Bullish",
+          "legs": ["Long OTM call", "Short OTM put"]
+        },
+        {
+          "number": 6, "name": "Short Risk Reversal (Squash / Combo)",
+          "category": "Directional",
+          "direction": "Bearish",
+          "legs": ["Short OTM call", "Long OTM put"]
+        },
+        {
+          "number": 7, "name": "Long Call", "category": "Directional", "direction": "Bullish",
+          "profit": "Unlimited as market rises",
+          "loss": "Limited to premium paid",
+          "decay": "Negative (time decay hurts)"
+        },
+        {
+          "number": 8, "name": "Short Call", "category": "Income", "direction": "Bearish/Neutral",
+          "profit": "Limited to premium received",
+          "loss": "Unlimited as market rises",
+          "decay": "Positive (time decay helps)"
+        },
+        {
+          "number": 9, "name": "Long Put", "category": "Directional", "direction": "Bearish",
+          "profit": "Substantial as market falls (limited by zero)",
+          "loss": "Limited to premium paid",
+          "decay": "Negative"
+        },
+        {
+          "number": 10, "name": "Short Put", "category": "Income", "direction": "Bullish/Neutral",
+          "profit": "Limited to premium received",
+          "loss": "Substantial as market falls",
+          "decay": "Positive"
+        },
+        {
+          "number": 11, "name": "Bull Spread",
+          "category": "Directional / Income",
+          "direction": "Bullish",
+          "note": "Can be implemented as call debit spread or put credit spread",
+          "legs": ["Long lower strike call/put", "Short higher strike call/put"]
+        },
+        {
+          "number": 12, "name": "Bear Spread",
+          "category": "Directional / Income",
+          "direction": "Bearish",
+          "note": "Can be implemented as put debit spread or call credit spread"
+        },
+        {
+          "number": 13, "name": "Long Butterfly",
+          "category": "Sideways",
+          "direction": "Neutral",
+          "structure": "Long 1 lower strike + short 2 middle strikes + long 1 higher strike",
+          "decay": "Positive near expiry when at center strike"
+        },
+        {
+          "number": 14, "name": "Short Butterfly",
+          "category": "Volatility",
+          "direction": "Neutral (profits from large move)",
+          "decay": "Negative"
+        },
+        {
+          "number": 15, "name": "Long Iron Butterfly",
+          "category": "Sideways / Income",
+          "direction": "Neutral",
+          "structure": "Short ATM straddle + long OTM strangle (wings)",
+          "decay": "Positive",
+          "note": "Defined-risk version of short straddle"
+        },
+        {
+          "number": 16, "name": "Short Iron Butterfly",
+          "category": "Volatility",
+          "direction": "Neutral (profits from large move)",
+          "note": "Defined-risk version of long straddle"
+        },
+        {
+          "number": 17, "name": "Long Straddle",
+          "category": "Volatility",
+          "direction": "Neutral (profits from large move in either direction)",
+          "legs": ["Long ATM call", "Long ATM put"],
+          "profit": "Unlimited in either direction beyond breakeven",
+          "loss": "Total premium paid",
+          "decay": "Strongly negative"
+        },
+        {
+          "number": 18, "name": "Short Straddle",
+          "category": "Sideways / Income",
+          "direction": "Neutral",
+          "legs": ["Short ATM call", "Short ATM put"],
+          "profit": "Total premium received",
+          "loss": "Unlimited",
+          "decay": "Strongly positive"
+        },
+        {
+          "number": 19, "name": "Long Strangle",
+          "category": "Volatility",
+          "direction": "Neutral (profits from large move)",
+          "legs": ["Long OTM call", "Long OTM put"],
+          "profit": "Unlimited beyond breakevens",
+          "loss": "Total premium paid"
+        },
+        {
+          "number": 20, "name": "Short Strangle",
+          "category": "Sideways / Income",
+          "direction": "Neutral",
+          "legs": ["Short OTM call", "Short OTM put"],
+          "profit": "Total premium received",
+          "loss": "Unlimited",
+          "decay": "Positive",
+          "note": "Wider profit zone than short straddle but less premium"
+        },
+        {
+          "number": 21, "name": "Ratio Call Spread",
+          "category": "Leveraged / Income",
+          "direction": "Mildly bearish to neutral",
+          "note": "Buy fewer calls at lower strike, sell more at higher strike — undefined upside risk"
+        },
+        {
+          "number": 22, "name": "Ratio Put Spread",
+          "category": "Leveraged / Income",
+          "direction": "Mildly bullish to neutral",
+          "note": "Buy fewer puts at higher strike, sell more at lower strike — undefined downside risk"
+        },
+        {
+          "number": 23, "name": "Call Ratio Backspread",
+          "category": "Leveraged / Volatility",
+          "direction": "Bullish with volatility benefit",
+          "note": "Sell fewer calls at lower strike, buy more at higher strike"
+        },
+        {
+          "number": 24, "name": "Put Ratio Backspread",
+          "category": "Leveraged / Volatility",
+          "direction": "Bearish with volatility benefit",
+          "note": "Sell fewer puts at higher strike, buy more at lower strike"
+        },
+        {
+          "number": 25, "name": "Box or Conversion",
+          "category": "Arbitrage / Synthetic",
+          "direction": "Market neutral",
+          "note": "Risk-free arbitrage structure; locks in risk-free rate"
+        }
+      ],
+      "pattern_evolution_methodology": "Each strategy illustrated with profit/loss diagrams at 4 months to expiry (purple), 1 month to expiry (gold), and at expiration (green) — shows effect of time decay on position value"
+    },
+    {
+      "id": "fidelity_ta_options",
+      "title": "Technical Analysis for Options Trading",
+      "authors": ["Dan Gard"],
+      "year": null,
+      "type": "reference",
+      "publisher": "Fidelity Investments (Webinar / Educational Deck)",
+      "note": "Introductory-level webinar deck. Covers concepts already implemented in the bot's scoring.py module.",
+      "core_concepts": [
+        {
+          "concept": "Trend Analysis",
+          "definition": "Uptrend: successively higher peaks and troughs. Downtrend: successively lower peaks and troughs. Sideways: no clear direction.",
+          "options_application": "Use trend direction to select strategy bias — uptrend favors bullish strategies (CSP, Bull Put Spread); downtrend favors bearish (Bear Call Spread); sideways favors neutral (Iron Condor, Short Strangle)",
+          "bot_status": "Implemented via SMA crossover and ADX in scoring.py"
+        },
+        {
+          "concept": "Support and Resistance",
+          "definition": "Price levels where supply/demand historically reverses. Support = floor; resistance = ceiling.",
+          "options_application": "Short put strike should be at or below key support. Short call strike at or above key resistance. These levels define strike selection.",
+          "bot_status": "Partially implemented — technical scoring uses SMA as proxy; explicit S/R detection not built"
+        },
+        {
+          "concept": "Moving Averages",
+          "definition": "Smoothed price series to identify trend direction and dynamic support/resistance.",
+          "options_application": "50/200-day MA crossover signals regime; price above 200-day = long-term uptrend favors bullish premium selling",
+          "bot_status": "Implemented — SMA scoring in technical module"
+        },
+        {
+          "concept": "Breakouts",
+          "definition": "Price moves through established support or resistance with volume confirmation. False breakouts are common.",
+          "options_application": "Breakout from range = do not enter neutral strategies (Iron Condor). Wait for new range establishment.",
+          "bot_status": "Implicitly handled by regime detection and ADX threshold"
+        },
+        {
+          "concept": "Bollinger Bands",
+          "definition": "Two standard deviation bands around a 20-period moving average. Price near upper band = overbought; near lower band = oversold.",
+          "options_application": "BB width (bandwidth) indicates volatility regime. Narrow bands (squeeze) precede large moves — avoid selling premium into a squeeze. Wide bands = elevated vol = favorable for premium sellers.",
+          "bot_status": "Implemented — BB in scoring.py"
+        }
+      ],
+      "key_principles": [
+        "Technical analysis focuses on price — supply and demand expressed through price action",
+        "Prices discount everything — all known information reflected in price",
+        "Prices are nonrandom but not fully predictable — trends exist and can be exploited",
+        "Patterns and trends repeat across timeframes (fractal nature)",
+        "Technical analysis is not mechanically precise — requires human (or model) interpretation and is subject to cognitive biases",
+        "Options strike selection is the key intersection of technical analysis and options trading — technicals define WHERE to place strikes, not whether to trade"
+      ],
+      "options_management_with_ta": [
+        "Use support/resistance to define strike placement zones before entry",
+        "Monitor underlying trend post-entry — adverse trend change is a signal to consider early exit",
+        "Bollinger band expansion post-entry signals volatility risk to short premium positions",
+        "Moving average breach by underlying is a key risk trigger for adjustment or exit"
+      ]
+    },
+    {
+      "id": "gsw_2006",
+      "title": "The U.S. Treasury Yield Curve: 1961 to the Present",
+      "authors": [
+        "Refet S. Gurkaynak (Bilkent University)",
+        "Brian Sack (Macroeconomic Advisers)",
+        "Jonathan H. Wright (Federal Reserve Board)"
+      ],
+      "year": 2006,
+      "type": "study",
+      "publisher": "Finance and Economics Discussion Series, Federal Reserve Board (FEDS 2006-28)",
+      "sample_period": "1961-06-14 to 2006 (updated periodically thereafter)",
+      "data_source_url": "https://www.federalreserve.gov/pubs/feds/2006",
+      "methodology": "Nelson-Siegel-Svensson smoothing of off-the-run Treasury notes and bonds",
+      "direct_trading_applicability": "Low — this is a methodology and data paper, not a strategy paper",
+      "fred_tickers_derived": {
+        "2_year_yield": "DGS2",
+        "5_year_yield": "DGS5",
+        "10_year_yield": "DGS10",
+        "2_10_spread": "T10Y2Y",
+        "3_month_yield": "DGS3MO",
+        "3_month_10_year_spread": "T10Y3M"
+      },
+      "major_findings": [
+        {
+          "finding": "Yield curve provides daily forward rate estimates for any maturity horizon",
+          "detail": "The GSW model produces zero-coupon yields, par yields, instantaneous forward rates, and n-by-m forward rates for any combination of n and m. Updated daily since 1961.",
+          "implication_for_bot": "Bot's credit regime signal (yield curve spread) is derived from this data via FRED. The 2y-10y spread (T10Y2Y) is the standard credit regime indicator already in use."
+        },
+        {
+          "finding": "Yield curve inversion is a leading indicator of recession",
+          "detail": "The paper establishes the methodology behind the yield curve that practitioners use to monitor inversion. Inverted curve (2y > 10y) has preceded every US recession since 1961.",
+          "implication_for_bot": "Yield curve inversion should sharpen the regime filter — deeply inverted curve (T10Y2Y < -50bps) warrants increasing selectivity in premium-selling entries."
+        },
+        {
+          "finding": "Forward rates carry information about market expectations of future short rates",
+          "detail": "The term premium embedded in the yield curve can be extracted using the GSW model. When term premium is negative (investors accept lower yield for safety), risk-off regime is likely.",
+          "implication_for_bot": "Term structure slope is already partially captured by the credit regime HYG/IEF z-score and yield curve spread. No new integration required."
+        }
+      ],
+      "practical_implications": [
+        "Bot already uses FRED yield curve data via T10Y2Y spread in credit regime signal — no new data source needed",
+        "Yield curve inversion threshold could be refined: deeply inverted (< -50bps) may warrant tighter VIX or delta requirements at entry",
+        "Paper validates FRED as the authoritative source for daily yield curve data — no need for alternative yield curve providers"
+      ]
+    }
+  ],
+  "cross_document_synthesis": {
+    "strategy_validation": [
+      {
+        "bot_strategy": "ShortPutSpread",
+        "validation_sources": ["dera_2024", "cohen_2005"],
+        "verdict": "Strongly validated — bull put spreads are the most common ETP complex trade (DERA: 34% of ETP complex volume); Cohen classifies as core income strategy",
+        "confidence": "High"
+      },
+      {
+        "bot_strategy": "ShortCallSpread",
+        "validation_sources": ["dera_2024", "cohen_2005"],
+        "verdict": "Strongly validated — bear call spreads dominant in stock complex volume; directional alignment critical (DERA finding: call spread vol driven by positive underlying returns)",
+        "confidence": "High"
+      },
+      {
+        "bot_strategy": "ShortStrangle",
+        "validation_sources": ["dera_2024", "cohen_2005"],
+        "verdict": "Validated as secondary — DERA confirms strangles are institutionally sold in ETP options, but represent only ~6% of complex volume; Cohen rates as Advanced due to undefined risk",
+        "confidence": "Medium",
+        "caution": "Undefined risk — iron condor is strictly preferable when available"
+      },
+      {
+        "bot_strategy": "IronCondor (gated)",
+        "validation_sources": ["dera_2024", "cohen_2005", "ssrn_4643378"],
+        "verdict": "Validated as neutral-regime strategy — DERA confirms iron condors are institutionally sold in ETPs; Cohen confirms as intermediate-level income strategy; iron condor preferred over strangle from risk perspective",
+        "confidence": "High",
+        "activation_note": "Gated behind 30-trade milestone; should replace ShortStrangle on neutral tickers when activated"
+      }
+    ],
+    "rolling_mechanics": {
+      "source": "dera_2024",
+      "key_insight": "Empirical evidence shows rolling is primarily triggered by moneyness change (short strike approaching ITM), not DTE threshold alone",
+      "implementation_guidance": "Primary rolling trigger: short strike delta exceeds threshold (e.g., delta of short put exceeds -0.40) OR underlying return crosses short strike. DTE threshold is a secondary/floor condition, not the primary trigger.",
+      "do_not_build_until": "30-trade milestone + DSR/Monte Carlo confirms genuine edge"
+    },
+    "execution_principles": [
+      "Always use multi-leg complex orders — never leg into spreads separately (DERA: up to 83% cost savings from complex orders vs. single-leg execution)",
+      "OTM-OTM configuration is market norm for vertical spreads — maintain current delta targeting",
+      "Close early at 50% of max profit to reduce negative gamma exposure (Cohen)",
+      "Avoid entering around major catalyst events (earnings, FOMC) — gap risk",
+      "Short options with ~30 DTE captures optimal theta-to-gamma ratio (Cohen rule of thumb)",
+      "Prefer defined-risk (spread) structures over undefined-risk (naked) — consistent with capital preservation mandate"
+    ],
+    "regime_signals": [
+      {
+        "signal": "Yield curve slope (T10Y2Y from FRED/GSW)",
+        "interpretation": "Deeply inverted (< -50bps) = recession risk elevated; tighten entry criteria",
+        "source": "gsw_2006"
+      },
+      {
+        "signal": "Bollinger Band width (bandwidth = (upper-lower)/middle)",
+        "interpretation": "Squeeze (narrow bands) = do not enter iron condor or short strangle — large move imminent; wide bands = favorable vol environment",
+        "source": "fidelity_ta_options"
+      },
+      {
+        "signal": "Complex ratio spike in ETPs (particularly HYG, IWM, SPY)",
+        "interpretation": "Elevated complex ratio driven by recent large returns = spread adjustment activity is elevated — underlying has moved significantly and traders are rolling",
+        "source": "dera_2024"
+      },
+      {
+        "signal": "ADX > 25 with directional bias",
+        "interpretation": "Trending market — reduce neutral (Iron Condor) entries; increase directional (ShortPutSpread on dips, ShortCallSpread on rips)",
+        "source": "fidelity_ta_options"
+      }
+    ]
+  }
+}
