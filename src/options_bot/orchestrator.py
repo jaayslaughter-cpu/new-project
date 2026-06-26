@@ -39,12 +39,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 
 from .broker import AlpacaBroker, PaperBroker, get_broker
@@ -119,6 +120,48 @@ def _select_extra_tickers(
     if extra_name in _BULLISH_EQUIVALENT_STRATEGIES:
         return scan_tickers
     return []
+
+
+# ---------------------------------------------------------------------------
+# OCC option-symbol parser
+# ---------------------------------------------------------------------------
+
+# OCC symbol format: <UNDERLYING><YYMMDD><C|P><STRIKE_x1000 zero-padded to 8>
+# Example: IWM260731C00320000 → IWM, 2026-07-31, call, 320.00
+_OCC_RE = re.compile(r'^([A-Z]+)(\d{6})([CP])(\d{8})$')
+
+
+def _parse_occ_symbol(symbol: str) -> Optional[dict]:
+    """Parse an OCC option symbol into its components.
+
+    Returns a dict with keys ``underlying``, ``expiry`` (date), ``option_type``
+    ('call'|'put'), and ``strike`` (float), or ``None`` if *symbol* is not a
+    valid OCC option symbol (e.g. bare equity ticker, garbage string, empty).
+
+    Used by ``_adopt_orphans`` to reconstruct position metadata from the raw
+    Alpaca symbol returned in broker positions.
+    """
+    if not symbol:
+        return None
+    m = _OCC_RE.match(symbol)
+    if not m:
+        return None
+    underlying, expiry_str, cp, strike_str = m.groups()
+    try:
+        expiry = date(
+            2000 + int(expiry_str[:2]),
+            int(expiry_str[2:4]),
+            int(expiry_str[4:6]),
+        )
+        strike = int(strike_str) / 1000.0
+        return {
+            "underlying": underlying,
+            "expiry": expiry,
+            "option_type": "call" if cp == "C" else "put",
+            "strike": strike,
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +358,23 @@ class OrchestratorConfig:
         default_factory=lambda: os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL", "")
     )
     sqlite_path: str = "options_bot.db"
+
+    # --- Orphan adoption (gated — safe only after ?-placeholder fix is confirmed deployed) ---
+    # Reads broker positions with no matching DB record and writes them into the
+    # trades table so the position monitor can manage them.  Uses the same INSERT
+    # path as save_fill, so it must stay OFF until the 63fc7d8 fix is confirmed
+    # running in the deployed Railway container.  Enable manually after verifying
+    # the deployed container is on the current main.
+    adopt_orphans_enabled: bool = False
+
+    # --- Catch-up scan (default ON — guards against missed scan on restart) ---
+    # On startup, if no scan has run today and the market is open past the
+    # scheduled 6:45 AM PT window with enough time left before close, fire one
+    # scan immediately.  Idempotency marker (last_scan_date in bot_state) ensures
+    # multiple container restarts on the same day produce exactly one scan.
+    # Set False only if you want zero startup-triggered entries.
+    catchup_scan_enabled: bool = True
+    catchup_min_minutes_to_close: int = 90  # don't catch up within 90 min of close
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +804,105 @@ class TradeDatabase:
             logger.info("[TradeDB] Saved: %s %s", filled.order_id, order.strategy_name)
         except Exception as exc:
             logger.error("[TradeDB] Save failed: %s", exc)
+            conn.close()
+            raise  # re-raise so the call site can alert via Discord
+        # Read-back verification: confirm the row actually persisted.
+        # A miss triggers a warning (DB inconsistency) but does NOT raise —
+        # the trade is already filled at the broker and the scan must continue.
+        try:
+            cur = self._execute(
+                conn, "SELECT id FROM trades WHERE id = ?", (filled.order_id,)
+            )
+            row = cur.fetchone() if cur else None
+            if row is None:
+                logger.warning(
+                    "[TradeDB] Read-back miss for %s — row not found after commit; "
+                    "DB may be inconsistent",
+                    filled.order_id,
+                )
+        except Exception as rb_exc:
+            logger.warning(
+                "[TradeDB] Read-back check error for %s: %s", filled.order_id, rb_exc
+            )
+        finally:
+            conn.close()
+
+    def adopt_orphan(
+        self,
+        underlying: str,
+        strategy: str,
+        net_credit: float,
+        legs: list,
+        profit_target_price: float,
+    ) -> bool:
+        """Record a broker position that has no existing DB entry as an open trade.
+
+        Mirrors ``save_fill``'s INSERT exactly (same 22 columns, same ?
+        placeholders so ``_execute`` can rewrite them for Postgres).  The
+        broker tag is set to ``"adopted"`` so the position monitor and analytics
+        can distinguish adopted records from normal fills.
+
+        Returns True on success, False on DB error (never raises — orphan
+        adoption is best-effort; the position is already live at the broker).
+        """
+        import uuid as _uuid
+        order_id = f"adopted-{_uuid.uuid4()}"
+        now = datetime.now(tz=timezone.utc).isoformat()
+        legs_json = json.dumps(legs)
+
+        if self._use_pg:
+            sql = """
+                INSERT INTO trades
+                (id, trade_date, strategy, underlying, legs_json,
+                 fill_price, slippage, max_loss, hard_stop, contracts,
+                 net_credit, status, broker, created_at, updated_at,
+                 delta, vega, theta, underlying_price, expiry,
+                 profit_target_price, profit_target_pct)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+            """
+        else:
+            sql = """
+                INSERT OR REPLACE INTO trades
+                (id, trade_date, strategy, underlying, legs_json,
+                 fill_price, slippage, max_loss, hard_stop, contracts,
+                 net_credit, status, broker, created_at, updated_at,
+                 delta, vega, theta, underlying_price, expiry,
+                 profit_target_price, profit_target_pct)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """
+        params = (
+            order_id,
+            date.today().isoformat(),
+            strategy,
+            underlying,
+            legs_json,
+            net_credit,            # fill_price (net credit received)
+            0.0,                   # slippage (unknown at adoption)
+            0.0,                   # max_loss (unknown at adoption)
+            net_credit * 2.0,      # hard_stop (2× credit default)
+            1,                     # contracts (position qty assumed = 1 lot)
+            net_credit,
+            "open",
+            "adopted",             # broker tag distinguishes from normal fills
+            now, now,
+            None, None, None,      # delta, vega, theta
+            None, None,            # underlying_price, expiry
+            profit_target_price,
+            0.5,                   # profit_target_pct (50% of credit)
+        )
+        conn = self._get_conn()
+        try:
+            self._execute(conn, sql, params)
+            conn.commit()
+            logger.info(
+                "[TradeDB] Adopted orphan: %s %s %s net_credit=%.2f",
+                order_id, underlying, strategy, net_credit,
+            )
+            return True
+        except Exception as exc:
+            logger.error("[TradeDB] adopt_orphan failed for %s/%s: %s", underlying, strategy, exc)
+            return False
         finally:
             conn.close()
 
@@ -1466,7 +1625,22 @@ class TradingPipeline:
         # Deduct committed max-loss from working equity so the next ticker
         # in the same scan is sized against the remaining risk budget.
         self.rm.update_equity_after_fill(order.max_loss_dollars)
-        self.db.save_fill(filled)
+        try:
+            self.db.save_fill(filled)
+        except Exception as _sf_exc:
+            # Trade IS filled at the broker — never abort the scan here.
+            # Alert loudly so the orphan can be adopted manually (or via
+            # adopt_orphans once that gate is enabled).
+            _sf_msg = (
+                f"🔴 **DB write failed** — {filled.order_id} IS FILLED AT BROKER "
+                f"but NOT in database. Manual reconciliation required.\n"
+                f"Strategy: {getattr(order, 'strategy_name', '?')} | "
+                f"Underlying: {getattr(order, 'underlying', '?')} | "
+                f"Error: {_sf_exc}"
+            )
+            logger.error("[Pipeline] save_fill failed for %s: %s", filled.order_id, _sf_exc)
+            self.state.record_error(f"save_fill failed {filled.order_id}: {_sf_exc}")
+            send_discord(self.config.discord_webhook_url, _sf_msg)
         with self.state._lock:
             self.state.filled_today.append(filled)
 
@@ -2161,6 +2335,16 @@ class Orchestrator:
             f"Halt at -{self.config.risk_config.max_daily_loss_pct:.0%} daily loss"
         )
 
+        # Fire catch-up scan if this boot missed the scheduled 6:45 AM PT window.
+        # Fail-open: any error in the catch-up must never prevent the scheduler
+        # from starting.
+        try:
+            self._maybe_catchup_scan()
+        except Exception as _cs_exc:
+            logger.warning(
+                "[Orchestrator] Catch-up scan startup error (non-fatal): %s", _cs_exc
+            )
+
         try:
             scheduler.start()
         except (KeyboardInterrupt, SystemExit):
@@ -2333,8 +2517,221 @@ class Orchestrator:
                 "[Reconcile] Done: %d Alpaca option positions, %d DB open trades",
                 len(alpaca_symbols), len(db_trades)
             )
+
+            # Adopt orphan positions — broker has them, DB doesn't.
+            # Gated by adopt_orphans_enabled (default False) until the
+            # ?-placeholder fix is confirmed deployed and INSERT path is clean.
+            if self.config.adopt_orphans_enabled:
+                _db_symbols: set = set()
+                for _t in db_trades:
+                    try:
+                        for _leg in json.loads(_t.get("legs_json", "[]")):
+                            _db_symbols.add(_leg.get("symbol", ""))
+                    except Exception:
+                        pass
+                _orphans = [p for p in alpaca_positions if p.get("symbol") not in _db_symbols]
+                if _orphans:
+                    logger.info(
+                        "[Reconcile] %d potential orphan legs — attempting adoption",
+                        len(_orphans),
+                    )
+                    self._adopt_orphans(_orphans)
+
         except Exception as exc:
             logger.warning("[Reconcile] Reconciliation failed (non-fatal): %s", exc)
+
+    def _adopt_orphans(self, positions: list) -> None:
+        """Reconstruct DB records for broker positions that have no DB entry.
+
+        Called from ``_reconcile_positions`` when ``adopt_orphans_enabled=True``.
+        Can also be called directly for manual reconciliation.
+
+        Recognizes two defined-risk premium-selling shapes only:
+          * 1 short put (no long) → cash_secured_put
+          * 1 short + 1 long, same option type → short_put_spread or short_call_spread
+
+        Everything else (naked calls, >2 legs, mismatched types, long-only) is
+        logged and skipped — never adopted without a clear structure.
+
+        net_credit is the per-share price (e.g. 0.83), NOT × 100.
+        """
+        if not self.config.adopt_orphans_enabled:
+            return
+
+        # Filter to options only, parse each OCC symbol
+        parsed = []
+        for pos in positions:
+            if pos.get("asset_class") != "us_option":
+                continue
+            sym = pos.get("symbol", "")
+            info = _parse_occ_symbol(sym)
+            if info is None:
+                logger.warning("[Orphan] Cannot parse OCC symbol %r — skipping", sym)
+                continue
+            parsed.append({**pos, **info})
+
+        # Group by (underlying, expiry)
+        groups: dict = {}
+        for p in parsed:
+            key = (p["underlying"], p["expiry"])
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(p)
+
+        for (underlying, expiry), legs in groups.items():
+            try:
+                n_legs = len(legs)
+                short_legs = [l for l in legs if l.get("side") == "short"]
+                long_legs  = [l for l in legs if l.get("side") == "long"]
+
+                if n_legs > 2:
+                    logger.warning(
+                        "[Orphan] %s %s: %d-leg shape not recognized — skipping",
+                        underlying, expiry, n_legs,
+                    )
+                    send_discord(
+                        self.config.discord_webhook_url,
+                        f"⚠️ **Orphan skip** — {underlying} {expiry}: "
+                        f"{n_legs}-leg structure not recognized",
+                    )
+                    continue
+
+                if not short_legs:
+                    logger.info(
+                        "[Orphan] %s %s: long-only position — skipping",
+                        underlying, expiry,
+                    )
+                    continue
+
+                short = short_legs[0]
+
+                if n_legs == 1:
+                    # Single short leg → only adopt as CSP (short put)
+                    if short["option_type"] != "put":
+                        logger.warning(
+                            "[Orphan] %s %s: naked short call — skipping (undefined risk)",
+                            underlying, expiry,
+                        )
+                        continue
+                    strategy = "cash_secured_put"
+                    net_credit = float(short["avg_entry_price"])
+                else:
+                    # 2 legs: 1 short + 1 long, same option type
+                    long_ = long_legs[0]
+                    if short["option_type"] != long_["option_type"]:
+                        logger.warning(
+                            "[Orphan] %s %s: mixed call/put legs — skipping",
+                            underlying, expiry,
+                        )
+                        continue
+                    strategy = (
+                        "short_put_spread"
+                        if short["option_type"] == "put"
+                        else "short_call_spread"
+                    )
+                    net_credit = float(short["avg_entry_price"]) - float(long_["avg_entry_price"])
+
+                profit_target_price = round(net_credit * 0.5, 4)
+
+                leg_records = [
+                    {
+                        "symbol": l["symbol"],
+                        "side": "sell_to_open" if l["side"] == "short" else "buy_to_open",
+                        "option_type": l["option_type"],
+                        "strike": l["strike"],
+                        "expiry": expiry.isoformat(),
+                    }
+                    for l in legs
+                ]
+
+                success = self.db.adopt_orphan(
+                    underlying=underlying,
+                    strategy=strategy,
+                    net_credit=net_credit,
+                    legs=leg_records,
+                    profit_target_price=profit_target_price,
+                )
+
+                if success:
+                    logger.info(
+                        "[Orphan] Adopted %s %s %s net_credit=%.2f profit_target=%.3f",
+                        underlying, expiry, strategy, net_credit, profit_target_price,
+                    )
+                    send_discord(
+                        self.config.discord_webhook_url,
+                        f"🔧 **Orphan adopted** — {underlying} {expiry} "
+                        f"{strategy} net_credit={net_credit:.2f}",
+                    )
+
+            except Exception as exc:
+                logger.error(
+                    "[Orphan] Error processing %s %s: %s", underlying, expiry, exc
+                )
+
+    def _maybe_catchup_scan(self) -> None:
+        """Fire a catch-up scan after a container restart that missed the 6:45 AM
+        PT scheduled window.
+
+        Five guards must ALL pass before a scan is fired:
+          1. ``catchup_scan_enabled`` config flag (default True)
+          2. Market is currently open
+          3. Current PT time is at or past the scheduled scan window (6:45 AM PT)
+          4. At least ``catchup_min_minutes_to_close`` minutes remain before close
+          5. No scan has run today yet (idempotency via last_scan_date in bot_state)
+
+        The idempotency marker is written by ``run_scan`` itself; multiple container
+        restarts on the same day therefore produce exactly one scan (guard 5 skips
+        the subsequent calls once the marker is present).
+        """
+        from zoneinfo import ZoneInfo
+
+        if not self.config.catchup_scan_enabled:
+            return
+
+        if not _market_is_open():
+            return
+
+        LA = ZoneInfo("America/Los_Angeles")
+        now_pt = datetime.now(tz=LA)
+
+        # Guard 3: past the scheduled scan window (6:45 AM PT = 9:45 AM ET)
+        if now_pt.time() < time(6, 45):
+            return
+
+        # Guard 4: enough trading day remaining to warrant new entries
+        if _minutes_to_close() < self.config.catchup_min_minutes_to_close:
+            logger.info(
+                "[CatchupScan] Too close to market close (<%d min) — skipping",
+                self.config.catchup_min_minutes_to_close,
+            )
+            return
+
+        # Guard 5: idempotency — skip if a scan already ran today
+        today_iso = date.today().isoformat()
+        try:
+            marker = self.db.load_state("last_scan_date", max_age_hours=48)
+        except Exception:
+            marker = None
+
+        if marker and marker.get("date") == today_iso:
+            logger.debug(
+                "[CatchupScan] Scan already ran today (%s) — skipping", today_iso
+            )
+            return
+
+        logger.info(
+            "[CatchupScan] No scan recorded for %s — firing catch-up scan now",
+            today_iso,
+        )
+        send_discord(
+            self.config.discord_webhook_url,
+            "⚡ **Catch-up scan** — container restarted after scheduled window; "
+            "running now",
+        )
+        try:
+            self.run_scan()
+        except Exception as exc:
+            logger.error("[CatchupScan] Catch-up scan failed: %s", exc)
 
     def run_scan(self) -> list[FilledOrder]:
         """
@@ -2344,6 +2741,13 @@ class Orchestrator:
         """
         self.state.reset_for_new_day()
         logger.info("[Orchestrator] === SCAN START %s ===", date.today())
+
+        # Persist scan-date marker so _maybe_catchup_scan skips on subsequent
+        # container restarts within the same trading day.
+        try:
+            self.db.save_state("last_scan_date", {"date": date.today().isoformat()})
+        except Exception:
+            pass
 
         # Reconcile DB positions with Alpaca on every scan
         # This handles the case where Railway restarted mid-day

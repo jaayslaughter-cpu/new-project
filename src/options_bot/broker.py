@@ -624,7 +624,7 @@ class AlpacaBroker:
                     "unrealized_plpc": float(pos.unrealized_plpc or 0),
                     "avg_entry_price": float(pos.avg_entry_price or 0),
                     "current_price":   float(pos.current_price or 0),
-                    "asset_class":     str(pos.asset_class),
+                    "asset_class":     getattr(pos.asset_class, "value", str(pos.asset_class)),
                 }
                 for pos in positions
             ]

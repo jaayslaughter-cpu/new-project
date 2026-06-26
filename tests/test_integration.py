@@ -1472,6 +1472,24 @@ class TestPaperBroker(unittest.TestCase):
         snap = self.broker.get_option_snapshots(["SPY260620C00580000"])
         self.assertIn("SPY260620C00580000", snap)
 
+    def test_get_positions_asset_class_is_plain_string(self):
+        """asset_class must be the raw value string 'us_option', never the
+        enum repr 'AssetClass.US_OPTION'.  Regression test for the bug where
+        str(AlpacaAssetClass.US_OPTION) returns 'AssetClass.US_OPTION' in
+        alpaca-py 0.43.x, causing every asset_class == 'us_option' filter to
+        silently return zero results (reconcile, monitor, position cap)."""
+        self.broker.submit(self.order)
+        positions = self.broker.get_positions()
+        self.assertGreater(len(positions), 0, "expected at least one position")
+        for pos in positions:
+            ac = pos.get("asset_class", "")
+            self.assertEqual(
+                ac, "us_option",
+                f"asset_class should be 'us_option', got {repr(ac)}. "
+                "Fix: use getattr(pos.asset_class, 'value', str(pos.asset_class)) "
+                "in AlpacaBroker.get_positions()."
+            )
+
 
 # ---------------------------------------------------------------------------
 # Test: AlpacaBroker raises without credentials
@@ -1644,12 +1662,18 @@ class TestTradeDatabase(unittest.TestCase):
         % -> %% into %%s — Postgres then receives literal '%s' text. Every write
         path must use ? placeholders. This forces the PG branch without a live
         Postgres and inspects the SQL _execute actually hands to the cursor."""
-        captured = {}
+        captured = {"all": []}
 
         class _FakeCursor:
+            description = [("id",)]
             def execute(self, sql, params=None):
-                captured["sql"] = sql
-                captured["params"] = params
+                captured["all"].append((sql, params))
+                # Keep "last INSERT seen" so the assertions below target the
+                # write path specifically, not the read-back SELECT that
+                # save_fill now issues for verification.
+                if "INSERT INTO trades" in sql:
+                    captured["sql"] = sql
+                    captured["params"] = params
             def fetchone(self):
                 return None
             def fetchall(self):
@@ -2631,6 +2655,276 @@ class TestMacroBlackout(unittest.TestCase):
     def test_no_event_nearby(self):
         r = self.mb.check_macro_blackout(as_of=self.date(2026, 5, 1), lookahead_days=1)
         self.assertFalse(r.in_blackout)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Shared shim: lets _maybe_catchup_scan's datetime.now() be deterministic
+# ---------------------------------------------------------------------------
+
+class _DTShim:
+    """Minimal datetime shim so _maybe_catchup_scan's now_pt comparison is
+    deterministic. Delegates everything except now() to the real datetime."""
+    def __init__(self, fixed_now):
+        self._fixed = fixed_now
+        from datetime import datetime as _real
+        self._real = _real
+    def now(self, tz=None):
+        if tz is not None:
+            return self._fixed.astimezone(tz)
+        return self._fixed
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+# ---------------------------------------------------------------------------
+# Test: OCC symbol parser
+# ---------------------------------------------------------------------------
+
+class TestOCCParser(unittest.TestCase):
+    """OCC option symbol parsing for orphan adoption. Must correctly recover
+    underlying/expiry/type/strike from the real 2026-06-24 IWM legs and reject
+    non-option symbols rather than synthesize garbage."""
+
+    def test_parses_real_iwm_call_legs(self):
+        from options_bot.orchestrator import _parse_occ_symbol
+        a = _parse_occ_symbol("IWM260731C00320000")
+        self.assertEqual(a["underlying"], "IWM")
+        self.assertEqual(a["expiry"], date(2026, 7, 31))
+        self.assertEqual(a["option_type"], "call")
+        self.assertEqual(a["strike"], 320.0)
+
+    def test_parses_put(self):
+        from options_bot.orchestrator import _parse_occ_symbol
+        p = _parse_occ_symbol("SPY261218P00400000")
+        self.assertEqual(p["option_type"], "put")
+        self.assertEqual(p["strike"], 400.0)
+
+    def test_rejects_equity_symbol(self):
+        from options_bot.orchestrator import _parse_occ_symbol
+        self.assertIsNone(_parse_occ_symbol("IWM"))
+        self.assertIsNone(_parse_occ_symbol("GARBAGE"))
+        self.assertIsNone(_parse_occ_symbol(""))
+
+    def test_fractional_strike(self):
+        from options_bot.orchestrator import _parse_occ_symbol
+        # 84.5 strike -> 00084500
+        r = _parse_occ_symbol("TLT260731P00084500")
+        self.assertEqual(r["strike"], 84.5)
+
+
+# ---------------------------------------------------------------------------
+# Test: Orphan position adoption
+# ---------------------------------------------------------------------------
+
+class TestOrphanAdoption(unittest.TestCase):
+    """_adopt_orphans must group legs into spreads, identify the short leg,
+    reconstruct net credit, and only adopt recognizable 1/2-leg premium-selling
+    structures — never synthesize a row for a shape it can't reason about."""
+
+    def _make_orch(self):
+        from options_bot.orchestrator import Orchestrator, OrchestratorConfig
+        cfg = OrchestratorConfig()
+        cfg.discord_webhook_url = ""
+        cfg.adopt_orphans_enabled = True
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.config = cfg
+
+        class _DB:
+            def __init__(self): self.adopted = []
+            def adopt_orphan(self, **kw):
+                self.adopted.append(kw)
+                return True
+        orch.db = _DB()
+        import options_bot.orchestrator as O
+        self._patch = patch.object(O, "send_discord", lambda *a, **k: None)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        return orch
+
+    def test_adopts_iwm_call_spread_with_correct_credit(self):
+        orch = self._make_orch()
+        # The real 2026-06-24 orphan: short 320C @ 1.30, long 330C @ 0.47.
+        # Net credit = (1.30 - 0.47) * 100 = $83 -> $0.83/contract.
+        positions = [
+            {"symbol": "IWM260731C00320000", "qty": -1, "side": "short",
+             "avg_entry_price": 1.30, "asset_class": "us_option"},
+            {"symbol": "IWM260731C00330000", "qty": 1, "side": "long",
+             "avg_entry_price": 0.47, "asset_class": "us_option"},
+        ]
+        orch._adopt_orphans(positions)
+        self.assertEqual(len(orch.db.adopted), 1)
+        a = orch.db.adopted[0]
+        self.assertEqual(a["underlying"], "IWM")
+        self.assertEqual(a["strategy"], "short_call_spread")
+        self.assertAlmostEqual(a["net_credit"], 0.83, places=2)
+        self.assertEqual(len(a["legs"]), 2)
+        # profit target = 50% of credit
+        self.assertAlmostEqual(a["profit_target_price"], 0.415, places=3)
+
+    def test_skips_long_only_no_short_leg(self):
+        orch = self._make_orch()
+        positions = [
+            {"symbol": "IWM260731C00330000", "qty": 1, "side": "long",
+             "avg_entry_price": 0.47, "asset_class": "us_option"},
+        ]
+        orch._adopt_orphans(positions)
+        self.assertEqual(len(orch.db.adopted), 0)  # no short leg -> not adopted
+
+    def test_skips_unrecognized_three_leg_shape(self):
+        orch = self._make_orch()
+        positions = [
+            {"symbol": "IWM260731C00320000", "qty": -1, "side": "short",
+             "avg_entry_price": 1.30, "asset_class": "us_option"},
+            {"symbol": "IWM260731C00330000", "qty": 1, "side": "long",
+             "avg_entry_price": 0.47, "asset_class": "us_option"},
+            {"symbol": "IWM260731C00340000", "qty": 1, "side": "long",
+             "avg_entry_price": 0.20, "asset_class": "us_option"},
+        ]
+        orch._adopt_orphans(positions)
+        self.assertEqual(len(orch.db.adopted), 0)  # 3 legs -> flagged, not adopted
+
+    def test_single_leg_csp_adopted(self):
+        orch = self._make_orch()
+        positions = [
+            {"symbol": "IWM260731P00270000", "qty": -1, "side": "short",
+             "avg_entry_price": 2.00, "asset_class": "us_option"},
+        ]
+        orch._adopt_orphans(positions)
+        self.assertEqual(len(orch.db.adopted), 1)
+        self.assertEqual(orch.db.adopted[0]["strategy"], "cash_secured_put")
+        self.assertAlmostEqual(orch.db.adopted[0]["net_credit"], 2.00, places=2)
+
+
+# ---------------------------------------------------------------------------
+# Test: Catch-up scan on container restart
+# ---------------------------------------------------------------------------
+
+class TestCatchupScan(unittest.TestCase):
+    """Startup catch-up scan must fire at most once per day and never open
+    fresh positions too close to the close. The 2026-06-24 incident: container
+    restarted ~50 min after the 06:45 PT scan window, scan was skipped for the
+    whole day, and the deployment cycled through several restarts within an hour
+    (so a naive catch-up would have scanned multiple times)."""
+
+    def _make_orch(self, marker_date=None, enabled=True, catchup_cutoff=90):
+        """Build a minimal stub exposing only what _maybe_catchup_scan touches."""
+        from options_bot.orchestrator import Orchestrator, OrchestratorConfig
+
+        class _StubDB:
+            def __init__(self, md):
+                self._md = md
+                self.saved = None
+            def load_state(self, key, max_age_hours=48):
+                if key == "last_scan_date" and self._md:
+                    return {"date": self._md}
+                return None
+            def save_state(self, key, value, max_age_hours=48):
+                self.saved = (key, value)
+
+        cfg = OrchestratorConfig()
+        cfg.catchup_scan_enabled = enabled
+        cfg.catchup_min_minutes_to_close = catchup_cutoff
+        cfg.discord_webhook_url = ""
+
+        # Bypass __init__ (which builds brokers/strategies) — set only fields used.
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.config = cfg
+        orch.db = _StubDB(marker_date)
+        orch._scan_calls = 0
+        orch.run_scan = lambda: setattr(orch, "_scan_calls", orch._scan_calls + 1) or []
+        return orch
+
+    def _patch_session(self, market_open, mins_to_close, scan_passed=True):
+        """Patch the module-level session helpers + discord to no-op."""
+        from datetime import datetime as _dt, timezone as _tz
+        from zoneinfo import ZoneInfo
+        import options_bot.orchestrator as O
+        # now_pt: put it after (or before) the scheduled scan time
+        now_pt = _dt.now(tz=_tz.utc).astimezone(ZoneInfo("America/Los_Angeles")).replace(
+            hour=(8 if scan_passed else 5), minute=0, second=0, microsecond=0
+        )
+        patches = [
+            patch.object(O, "_market_is_open", lambda: market_open),
+            patch.object(O, "_minutes_to_close", lambda: mins_to_close),
+            patch.object(O, "send_discord", lambda *a, **k: None),
+            patch.object(O, "datetime", _DTShim(now_pt)),
+        ]
+        return patches
+
+    def test_idempotent_when_marker_is_today(self):
+        # Marker says a scan already ran today -> NO catch-up (the multi-restart
+        # protection). This is the single most important guard.
+        orch = self._make_orch(marker_date=date.today().isoformat())
+        ps = self._patch_session(market_open=True, mins_to_close=180)
+        for p in ps: p.start()
+        try:
+            orch._maybe_catchup_scan()
+        finally:
+            for p in ps: p.stop()
+        self.assertEqual(orch._scan_calls, 0)
+
+    def test_runs_when_no_marker_and_market_open_after_window(self):
+        orch = self._make_orch(marker_date=None)
+        ps = self._patch_session(market_open=True, mins_to_close=180, scan_passed=True)
+        for p in ps: p.start()
+        try:
+            orch._maybe_catchup_scan()
+        finally:
+            for p in ps: p.stop()
+        self.assertEqual(orch._scan_calls, 1)
+
+    def test_skips_when_too_close_to_close(self):
+        # Booted late in the session -> do NOT open fresh positions.
+        orch = self._make_orch(marker_date=None, catchup_cutoff=90)
+        ps = self._patch_session(market_open=True, mins_to_close=45, scan_passed=True)
+        for p in ps: p.start()
+        try:
+            orch._maybe_catchup_scan()
+        finally:
+            for p in ps: p.stop()
+        self.assertEqual(orch._scan_calls, 0)
+
+    def test_skips_when_market_closed(self):
+        orch = self._make_orch(marker_date=None)
+        ps = self._patch_session(market_open=False, mins_to_close=-30)
+        for p in ps: p.start()
+        try:
+            orch._maybe_catchup_scan()
+        finally:
+            for p in ps: p.stop()
+        self.assertEqual(orch._scan_calls, 0)
+
+    def test_skips_when_disabled(self):
+        orch = self._make_orch(marker_date=None, enabled=False)
+        ps = self._patch_session(market_open=True, mins_to_close=180)
+        for p in ps: p.start()
+        try:
+            orch._maybe_catchup_scan()
+        finally:
+            for p in ps: p.stop()
+        self.assertEqual(orch._scan_calls, 0)
+
+    def test_three_restarts_one_scan(self):
+        # Simulate the 2026-06-24 pattern: first restart has no marker (scans +
+        # writes marker), next two restarts see the marker and abort.
+        orch = self._make_orch(marker_date=None)
+        # First boot: real run_scan would write the marker; emulate that here.
+        def _scan_and_mark():
+            orch._scan_calls += 1
+            orch.db._md = date.today().isoformat()
+            return []
+        orch.run_scan = _scan_and_mark
+        ps = self._patch_session(market_open=True, mins_to_close=180)
+        for p in ps: p.start()
+        try:
+            orch._maybe_catchup_scan()   # restart 1 -> scans
+            orch._maybe_catchup_scan()   # restart 2 -> marker present -> skip
+            orch._maybe_catchup_scan()   # restart 3 -> marker present -> skip
+        finally:
+            for p in ps: p.stop()
+        self.assertEqual(orch._scan_calls, 1)
 
 
 if __name__ == "__main__":
