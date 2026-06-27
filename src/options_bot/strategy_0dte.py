@@ -1541,14 +1541,16 @@ class ZeroDTEStrategy:
             return []
         try:
             with self.db._get_conn() as conn:
-                cur = conn.execute(
+                cur = self.db._execute(
+                    conn,
                     """SELECT realized_pnl FROM trades
                        WHERE strategy LIKE '0dte_%'
                          AND realized_pnl IS NOT NULL
                        ORDER BY updated_at DESC LIMIT 50"""
                 )
                 return [row[0] for row in cur.fetchall()]
-        except Exception:
+        except Exception as exc:
+            logger.error("[0DTE] _load_recent_pnls failed: %s", exc)
             return []
 
 
