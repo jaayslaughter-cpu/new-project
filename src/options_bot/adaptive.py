@@ -452,7 +452,8 @@ class AdaptiveTuner:
         """Pull closed trades from DB and compute performance metrics."""
         try:
             with self.db._get_conn() as conn:
-                cur = conn.execute(
+                cur = self.db._execute(
+                    conn,
                     """
                     SELECT realized_pnl FROM trades
                     WHERE strategy = ?
@@ -502,7 +503,8 @@ class AdaptiveTuner:
         """Total number of closed trades for this strategy in the DB."""
         try:
             with self.db._get_conn() as conn:
-                cur = conn.execute(
+                cur = self.db._execute(
+                    conn,
                     """
                     SELECT COUNT(*) FROM trades
                     WHERE strategy = ?
@@ -513,7 +515,8 @@ class AdaptiveTuner:
                     (strategy_name,)
                 )
                 return cur.fetchone()[0]
-        except Exception:
+        except Exception as exc:
+            logger.error("[Adaptive] _count_closed failed: %s", exc)
             return 0
 
     # ------------------------------------------------------------------
