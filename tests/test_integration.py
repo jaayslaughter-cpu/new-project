@@ -2333,6 +2333,30 @@ class TestRegressionThreeLiveBugs(unittest.TestCase):
         )
 
 
+    # --- Bug 5: orchestrator passes risk_budget_dollars to EVERY strategy ---
+    # The pipeline calls self.strategy.evaluate(enriched, risk_budget_dollars=...)
+    # uniformly, and swaps self.pipeline.strategy to CSP / ShortCallSpread /
+    # ShortStrangle / IronCondor during the extra-strategy pass. Every strategy's
+    # evaluate() MUST therefore accept the kwarg, or that strategy raises
+    # TypeError and silently never trades (same failure family as the earlier
+    # regime=/open_trades= signature-mismatch bug).
+    def test_all_strategies_accept_risk_budget_kwarg(self):
+        import inspect
+        from options_bot.strategy import (
+            CashSecuredPut, ShortPutSpread, ShortStrangle, ShortCallSpread,
+            IronCondor, BaseStrategy,
+        )
+        for cls in (BaseStrategy, CashSecuredPut, ShortPutSpread, ShortStrangle,
+                    ShortCallSpread, IronCondor):
+            params = inspect.signature(cls.evaluate).parameters
+            self.assertIn(
+                "risk_budget_dollars", params,
+                f"{cls.__name__}.evaluate() is missing risk_budget_dollars — the "
+                f"orchestrator passes it to every strategy; this would TypeError "
+                f"and silently disable {cls.__name__} on every scan."
+            )
+
+
 class TestLiquidityFilterOIFix(unittest.TestCase):
     """The 2026-06-22 logs showed every ticker (incl. SPY/IWM) rejected at the
     liquidity gate. Root cause: yfinance returns open_interest=0, and the gate
