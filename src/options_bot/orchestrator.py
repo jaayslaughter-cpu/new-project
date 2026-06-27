@@ -1455,7 +1455,12 @@ class TradingPipeline:
 
         # --- Step 3: Strategy evaluation ---
         try:
-            signal = self.strategy.evaluate(enriched)
+            _risk_budget = (
+                self.rm._equity * self.rm.config.risk_budget_pct
+                if hasattr(self, "rm") and self.rm is not None
+                else None
+            )
+            signal = self.strategy.evaluate(enriched, risk_budget_dollars=_risk_budget)
         except LiquidityFilterError as exc:
             logger.info("[Pipeline] %s strategy: no qualifying contracts — %s", ticker, exc)
             return None
