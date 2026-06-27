@@ -2302,6 +2302,37 @@ class TestRegressionThreeLiveBugs(unittest.TestCase):
         self.assertEqual(captured["sql"].count("%s"), 1)
 
 
+    # --- Bug 4: direct conn.execute() on a _get_conn() connection ---
+    # psycopg2 connections have NO .execute() method (only cursors do), and a
+    # raw conn.execute() also skips the ?->%s / literal-% rewrite in _execute().
+    # On SQLite (tests) conn.execute works, so this only ever broke on the live
+    # Postgres deployment — silently, behind bare excepts. Every DB read MUST go
+    # through TradeDatabase._execute(). This guard scans the source so a future
+    # edit can't quietly reintroduce a raw conn.execute() call site.
+    def test_no_raw_conn_execute_bypasses_wrapper(self):
+        import os, re
+        pkg_dir = os.path.dirname(
+            __import__("options_bot").__file__
+        )
+        offenders = []
+        # The only two legitimate conn.execute() uses live inside _execute()
+        # itself (the SQLite branch) and the PRAGMA table_info introspection.
+        allowed = ("return conn.execute(sql, params)", 'PRAGMA table_info(trades)')
+        for fname in os.listdir(pkg_dir):
+            if not fname.endswith(".py"):
+                continue
+            path = os.path.join(pkg_dir, fname)
+            with open(path) as fh:
+                for i, line in enumerate(fh, 1):
+                    if "conn.execute(" in line and not any(a in line for a in allowed):
+                        offenders.append(f"{fname}:{i}: {line.strip()}")
+        self.assertEqual(
+            offenders, [],
+            "Raw conn.execute() found — route through TradeDatabase._execute() "
+            "or it will silently fail on Postgres:\n" + "\n".join(offenders)
+        )
+
+
 class TestLiquidityFilterOIFix(unittest.TestCase):
     """The 2026-06-22 logs showed every ticker (incl. SPY/IWM) rejected at the
     liquidity gate. Root cause: yfinance returns open_interest=0, and the gate
