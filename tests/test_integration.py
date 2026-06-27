@@ -1138,7 +1138,7 @@ class TestShortCallSpread(unittest.TestCase):
         import inspect
         sig = inspect.signature(self.strategy.evaluate)
         params = list(sig.parameters.keys())
-        self.assertEqual(params, ["chain"])
+        self.assertIn("chain", params)  # risk_budget_dollars added as optional kwarg
 
     def test_reachable_via_strategy_registry(self):
         from options_bot.strategy import get_strategy, StrategySignal
