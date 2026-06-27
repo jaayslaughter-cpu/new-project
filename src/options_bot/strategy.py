@@ -159,7 +159,7 @@ class BaseStrategy(ABC):
         logger.info("[Strategy] Initialized: %s", name)
 
     @abstractmethod
-    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+    def evaluate(self, chain: list[EnrichedOptionRow], risk_budget_dollars: float | None = None) -> StrategySignal:
         """
         Evaluate the chain and return a StrategySignal if a trade qualifies.
 
@@ -368,7 +368,7 @@ class CashSecuredPut(BaseStrategy):
         super().__init__("CashSecuredPut")
         self.config = config or CSPConfig()
 
-    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+    def evaluate(self, chain: list[EnrichedOptionRow], risk_budget_dollars: float | None = None) -> StrategySignal:
         self._require_nonempty(chain)
         valid = self._require_greeks(chain)
 
@@ -1304,7 +1304,7 @@ class IronCondor(BaseStrategy):
         self._put_spread  = ShortPutSpread(self.cfg.put_side)
         self._call_spread = ShortCallSpread(self.cfg.call_side)
 
-    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+    def evaluate(self, chain: list[EnrichedOptionRow], risk_budget_dollars: float | None = None) -> StrategySignal:
         # Each side runs its full evaluate() — including its own hard-reject
         # delta window, PoP/PoT gate, and GEX/volume-profile checks. If either
         # side can't find a qualifying spread it raises (LiquidityFilterError)
