@@ -1,0 +1,167 @@
+[
+  {
+    "id": "elder93_001",
+    "source": "Trading for a Living (Elder, 1993)",
+    "source_type": "trading_book",
+    "confidence": 0.90,
+    "strategy_name": "Elder-ray (Bull Power / Bear Power)",
+    "strategy_type": "indicator_oscillator",
+    "description": "Bull Power = High_of_bar - 13-day EMA. Bear Power = Low_of_bar - 13-day EMA. Bull Power is normally positive (bulls pushing above average consensus); Bear Power is normally negative (bears pushing below). EMA slope identifies trend direction; Bull/Bear Power identify entry timing within that trend.",
+    "signals": {
+      "buy_condition": "Trend up (EMA rising) AND Bear Power negative but ticking up. Strongest buy: prices new low but Bear Power shallower low (bullish divergence). Do NOT buy when Bear Power is positive (entire bar above EMA — runaway uptrend, greater-fool territory).",
+      "sell_condition": "Price new high but Bull Power lower peak than previous rally — bearish divergence in Bull Power. Cover when Bear Power diverges (prices new low but Bear Power shallower).",
+      "short_condition": "Trend down (EMA falling) AND Bull Power positive but ticking down. Strongest short: prices new high but Bull Power lower top. Do NOT short when Bull Power already negative.",
+      "pyramid_rule": "Add to longs whenever Bear Power dips below zero and ticks up again during uptrend. Add to shorts whenever Bull Power rallies above zero and ticks down during downtrend."
+    },
+    "parameters": {
+      "ema_length": 13,
+      "bull_power_formula": "High_of_bar - 13day_EMA",
+      "bear_power_formula": "Low_of_bar - 13day_EMA"
+    },
+    "notes": "Invented by Alexander Elder in 1989. X-ray analogy: shows bull/bear strength below the price surface. Designed to work with Triple Screen — weekly EMA/MACD sets direction, daily Elder-ray provides entry timing. Best combined with trend-following first screen rather than standalone.",
+    "applicability_to_bot": "DIRECTLY_APPLICABLE — Bull Power and Bear Power formulas slot directly into existing GreeksEnricher / signal stack. Bear Power ticking up during uptrend = buy-timing signal compatible with short-put-spread entries. Worth adding as an auxiliary entry-timing filter alongside existing RSI/MACD.",
+    "tags": ["entry_timing", "oscillator", "elder", "bull_power", "bear_power", "divergence"]
+  },
+  {
+    "id": "elder93_002",
+    "source": "Trading for a Living (Elder, 1993)",
+    "source_type": "trading_book",
+    "confidence": 0.88,
+    "strategy_name": "Force Index (2-day and 13-day EMA variants)",
+    "strategy_type": "indicator_oscillator",
+    "description": "Force Index = Volume_today × (Close_today - Close_yesterday). Raw value is highly jagged. 2-day EMA of Force Index = short-term entry/exit timing. 13-day EMA of Force Index = intermediate trend confirmation and divergence detection.",
+    "signals": {
+      "two_day_ema_buy": "In uptrend (13-day EMA of price rising): buy when 2-day EMA of Force Index turns negative. Place buy order above high of that day — stops you in if rally resumes.",
+      "two_day_ema_short": "In downtrend (13-day EMA of price falling): sell short when 2-day EMA of Force Index turns positive. Place sell order below low of latest bar.",
+      "thirteen_day_ema": "Above centerline = bulls in control. Below centerline = bears in control. New high in 13-day EMA confirms uptrend continuation. Bearish divergence (price new high but Force Index lower peak) = strong sell signal.",
+      "divergence_buy": "Bullish divergence: prices fall to new low but 2-day EMA of Force Index makes shallower bottom → strong buy.",
+      "divergence_sell": "Bearish divergence: prices rally to new high but 2-day EMA of Force Index makes lower top → strong sell."
+    },
+    "parameters": {
+      "formula": "Volume × (Close_today - Close_yesterday)",
+      "short_smoothing": "2-day EMA",
+      "intermediate_smoothing": "13-day EMA",
+      "programming_trick": "Divide Force Index by latest closing price to reduce very large numbers"
+    },
+    "notes": "Force combines price direction, price extent, AND volume — head and heart of market together. 2-day EMA so sensitive it is best used to fine-tune other indicator signals, not standalone. Monthly peak/trough in 2-day EMA of Force Index warns that latest price extreme likely to be retested. Third screen of Triple Screen uses 2-day EMA Force Index for precise entry timing.",
+    "applicability_to_bot": "DIRECTLY_APPLICABLE — 2-day EMA Force Index is the originally-specified second screen in Triple Screen. Bot already has MACD/RSI/ADX but not Force Index. Adding it as an alternative oscillator for daily entry timing would complement the existing regime-based filters. Requires volume data (available from Alpaca bars).",
+    "tags": ["force_index", "volume", "oscillator", "entry_timing", "elder", "triple_screen"]
+  },
+  {
+    "id": "elder93_003",
+    "source": "Trading for a Living (Elder, 1993)",
+    "source_type": "trading_book",
+    "confidence": 0.92,
+    "strategy_name": "Triple Screen Trading System (original 1985 formulation)",
+    "strategy_type": "multi_timeframe_system",
+    "description": "Three screens applied sequentially. Screen 1 (weekly): MACD-Histogram slope identifies market tide — trade only in that direction. Screen 2 (daily): oscillator (Force Index 2-day EMA, Elder-ray, Stochastic, Williams %R) identifies waves against the tide. Screen 3: trailing buy-stop or sell-stop for intraday entry in tide direction.",
+    "signals": {
+      "screen_1_up": "Weekly MACD-Histogram ticking up → trade only from long side or stand aside.",
+      "screen_1_down": "Weekly MACD-Histogram ticking down → trade only from short side or stand aside.",
+      "screen_2_buy_entry": "When weekly up: 2-day EMA Force Index turns negative (or Stochastic below 30, or Bear Power ticking up from below zero) → buy opportunity.",
+      "screen_2_short_entry": "When weekly down: 2-day EMA Force Index turns positive (or Stochastic above 70, or Bull Power ticking down from above zero) → short opportunity.",
+      "screen_3_buy": "Trailing buy-stop: place buy order 1 tick above previous day high. Lower it daily until triggered or weekly signal reverses.",
+      "screen_3_short": "Trailing sell-stop: place sell order 1 tick below previous day low. Raise it daily until triggered or weekly signal reverses.",
+      "stop_loss": "Place stop immediately after entry at extreme of past 2 days range. Move to break-even as soon as market moves in favor."
+    },
+    "parameters": {
+      "timeframe_factor": 5,
+      "weekly_indicator": "MACD-Histogram slope (can also use 13-week EMA slope or Directional System)",
+      "daily_oscillators": ["Force Index 2-day EMA", "Elder-ray Bear/Bull Power", "Stochastic 5-day", "Williams %R 4-5 day"],
+      "best_weekly_buy": "MACD-Histogram uptick from below centerline",
+      "best_weekly_sell": "MACD-Histogram downtick from above centerline"
+    },
+    "notes": "Triple Screen was first published in Futures Magazine April 1986. RSI moves too slowly for Screen 2 — use Force Index, Elder-ray, Stochastic, or Williams %R instead. Conservative traders: enter on first signal and stay until weekly trend reverses. Active traders: pyramid on each new Screen 2 signal in trend direction. The key insight: trend-following on long timeframe + oscillator on shorter timeframe cancels each indicator type's weaknesses.",
+    "applicability_to_bot": "FRAMEWORK_MATCH — Bot's existing scan (weekly/daily regime + daily oscillator entry) is structurally Triple Screen. Upgrade path: (1) add 2-day EMA Force Index as Screen 2 oscillator option, (2) implement trailing buy/sell stop as Screen 3 for more precise entry than market orders, (3) verify weekly MACD-Histogram slope is explicitly computed and used as Screen 1 gate.",
+    "tags": ["triple_screen", "multi_timeframe", "entry_system", "elder", "1986", "trend_following", "oscillator"]
+  },
+  {
+    "id": "elder93_004",
+    "source": "Trading for a Living (Elder, 1993)",
+    "source_type": "trading_book",
+    "confidence": 0.85,
+    "strategy_name": "Divergence Classification System (Class A/B/C)",
+    "strategy_type": "signal_quality_filter",
+    "description": "Formal classification of oscillator-price divergences by reliability. Class A: price new high/low but indicator fails to confirm — STRONGEST signal. Class B: price double top/bottom but indicator makes lower peak/higher trough — SECOND strongest. Class C: price new extreme but indicator makes double top/bottom — WEAKEST, often whipsaw. Triple divergences (three price extremes, three oscillator extremes) are stronger than regular divergences.",
+    "signals": {
+      "class_A_bearish": "Price reaches new high, oscillator makes lower high than previous rally. Usually leads to sharp breaks. Best sell signal.",
+      "class_A_bullish": "Price falls to new low, oscillator makes shallower bottom. Often precedes sharp rallies. Best buy signal.",
+      "class_B_bearish": "Price double top, oscillator traces lower second top.",
+      "class_B_bullish": "Price double bottom, oscillator traces higher second bottom.",
+      "class_C_bearish": "Price new high, oscillator matches previous high (double top in oscillator). Weakest — often whipsaw.",
+      "class_C_bullish": "Price new low, oscillator double bottom. Weakest.",
+      "triple_divergence": "Three price extremes with progressively shallower oscillator extremes — extremely strong signal, especially after a Class A divergence aborts."
+    },
+    "notes": "Valid divergences are 'clearly visible — they seem to jump from the charts.' If you need a ruler to measure whether a divergence exists, assume there is none. Class A and C frequently lead to whipsaws — best to ignore C unless strongly confirmed by other indicators. The strongest MACD-Histogram signals: bearish divergence when MACD-Histogram above centerline (bulls exhausted); bullish divergence when MACD-Histogram below centerline (bears exhausted).",
+    "applicability_to_bot": "SIGNAL_QUALITY_FILTER — Bot's existing MACD/RSI divergence detection could be classified using this framework to weight signals. Class A divergences should receive higher confidence scores than Class B or C. Implement as a multiplier on the existing signal confidence stack.",
+    "tags": ["divergence", "signal_quality", "oscillator", "MACD", "RSI", "class_A", "classification"]
+  },
+  {
+    "id": "elder93_005",
+    "source": "Trading for a Living (Elder, 1993)",
+    "source_type": "trading_book",
+    "confidence": 0.87,
+    "strategy_name": "Channel Trading with Divergence Confirmation (Stoller Method)",
+    "strategy_type": "mean_reversion_signal",
+    "description": "Build a channel around 13-day EMA adjusted until it contains 90-95% of price action. Upper channel line = EMA + (coefficient × EMA). Lower channel line = EMA - (coefficient × EMA). Coefficient adjusted quarterly. Trade against deviations (professionals) not in the direction of breakouts (amateurs). Strongest signals: indicator divergence occurs at channel boundary simultaneously.",
+    "signals": {
+      "channel_sell": "Price reaches upper channel line AND oscillator (Stochastic or MACD-Histogram) traces a lower peak (bearish divergence). Bulls weak at overextended price.",
+      "channel_buy": "Price reaches lower channel line AND oscillator traces a higher bottom (bullish divergence). Bears weak at underextended price.",
+      "strong_trend_rule": "When channel rising sharply and price penetrates upper boundary, expect return to EMA — add to longs on that pullback to EMA. Reverse for downtrending channels.",
+      "bollinger_bands_option": "For options traders: Bollinger bands narrow when volatility low → options cheap → favorable to buy options premium. Bands wide → options expensive → favorable to write/sell options."
+    },
+    "parameters": {
+      "ema_backbone": "13-day EMA",
+      "channel_coverage": "90-95% of price action",
+      "adjustment_frequency": "quarterly",
+      "weekly_channels": "Coefficients approximately 2× wider than daily channels"
+    },
+    "notes": "Gerald Appel's rules: flat channel = buy lower wall, sell upper wall. Manning Stoller's key insight: combining channel extremes with indicator divergences filters out most false signals. Professionals fade channel extremes; amateurs chase breakouts. Most breakouts are exhaustion moves quickly aborted. Bollinger bands uniquely useful for options because they directly measure the volatility that determines options pricing.",
+    "applicability_to_bot": "OPTIONS_RELEVANT — Bollinger Bands narrowing signals low IV environment → favorable for options BUYERS; wide bands signal high IV → favorable for options SELLERS (short premium). Bot already targets short premium (mean-reverting regime). Add Bollinger Band width as an additional filter: prefer entering short-premium positions when BB is wide (IV elevated, premium rich). Already implemented indirectly via VIX/IVR checks but this gives a per-ticker directional entry filter.",
+    "tags": ["channels", "bollinger_bands", "mean_reversion", "options_volatility", "divergence", "stoller", "appel"]
+  },
+  {
+    "id": "elder93_006",
+    "source": "Trading for a Living (Elder, 1993)",
+    "source_type": "trading_book",
+    "confidence": 0.90,
+    "strategy_name": "2% Risk Rule + Anti-Martingale Position Sizing",
+    "strategy_type": "money_management",
+    "description": "Never risk more than 2% of account equity on any single trade (including slippage and commissions). Most professionals consider 2% too high — they cap at 1%-1.5%. Stop trading for the rest of the month if total monthly losses reach 6-8% of equity. Anti-martingale: trade MORE when system is in sync with market (winning), trade LESS when out of sync (losing). Never average down, never meet a margin call.",
+    "signals": {
+      "position_size_rule": "Max_risk_per_trade = 2% of equity. Number of contracts = floor(Max_risk / risk_per_contract). Risk_per_contract = entry_price - stop_price × contract_multiplier.",
+      "monthly_stop": "If total monthly P&L loss reaches 6-8% of equity, stop trading for the rest of the month. Use time to re-examine system and markets.",
+      "pyramid_rule": "Add to winning positions only when: (a) existing position at break-even or better, (b) risk on additional position ≤ 2% of equity.",
+      "anti_martingale": "As account grows, 2% rule automatically sizes larger. When account shrinks, sizes down. Never increase size after losses.",
+      "optimal_f_warning": "If trading at more than the mathematically optimal fraction, ruin is certain. When in doubt, risk less."
+    },
+    "notes": "Key insight from optimal-f research: trading MORE than optimal fraction guarantees ruin; trading less reduces profits geometrically but risk decreases arithmetically — asymmetric benefit to conservatism. Loss recovery math: 10% loss requires 11% gain, 20% loss requires 25%, 40% loss requires 67%, 50% loss requires 100%. Losses grow arithmetically, recovery required grows geometrically. The first loss is cheapest. Vince: Never average down; liquidate worst position if must reduce; first mistake is cheapest.",
+    "applicability_to_bot": "ALREADY_IMPLEMENTED — Bot's 1% risk budget per trade directly implements this (Elder recommends 1-1.5% for professionals). The monthly 6-8% stop maps to bot's 8% drawdown limit. The anti-martingale principle is implemented via the risk budget's equity-percentage basis. Confirms current approach is correct. No code changes needed.",
+    "tags": ["money_management", "position_sizing", "risk_control", "2percent_rule", "anti_martingale", "optimal_f"]
+  },
+  {
+    "id": "elder93_007",
+    "source": "Trading for a Living (Elder, 1993)",
+    "source_type": "trading_book",
+    "confidence": 0.85,
+    "strategy_name": "Parabolic Stop Trailing System (Wilder, 1976)",
+    "strategy_type": "exit_management",
+    "description": "Parabolic moves stops in the direction of the trade based on time AND price. Stop_tomorrow = Stop_today + AF × (EP_trade - Stop_today). EP = extreme point reached since entry. AF (Acceleration Factor) starts at 0.02, increases by 0.02 each day price reaches new high (long) or new low (short), max 0.20. If market fails to reach new extremes, AF still moves stop forward — forces exit from stagnant trades.",
+    "signals": {
+      "long_stop": "Daily: Stop_tomorrow = Stop_today + AF × (Highest_high_since_entry - Stop_today). Raise AF by 0.02 each new high, cap at 0.20.",
+      "short_stop": "Daily: Stop_tomorrow = Stop_today - AF × (Stop_today - Lowest_low_since_entry). Lower AF by 0.02 each new low, cap at 0.20.",
+      "whipsaw_signal": "Two whipsaws in a row = market is flat. Stop using Parabolic, track on paper until two good signals appear.",
+      "entry_method": "Enter via Triple Screen or other system. Switch to Parabolic only once riding a confirmed strong trend."
+    },
+    "parameters": {
+      "af_initial": 0.02,
+      "af_step": 0.02,
+      "af_max": 0.20,
+      "adjustment": "AF does not increase on days with no new extreme. Stop still moves forward by existing AF.",
+      "constraint": "Never move stop into previous day's range."
+    },
+    "notes": "Parabolic is excellent for runaway trends where chart patterns are hard to read. Not useful in flat markets — only activate after confirming trend via other methods. Original was a full reversal system (go short when long stop hit). Modern use: enter via another system, then apply Parabolic stops only to protect profits in confirmed trends. AF starting at 0.02 means 2% of distance between EP and stop is moved each day even with no new extreme — forces out stagnant trades.",
+    "applicability_to_bot": "ROLLING_MILESTONE — Parabolic stop logic is relevant for the rolling feature (when built post-30-trade milestone). It provides a principled stop-advancing framework for managing winning short-premium positions without the vagueness of 'DTE-based' rolling triggers. Could be used to advance profit-protection stops on short put spreads as time passes without adverse movement.",
+    "tags": ["parabolic", "trailing_stop", "exit_management", "wilder", "trend_following", "runaway_trend"]
+  }
+]
