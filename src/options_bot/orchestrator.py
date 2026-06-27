@@ -3219,12 +3219,14 @@ class Orchestrator:
         # Pull all realized P&L from closed trades in DB for full metrics
         try:
             with self.db._get_conn() as conn:
-                cur = conn.execute(
+                cur = self.db._execute(
+                    conn,
                     "SELECT realized_pnl FROM trades WHERE trade_date=? AND realized_pnl IS NOT NULL",
                     (today,)
                 )
                 all_pnls = [row[0] for row in cur.fetchall()]
-        except Exception:
+        except Exception as exc:
+            logger.error("[Orchestrator] EOD realized_pnl query failed: %s", exc)
             all_pnls = []
 
         # Compute metrics if we have any closed trades
@@ -3345,25 +3347,29 @@ class Orchestrator:
     def _query_all_pnls(self):
         try:
             with self.db._get_conn() as conn:
-                cur = conn.execute(
+                cur = self.db._execute(
+                    conn,
                     "SELECT realized_pnl FROM trades "
                     "WHERE status NOT IN ('open') AND realized_pnl IS NOT NULL"
                 )
                 return [row[0] for row in cur.fetchall()]
-        except Exception:
+        except Exception as exc:
+            logger.error("[Orchestrator] _query_all_pnls failed: %s", exc)
             return []
 
     def _query_pnls_since(self, since_date):
         try:
             with self.db._get_conn() as conn:
-                cur = conn.execute(
+                cur = self.db._execute(
+                    conn,
                     "SELECT realized_pnl FROM trades "
                     "WHERE status NOT IN ('open') AND realized_pnl IS NOT NULL "
                     "AND trade_date >= ?",
                     (since_date.isoformat(),)
                 )
                 return [row[0] for row in cur.fetchall()]
-        except Exception:
+        except Exception as exc:
+            logger.error("[Orchestrator] _query_pnls_since failed: %s", exc)
             return []
 
     def _pnl_block(self, pnls, label):
@@ -3396,7 +3402,8 @@ class Orchestrator:
         try:
             with self.db._get_conn() as conn:
                 try:
-                    cur = conn.execute(
+                    cur = self.db._execute(
+                        conn,
                         "SELECT snapshot_date, equity "
                         "FROM equity_snapshots "
                         "ORDER BY snapshot_date ASC"
@@ -3408,7 +3415,8 @@ class Orchestrator:
                     pass  # table may not exist yet — fall through to reconstruction
 
                 # Reconstruction: build cumulative curve from closed trade P&L
-                cur = conn.execute(
+                cur = self.db._execute(
+                    conn,
                     "SELECT trade_date, realized_pnl FROM trades "
                     "WHERE status NOT IN ('open') AND realized_pnl IS NOT NULL "
                     "ORDER BY trade_date ASC"
