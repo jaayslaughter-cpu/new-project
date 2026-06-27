@@ -482,7 +482,8 @@ def positions_from_broker(broker, db=None) -> list[StressPosition]:
     if db:
         try:
             with db._get_conn() as conn:
-                cur = conn.execute(
+                cur = db._execute(
+                    conn,
                     "SELECT underlying, strategy, max_loss, net_credit, contracts, "
                     "delta, vega, theta, underlying_price "
                     "FROM trades WHERE status='open'"
