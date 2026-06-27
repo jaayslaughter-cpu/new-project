@@ -511,7 +511,7 @@ class ShortPutSpread(BaseStrategy):
         super().__init__("ShortPutSpread")
         self.config = config or ShortPutSpreadConfig()
 
-    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+    def evaluate(self, chain: list[EnrichedOptionRow], risk_budget_dollars: float | None = None) -> StrategySignal:
         self._require_nonempty(chain)
         valid = self._require_greeks(chain)
 
@@ -585,6 +585,40 @@ class ShortPutSpread(BaseStrategy):
             long_leg_candidates,
             key=lambda c: abs(c.delta - cfg.long_delta)
         )
+
+        # BUDGET-FIT: If the natural long leg produces a max loss that exceeds
+        # the risk budget, walk the long leg closer to the short strike
+        # (higher strike = narrower spread = lower max loss) until it fits.
+        # Caller passes risk_budget_dollars; None means skip (backward-compat).
+        if risk_budget_dollars is not None:
+            # Sort ascending by strike (widest→narrowest for puts)
+            _sorted_candidates = sorted(long_leg_candidates, key=lambda c: c.strike)
+            _chosen = None
+            for _cand in _sorted_candidates:
+                _trial_width = short_put.strike - _cand.strike
+                _trial_credit = short_put.mid_price - _cand.mid_price
+                _trial_max_loss = (_trial_width - _trial_credit) * 100
+                if _trial_max_loss <= risk_budget_dollars:
+                    _chosen = _cand
+                    break
+            if _chosen is not None and _chosen is not long_put:
+                logger.info(
+                    "[%s] Budget-fit: narrowed spread from %.0f-wide (loss=$%.0f) "
+                    "to %.0f-wide (loss=$%.0f) to fit risk budget $%.0f",
+                    self.name,
+                    short_put.strike - long_put.strike,
+                    (short_put.strike - long_put.strike - (short_put.mid_price - long_put.mid_price)) * 100,
+                    short_put.strike - _chosen.strike,
+                    (short_put.strike - _chosen.strike - (short_put.mid_price - _chosen.mid_price)) * 100,
+                    risk_budget_dollars,
+                )
+                long_put = _chosen
+            elif _chosen is None:
+                raise LiquidityFilterError(
+                    f"{short_put.underlying} chain",
+                    f"[{self.name}] No spread width fits risk budget ${risk_budget_dollars:.0f} "
+                    f"(even 1-wide exceeds budget — equity too small for this ticker)"
+                )
 
         spread_width = short_put.strike - long_put.strike
         short_credit = short_put.mid_price
@@ -770,7 +804,7 @@ class ShortStrangle(BaseStrategy):
         super().__init__("ShortStrangle")
         self.config = config or ShortStrangleConfig()
 
-    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+    def evaluate(self, chain: list[EnrichedOptionRow], risk_budget_dollars: float | None = None) -> StrategySignal:
         self._require_nonempty(chain)
         valid = self._require_greeks(chain)
 
@@ -976,7 +1010,7 @@ class ShortCallSpread(BaseStrategy):
         super().__init__("ShortCallSpread")
         self.config = config or ShortCallSpreadConfig()
 
-    def evaluate(self, chain: list[EnrichedOptionRow]) -> StrategySignal:
+    def evaluate(self, chain: list[EnrichedOptionRow], risk_budget_dollars: float | None = None) -> StrategySignal:
         self._require_nonempty(chain)
         valid = self._require_greeks(chain)
 
@@ -1040,6 +1074,39 @@ class ShortCallSpread(BaseStrategy):
             long_leg_candidates,
             key=lambda c: abs(c.delta - cfg.long_delta)
         )
+
+        # BUDGET-FIT: mirror of ShortPutSpread logic — walk the long call leg
+        # closer to the short strike (lower strike = narrower spread = lower
+        # max loss) until the spread fits the risk budget.
+        if risk_budget_dollars is not None:
+            # Sort descending by strike (widest→narrowest for calls)
+            _sorted_candidates = sorted(long_leg_candidates, key=lambda c: -c.strike)
+            _chosen = None
+            for _cand in _sorted_candidates:
+                _trial_width = _cand.strike - short_call.strike
+                _trial_credit = short_call.mid_price - _cand.mid_price
+                _trial_max_loss = (_trial_width - _trial_credit) * 100
+                if _trial_max_loss <= risk_budget_dollars:
+                    _chosen = _cand
+                    break
+            if _chosen is not None and _chosen is not long_call:
+                logger.info(
+                    "[%s] Budget-fit: narrowed spread from %.0f-wide (loss=$%.0f) "
+                    "to %.0f-wide (loss=$%.0f) to fit risk budget $%.0f",
+                    self.name,
+                    long_call.strike - short_call.strike,
+                    (long_call.strike - short_call.strike - (short_call.mid_price - long_call.mid_price)) * 100,
+                    _chosen.strike - short_call.strike,
+                    (_chosen.strike - short_call.strike - (short_call.mid_price - _chosen.mid_price)) * 100,
+                    risk_budget_dollars,
+                )
+                long_call = _chosen
+            elif _chosen is None:
+                raise LiquidityFilterError(
+                    f"{short_call.underlying} chain",
+                    f"[{self.name}] No spread width fits risk budget ${risk_budget_dollars:.0f} "
+                    f"(even 1-wide exceeds budget — equity too small for this ticker)"
+                )
 
         spread_width  = long_call.strike - short_call.strike
         short_credit  = short_call.mid_price
