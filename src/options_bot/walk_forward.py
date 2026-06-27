@@ -314,7 +314,8 @@ def check_tuner_permission(
     """
     try:
         with db._get_conn() as conn:
-            cur = conn.execute(
+            cur = db._execute(
+                conn,
                 """SELECT updated_at, realized_pnl FROM trades
                    WHERE strategy = ?
                      AND status IN ('stopped_out','closed_profit_target',
