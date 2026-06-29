@@ -57,6 +57,7 @@ from .exceptions import (
     StalenessError,
 )
 from .greeks import GreeksEnricher, get_risk_free_rate
+from .dividends import DIVIDEND_YIELDS
 from .parity_check import check_parity
 from .vrp_gate import evaluate_vrp_gate, PROVISIONAL_RV_WINDOW
 from .market_data import YFinanceDataLoader
@@ -1238,7 +1239,7 @@ class TradingPipeline:
         self.db = db
         self.state = state
         self._regime    = regime_detector or RegimeDetector()
-        self.enricher   = GreeksEnricher()   # fetches Treasury rate on init
+        self.enricher   = GreeksEnricher(dividend_yields=DIVIDEND_YIELDS)   # fetches Treasury rate on init
         self.strategy   = get_strategy(config.strategy_name, config.strategy_config)
         self._sentiment = SentimentAnalyzer(config=SentimentConfig())
         self._confidence = ConfidenceScorer(
