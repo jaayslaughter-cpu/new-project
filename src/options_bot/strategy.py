@@ -70,6 +70,7 @@ from .spread_math import (
     validate_spread_inputs,
 )
 from .greeks import probability_of_profit, pop_spread, get_risk_free_rate
+from .dividends import DIVIDEND_YIELDS
 from .earnings_calendar import EarningsFilter
 from .volume_profile import check_strike_safety, volume_profile_cache
 from .gex_analysis import analyze_gex, check_strike_gex_safety
@@ -699,6 +700,7 @@ class ShortPutSpread(BaseStrategy):
                 sigma=short_iv,
                 rate=rate,
                 days_to_expiry=short_put.dte,
+                dividend_yield=DIVIDEND_YIELDS.get(short_put.underlying, 0.0),
             )
             if prob["pop"] < cfg.min_pop:
                 raise LiquidityFilterError(
@@ -1183,6 +1185,7 @@ class ShortCallSpread(BaseStrategy):
                 sigma=short_iv,
                 rate=rate,
                 days_to_expiry=short_call.dte,
+                dividend_yield=DIVIDEND_YIELDS.get(short_call.underlying, 0.0),
             )
             if prob["pop"] < cfg.min_pop:
                 raise LiquidityFilterError(
