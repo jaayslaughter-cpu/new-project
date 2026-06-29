@@ -125,10 +125,10 @@ def get_risk_free_rate() -> float:
 # ---------------------------------------------------------------------------
 
 def _bs_d1_d2(
-    S: float, K: float, T: float, r: float, sigma: float
+    S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
 ) -> tuple[float, float]:
     """
-    Compute d1 and d2 for Black-Scholes.
+    Compute d1 and d2 for Black-Scholes-Merton (continuous dividend yield).
 
     Parameters
     ----------
@@ -137,6 +137,7 @@ def _bs_d1_d2(
     T : float  — time to expiry in years
     r : float  — risk-free rate (annual decimal)
     sigma : float — implied volatility (annual decimal)
+    q : float  — continuous dividend yield (annual decimal, default 0.0)
     """
     if T <= 0:
         raise DataValidationError("T", f"Time to expiry must be positive, got {T}")
@@ -148,61 +149,76 @@ def _bs_d1_d2(
         raise DataValidationError("K", f"Strike must be positive, got {K}")
 
     sqrt_T = math.sqrt(T)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
     d2 = d1 - sigma * sqrt_T
     return d1, d2
 
 
 def bs_price(
-    S: float, K: float, T: float, r: float, sigma: float, option_type: str
+    S: float, K: float, T: float, r: float, sigma: float, option_type: str,
+    q: float = 0.0,
 ) -> float:
-    """Black-Scholes option price."""
-    d1, d2 = _bs_d1_d2(S, K, T, r, sigma)
+    """Black-Scholes-Merton option price with continuous dividend yield q.
+
+    When q=0 (default) this reduces exactly to the plain Black-Scholes formula,
+    so all existing callers are unaffected.
+    """
+    d1, d2    = _bs_d1_d2(S, K, T, r, sigma, q)
+    disc_S    = S * math.exp(-q * T)   # dividend-adjusted spot  (= S when q=0)
+    disc_K    = K * math.exp(-r * T)
     if option_type == "call":
-        return S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+        return disc_S * norm.cdf(d1) - disc_K * norm.cdf(d2)
     else:
-        return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        return disc_K * norm.cdf(-d2) - disc_S * norm.cdf(-d1)
 
 
 def bs_greeks(
-    S: float, K: float, T: float, r: float, sigma: float, option_type: str
+    S: float, K: float, T: float, r: float, sigma: float, option_type: str,
+    q: float = 0.0,
 ) -> dict[str, float]:
     """
-    Compute all first-order Greeks analytically.
+    Compute all first-order Greeks analytically (Black-Scholes-Merton).
+
+    When q=0 (default) all formulas reduce exactly to plain Black-Scholes,
+    so existing callers are unaffected.
 
     Returns dict with keys: delta, gamma, theta, vega, rho
     theta is per calendar day (not per year).
     vega is per 1-point move in IV (i.e. per 0.01 in sigma decimal).
     """
-    d1, d2 = _bs_d1_d2(S, K, T, r, sigma)
-    sqrt_T = math.sqrt(T)
-    pdf_d1 = norm.pdf(d1)
-    exp_rT = math.exp(-r * T)
+    d1, d2  = _bs_d1_d2(S, K, T, r, sigma, q)
+    sqrt_T  = math.sqrt(T)
+    pdf_d1  = norm.pdf(d1)
+    exp_rT  = math.exp(-r * T)
+    exp_qT  = math.exp(-q * T)   # = 1.0 when q=0
 
-    # Delta
+    # Delta — Merton: e^(-q·T)·N(d1) for call, e^(-q·T)·(N(d1)−1) for put
     if option_type == "call":
-        delta = norm.cdf(d1)
+        delta = exp_qT * norm.cdf(d1)
     else:
-        delta = norm.cdf(d1) - 1.0
+        delta = exp_qT * (norm.cdf(d1) - 1.0)
 
-    # Gamma (same for call and put)
-    gamma = pdf_d1 / (S * sigma * sqrt_T)
+    # Gamma — picks up e^(-q·T) factor
+    gamma = exp_qT * pdf_d1 / (S * sigma * sqrt_T)
 
-    # Theta (per calendar day — divide annual theta by 365)
+    # Theta (per calendar day)
+    base_theta = -(S * exp_qT * pdf_d1 * sigma) / (2 * sqrt_T)
     if option_type == "call":
         theta_annual = (
-            -(S * pdf_d1 * sigma) / (2 * sqrt_T)
+            base_theta
             - r * K * exp_rT * norm.cdf(d2)
+            + q * S * exp_qT * norm.cdf(d1)
         )
     else:
         theta_annual = (
-            -(S * pdf_d1 * sigma) / (2 * sqrt_T)
+            base_theta
             + r * K * exp_rT * norm.cdf(-d2)
+            - q * S * exp_qT * norm.cdf(-d1)
         )
     theta = theta_annual / 365.0
 
-    # Vega (per 1-point move = 0.01 in sigma)
-    vega = S * pdf_d1 * sqrt_T * 0.01
+    # Vega (per 1% IV move = 0.01 in sigma); picks up e^(-q·T) factor
+    vega = S * exp_qT * pdf_d1 * sqrt_T * 0.01
 
     # Rho (per 1% rate move = 0.01)
     if option_type == "call":
@@ -228,6 +244,7 @@ def solve_iv(
     initial_guess: float = 0.25,
     max_iterations: int = 100,
     tolerance: float = 1e-6,
+    q: float = 0.0,
 ) -> float:
     """
     Newton-Raphson implied volatility solver.
@@ -270,10 +287,10 @@ def solve_iv(
     sigma = initial_guess
     for i in range(max_iterations):
         try:
-            price = bs_price(S, K, T, r, sigma, option_type)
-            d1, _ = _bs_d1_d2(S, K, T, r, sigma)
-            # Vega = S * N'(d1) * sqrt(T)  (NOT divided by 100 here)
-            vega = S * norm.pdf(d1) * math.sqrt(T)
+            price = bs_price(S, K, T, r, sigma, option_type, q)
+            d1, _ = _bs_d1_d2(S, K, T, r, sigma, q)
+            # Merton vega = S·e^(-q·T)·N'(d1)·√T  (NOT divided by 100 here)
+            vega = S * math.exp(-q * T) * norm.pdf(d1) * math.sqrt(T)
 
             if abs(vega) < 1e-10:
                 raise IVSolveError("?", "Vega near zero — deep ITM/OTM, cannot solve")
@@ -313,7 +330,8 @@ class GreeksEnricher:
     Plugs into the pipeline after market_data and before the strategy engine.
     """
 
-    def __init__(self, risk_free_rate: Optional[float] = None, pricing_model: str = "black_scholes"):
+    def __init__(self, risk_free_rate: Optional[float] = None, pricing_model: str = "black_scholes",
+                 dividend_yields: Optional[dict] = None):
         """
         Parameters
         ----------
@@ -323,12 +341,18 @@ class GreeksEnricher:
         pricing_model : str
             "black_scholes" for European-style (SPX, SPY index options).
             "binomial_crr" for American-style single-stock (requires QuantLib).
+        dividend_yields : dict or None
+            Per-ticker annualised continuous dividend yields, e.g.
+            {"SPY": 0.013, "TLT": 0.035}.  Defaults to an empty dict
+            (q=0 for all tickers — plain Black-Scholes).  Typically passed
+            from ``dividends.DIVIDEND_YIELDS``.
         """
-        self._override_rate = risk_free_rate
-        self.pricing_model = pricing_model
+        self._override_rate    = risk_free_rate
+        self.pricing_model     = pricing_model
+        self._dividend_yields  = dividend_yields or {}
         logger.info(
-            "[GreeksEnricher] Initialized (model=%s, rate_override=%s)",
-            pricing_model, risk_free_rate
+            "[GreeksEnricher] Initialized (model=%s, rate_override=%s, div_yields=%d tickers)",
+            pricing_model, risk_free_rate, len(self._dividend_yields)
         )
 
     def get_rate(self) -> float:
@@ -355,7 +379,8 @@ class GreeksEnricher:
         logger.debug("[GreeksEnricher] Enriching %s", row.symbol)
 
         rate = self.get_rate()
-        T = row.dte / 365.0  # time to expiry in years
+        T    = row.dte / 365.0  # time to expiry in years
+        q    = self._dividend_yields.get(row.underlying, 0.0)   # per-ticker yield
 
         # Need mid_price to solve IV
         market_price = row.mid_price
@@ -380,6 +405,7 @@ class GreeksEnricher:
                 T=T,
                 r=rate,
                 option_type=row.option_type,
+                q=q,
             )
         except IVSolveError as exc:
             logger.debug("[GreeksEnricher] IV solve failed for %s: %s", row.symbol, exc)
@@ -399,6 +425,7 @@ class GreeksEnricher:
                 r=rate,
                 sigma=iv,
                 option_type=row.option_type,
+                q=q,
             )
         except (DataValidationError, ZeroDivisionError, ValueError) as exc:
             logger.warning(
