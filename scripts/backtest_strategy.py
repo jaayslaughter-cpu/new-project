@@ -69,6 +69,7 @@ from scipy.stats import norm
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from options_bot.greeks import bs_price, bs_greeks, pop_spread
 from options_bot.realized_vol import rv_yang_zhang
+from options_bot.dividends import DIVIDEND_YIELDS
 
 # ── IV source mapping ─────────────────────────────────────────────────────────
 # Each entry: (source_type, series_id_or_yf_ticker, vix_multiplier)
@@ -321,6 +322,7 @@ def evaluate_spread(
     T      = cfg.target_dte / TRADING_DAYS
     r      = RISK_FREE_RATE
     budget = cfg.equity * cfg.risk_pct
+    q      = DIVIDEND_YIELDS.get(ticker, 0.0)   # per-ticker dividend yield
 
     if strategy == "short_put_spread":
         short_delta = cfg.short_put_delta
@@ -343,8 +345,8 @@ def evaluate_spread(
     if width < cfg.min_spread_width or width > cfg.max_spread_width:
         return None, BlockedEntry(str(sim_date), ticker, strategy, "width")
 
-    short_price = bs_price(S, short_K, T, r, iv, otype)
-    long_price  = bs_price(S, long_K,  T, r, iv, otype)
+    short_price = bs_price(S, short_K, T, r, iv, otype, q)
+    long_price  = bs_price(S, long_K,  T, r, iv, otype, q)
     net_credit  = short_price - long_price
 
     if net_credit < cfg.min_credit:
@@ -356,6 +358,7 @@ def evaluate_spread(
         short_strike=short_K, long_strike=long_K,
         net_credit=net_credit, spot=S,
         sigma=iv, rate=r, days_to_expiry=cfg.target_dte,
+        dividend_yield=q,
     )
     pop = float(pop_result.get("pop", 0.0)) if isinstance(pop_result, dict) \
           else float(pop_result)
@@ -369,7 +372,7 @@ def evaluate_spread(
         trial_w = width - 1.0
         while trial_w >= cfg.min_spread_width:
             fit_K     = short_K - trial_w if otype == "put" else short_K + trial_w
-            fit_lp    = bs_price(S, fit_K, T, r, iv, otype)
+            fit_lp    = bs_price(S, fit_K, T, r, iv, otype, q)
             fit_cred  = short_price - fit_lp
             fit_loss  = (trial_w - fit_cred) * 100
             if fit_loss <= budget and fit_cred >= cfg.min_credit:
@@ -398,6 +401,7 @@ def simulate_exit(trade: Trade, close_s: pd.Series, iv_s: pd.Series,
     entry_date = date.fromisoformat(trade.date)
     otype      = "put" if "put" in trade.strategy else "call"
     r          = RISK_FREE_RATE
+    q          = DIVIDEND_YIELDS.get(trade.ticker, 0.0)
     stop_p     = trade.net_credit * cfg.stop_multiplier
     target_p   = trade.net_credit * (1 - cfg.profit_target_pct)
     half_dte   = trade.dte_at_entry // 2
@@ -415,8 +419,8 @@ def simulate_exit(trade: Trade, close_s: pd.Series, iv_s: pd.Series,
              else trade.iv_used
 
         try:
-            sm = bs_price(S, trade.short_strike, T_rem, r, iv, otype)
-            lm = bs_price(S, trade.long_strike,  T_rem, r, iv, otype)
+            sm = bs_price(S, trade.short_strike, T_rem, r, iv, otype, q)
+            lm = bs_price(S, trade.long_strike,  T_rem, r, iv, otype, q)
             spread_cost = sm - lm
         except Exception:
             spread_cost = trade.net_credit
@@ -517,10 +521,11 @@ def run_backtest(
                         trades.append(open_trade); open_trade = None
                     elif days_in >= 1:
                         try:
+                            _q = DIVIDEND_YIELDS.get(ticker, 0.0)
                             sm = bs_price(S, open_trade.short_strike, T_rem,
-                                          RISK_FREE_RATE, iv, otype_ot)
+                                          RISK_FREE_RATE, iv, otype_ot, _q)
                             lm = bs_price(S, open_trade.long_strike, T_rem,
-                                          RISK_FREE_RATE, iv, otype_ot)
+                                          RISK_FREE_RATE, iv, otype_ot, _q)
                             sc = sm - lm
                         except Exception:
                             sc = open_trade.net_credit
