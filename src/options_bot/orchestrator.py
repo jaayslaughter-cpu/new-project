@@ -2044,39 +2044,75 @@ class PositionMonitor:
             if hard_stop <= 0:
                 return
 
-            # Use the first short leg as the primary price signal
+            # Identify short and long legs. The stop/profit-target thresholds
+            # were computed against the SPREAD's net price (entry_credit and
+            # its multiples) — comparing them against a single leg's raw
+            # ask/bid is a unit mismatch that will almost always falsely
+            # trigger, since one leg's standalone price is typically much
+            # larger than the spread's net debit/credit (the other leg's
+            # value is being ignored entirely). Always compute the actual
+            # cost to close the full position: buy back the short leg at its
+            # ask, sell the long leg at its bid. cost_to_close = short_ask -
+            # long_bid. This mirrors scripts/backtest_real_chains.py's exit
+            # accounting and is the only number directly comparable to
+            # hard_stop / profit_target.
             short_legs = [l for l in legs if "sell" in l.get("side", "")]
+            long_legs  = [l for l in legs if "buy" in l.get("side", "")]
             if not short_legs:
                 return
 
             short_symbol = short_legs[0]["symbol"]
-            quote = quotes.get(short_symbol, {})
-            ask_price = quote.get("ask")   # cost to close the short leg
+            short_quote = quotes.get(short_symbol, {})
+            short_ask = short_quote.get("ask")
+            short_bid = short_quote.get("bid")
 
-            if ask_price is None:
+            if short_ask is None:
                 logger.debug("[Monitor] No ask for %s — skipping", short_symbol)
                 return
 
+            if long_legs:
+                long_symbol = long_legs[0]["symbol"]
+                long_quote = quotes.get(long_symbol, {})
+                long_bid = long_quote.get("bid")
+                long_ask = long_quote.get("ask")
+                if long_bid is None:
+                    logger.debug(
+                        "[Monitor] No bid for long leg %s — falling back to "
+                        "single-leg short price (less accurate, defined-risk "
+                        "spread math unavailable this cycle)", long_symbol
+                    )
+                    cost_to_close = short_ask
+                    cost_to_close_bid = short_bid
+                else:
+                    # Defined-risk spread: true cost to close is short_ask - long_bid
+                    cost_to_close = short_ask - long_bid
+                    cost_to_close_bid = (short_bid - long_ask) if (short_bid is not None and long_ask is not None) else None
+            else:
+                # Single-leg position (e.g. CashSecuredPut) — short leg price IS the position price
+                cost_to_close = short_ask
+                cost_to_close_bid = short_bid
+
             # --- Stop loss ---
-            if ask_price >= hard_stop:
+            if cost_to_close >= hard_stop:
                 logger.warning(
-                    "[Monitor] STOP HIT: %s %s — ask=%.2f >= stop=%.2f",
+                    "[Monitor] STOP HIT: %s %s — cost_to_close=%.2f >= stop=%.2f "
+                    "(short_ask=%.2f%s)",
                     trade.get("underlying",""), trade.get("strategy",""),
-                    ask_price, hard_stop
+                    cost_to_close, hard_stop, short_ask,
+                    f", long_bid={long_bid:.2f}" if long_legs and long_bid is not None else ""
                 )
-                self._close_trade(trade, ask_price, reason="stop_hit")
+                self._close_trade(trade, cost_to_close, reason="stop_hit")
                 return
 
-            # --- Profit target: bid price has fallen to <= 50% of entry credit ---
-            if profit_target is not None:
-                bid_price = quote.get("bid")
-                if bid_price is not None and bid_price <= profit_target:
+            # --- Profit target: cost to close has fallen to <= target ---
+            if profit_target is not None and cost_to_close_bid is not None:
+                if cost_to_close_bid <= profit_target:
                     logger.info(
-                        "[Monitor] PROFIT TARGET: %s %s — bid=%.2f <= target=%.2f (50%% of %.2f credit)",
+                        "[Monitor] PROFIT TARGET: %s %s — cost_to_close=%.2f <= target=%.2f (%.2f of %.2f credit)",
                         trade.get("underlying",""), trade.get("strategy",""),
-                        bid_price, profit_target, entry_credit
+                        cost_to_close_bid, profit_target, profit_target, entry_credit
                     )
-                    self._close_trade(trade, bid_price, reason="profit_target")
+                    self._close_trade(trade, cost_to_close_bid, reason="profit_target")
 
         except Exception as exc:
             logger.error("[Monitor] Error checking trade %s: %s", trade.get("id"), exc)
