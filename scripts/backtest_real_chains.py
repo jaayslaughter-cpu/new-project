@@ -5,27 +5,34 @@ scripts/backtest_real_chains.py
 Backtests ShortPutSpread / ShortCallSpread against REAL, market-quoted
 options chains — no Black-Scholes reconstruction, no synthetic IV. Every
 credit, every delta, every exit cost comes directly from actual recorded
-bid/ask/greeks.
+bid/ask/greeks. Optionally ingests real underlying OHLCV data to compute
+true Black-Scholes PoP and build a real SPY buy-and-hold benchmark into
+the same report.
 
-Data source
-───────────
-post-no-preference/options on DoltHub (CC-licensed, free, 2019–present,
-~2,098 underlyings). Two tables:
+Data sources (both from DoltHub, same publisher, same daily cadence)
+──────────────────────────────────────────────────────────────────────
+post-no-preference/options  (option_chain table)
+    date, act_symbol, expiration, strike, call_put, bid, ask, vol,
+    delta, gamma, theta, vega, rho
+    `vol` here is the contract's own recorded implied volatility —
+    no IV solving needed.
 
-  option_chain        date, act_symbol, expiration, strike, call_put,
-                       bid, ask, vol, delta, gamma, theta, vega, rho
-  volatility_history   date, act_symbol, hv_current/week/month/year_high/low,
-                       iv_current/week/month/year_high/low  (IV-rank context)
+post-no-preference/stocks   (ohlcv table) — OPTIONAL but recommended
+    date, act_symbol, open, high, low, close, volume
+    Used for: (1) real Black-Scholes PoP via the bot's own pop_spread()
+    function, now that we have real spot price + real IV + real DTE —
+    no more delta-shorthand approximation. (2) A genuine SPY buy-and-hold
+    benchmark computed from real closing prices over the exact same
+    period as the options backtest, not a hardcoded yearly-return table.
 
 This script reads CSV exports of those tables — it does not call the
 DoltHub API directly (no network access required to run it).
 
-Getting the export
-───────────────────
-DoltHub's SQL workbench lets you run arbitrary SQL and download the result
-as CSV. Run these two queries (replace the ticker list / date range as
-needed) and download each result:
+Getting the exports
+────────────────────
+Run on DoltHub's SQL workbench and download each result as CSV:
 
+    -- option_chain (post-no-preference/options)
     SELECT * FROM option_chain
     WHERE act_symbol IN ('SPY','QQQ','IWM','TLT','XLF','XLK','XLE','XLV',
                           'XLI','GLD','EEM','HYG','SMH','VXX','XBI')
@@ -33,37 +40,45 @@ needed) and download each result:
       AND DATEDIFF(expiration, date) BETWEEN 7 AND 65
       AND ABS(delta) BETWEEN 0.02 AND 0.40;
 
-    SELECT * FROM volatility_history
+    -- ohlcv (post-no-preference/stocks) — same ticker list, no DTE/delta
+    -- filters needed since it's one row per symbol per day (small table)
+    SELECT * FROM ohlcv
     WHERE act_symbol IN ('SPY','QQQ','IWM','TLT','XLF','XLK','XLE','XLV',
                           'XLI','GLD','EEM','HYG','SMH','VXX','XBI')
       AND date >= '2020-01-01';
 
-The DTE and delta filters above match the bot's actual trading range
-(DTE 14–60, |delta| up to 0.40 covers every strategy's target deltas with
-margin) and cut the export from "all strikes of every expiration" down to
-only the rows the strategies could ever actually select — this keeps the
-file size manageable instead of pulling the full chain.
+The DTE and delta filters on option_chain match the bot's actual trading
+range (DTE 14–60, |delta| up to 0.40 covers every strategy's target
+deltas with margin) and keep the export to only rows the strategies could
+ever select.
 
 Why real quotes change everything vs the synthetic backtest
 ─────────────────────────────────────────────────────────────
 - Entry credit = short_bid − long_ask (you receive the bid when selling,
   pay the ask when buying) — the bid-ask spread is real, built-in slippage,
   not assumed away.
-- Delta is the recorded market delta — no IV solving, no spot price needed.
-- Exit cost-to-close is read from the SAME contract's real quote on a later
-  date — by expiration this naturally converges to intrinsic value, with
-  no separate intrinsic-value formula needed.
-- PoP is approximated as 1 − |short_delta|, the standard practitioner
-  shorthand (not a Black-Scholes touch-probability calc, since this
-  dataset has no underlying spot price column to feed one). Documented
-  and clearly labeled — this is the one approximation in an otherwise
-  fully real-data backtest.
+- IV is the contract's own recorded `vol` — no solving required.
+- Delta is the recorded market delta.
+- PoP, when OHLCV is supplied, comes from the bot's own pop_spread()
+  Black-Scholes formula fed real spot/IV/DTE — the same math the live bot
+  uses for real trades. Without OHLCV, falls back to the 1-|delta|
+  practitioner shorthand (clearly labeled either way).
+- Exit cost-to-close is read from the SAME contract's real quote on a
+  later date — by expiration this naturally converges to intrinsic value.
+- The SPY benchmark, when OHLCV is supplied, is computed from SPY's own
+  real closing prices over the identical date range as the options
+  backtest — a genuine apples-to-apples comparison, not a separately
+  sourced yearly-return table.
 
 Usage
 ─────
     python scripts/backtest_real_chains.py \\
         --chain option_chain_export.csv \\
+        --ohlcv ohlcv_export.csv \\
         --output backtest_real_results/
+
+`--ohlcv` is optional — the script runs fine without it, just with the
+delta-shorthand PoP and no SPY benchmark section.
 
 Outputs: trades.csv, ticker_summary.csv, summary.txt
 """
@@ -79,7 +94,11 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from options_bot.greeks import pop_spread
+
 TRADING_DAYS = 252
+RISK_FREE_RATE = 0.05   # flat approximation; not recorded in either dataset
 
 # ── Strategy config — mirrors the live bot's actual ShortPutSpread /
 # ShortCallSpread defaults (src/options_bot/strategy.py) ──────────────────
@@ -120,6 +139,7 @@ class Trade:
     pop_approx:     float
     dte_at_entry:   int
     expiration:     str
+    pop_is_real:    bool  = False     # True = real BS PoP via spot+IV; False = delta shorthand
     exit_date:      str  = ""
     exit_reason:    str  = ""
     pnl:            float = 0.0
@@ -149,6 +169,43 @@ def load_chain(path: str) -> pd.DataFrame:
     df["dte"] = (df["expiration"] - df["date"]).dt.days
     df["mid"] = (df["bid"] + df["ask"]) / 2.0
     return df
+
+
+def load_ohlcv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["date"])
+    df.columns = [c.strip().lower() for c in df.columns]
+    required = {"date", "act_symbol", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"ohlcv CSV missing required columns: {missing}")
+    return df[["date", "act_symbol", "close"]].copy()
+
+
+def spy_buy_and_hold(ohlcv: pd.DataFrame, equity: float) -> Optional[dict]:
+    """Real SPY buy-and-hold return over the exact date range present in
+    the ohlcv export — same period as the options backtest, not a
+    separately sourced yearly-return table."""
+    spy = ohlcv[ohlcv["act_symbol"] == "SPY"].sort_values("date")
+    if spy.empty:
+        return None
+    start_price = float(spy.iloc[0]["close"])
+    end_price   = float(spy.iloc[-1]["close"])
+    shares = equity / start_price
+    end_value = shares * end_price
+    total_return = (end_value / equity) - 1.0
+    n_days = (spy.iloc[-1]["date"] - spy.iloc[0]["date"]).days
+    years = max(n_days / 365.25, 0.01)
+    cagr = (end_value / equity) ** (1 / years) - 1.0
+    return {
+        "start_date": str(spy.iloc[0]["date"].date()),
+        "end_date":   str(spy.iloc[-1]["date"].date()),
+        "start_price": round(start_price, 2),
+        "end_price":   round(end_price, 2),
+        "start_value": round(equity, 2),
+        "end_value":   round(end_value, 2),
+        "total_return": round(total_return, 4),
+        "cagr":         round(cagr, 4),
+    }
 
 
 # ── Strike selection from REAL chain rows (no BS solving needed) ─────────
@@ -195,6 +252,7 @@ def evaluate_entry(
     sim_date,
     strategy: str,
     cfg: RealChainConfig,
+    spot_price: Optional[float] = None,
 ) -> tuple[Optional[Trade], Optional[BlockedEntry]]:
     option_type = "put" if strategy == "short_put_spread" else "call"
     short_target = cfg.short_put_delta if option_type == "put" else cfg.short_call_delta
@@ -227,8 +285,31 @@ def evaluate_entry(
         if net_credit < cfg.min_credit:
             continue
 
-        # PoP approximation (documented): 1 - |short delta|
-        pop_approx = 1.0 - abs(short_row["delta"])
+        # PoP: real Black-Scholes via the bot's own pop_spread() when a real
+        # spot price is available (from ohlcv) — uses the contract's own
+        # recorded `vol` (real IV, no solving). Falls back to the
+        # 1-|delta| practitioner shorthand when no spot price is supplied.
+        pop_is_real = False
+        if spot_price is not None and "vol" in short_row and short_row["vol"] > 0:
+            try:
+                spread_type = "bull_put" if option_type == "put" else "bear_call"
+                pop_result = pop_spread(
+                    spread_type=spread_type,
+                    short_strike=float(short_row["strike"]),
+                    long_strike=float(long_row["strike"]),
+                    net_credit=float(net_credit),
+                    spot=float(spot_price),
+                    sigma=float(short_row["vol"]),
+                    rate=RISK_FREE_RATE,
+                    days_to_expiry=int(short_row["dte"]),
+                )
+                pop_approx = float(pop_result["pop"]) if isinstance(pop_result, dict) else float(pop_result)
+                pop_is_real = True
+            except Exception:
+                pop_approx = 1.0 - abs(short_row["delta"])
+        else:
+            pop_approx = 1.0 - abs(short_row["delta"])
+
         if pop_approx < cfg.min_pop:
             continue
 
@@ -248,6 +329,7 @@ def evaluate_entry(
             pop_approx=round(pop_approx, 4),
             dte_at_entry=int(short_row["dte"]),
             expiration=str(exp.date() if hasattr(exp, "date") else exp),
+            pop_is_real=pop_is_real,
         ), None
 
     return None, BlockedEntry(str(sim_date), ticker, strategy, "no_qualifying_spread")
@@ -319,9 +401,17 @@ def simulate_exit(trade: Trade, ticker_chain: pd.DataFrame, cfg: RealChainConfig
 # ── Main engine ───────────────────────────────────────────────────────────
 
 def run_backtest(df: pd.DataFrame, cfg: RealChainConfig,
-                 strategies: list[str]) -> tuple[list[Trade], list[BlockedEntry]]:
+                 strategies: list[str],
+                 ohlcv: Optional[pd.DataFrame] = None,
+                 ) -> tuple[list[Trade], list[BlockedEntry]]:
     trades, blocked = [], []
     tickers = sorted(df["act_symbol"].unique())
+
+    # Build a fast (ticker, date) -> close lookup if OHLCV was supplied
+    spot_lookup: dict = {}
+    if ohlcv is not None:
+        for _, row in ohlcv.iterrows():
+            spot_lookup[(row["act_symbol"], pd.Timestamp(row["date"]))] = float(row["close"])
 
     for ticker in tickers:
         ticker_chain = df[df["act_symbol"] == ticker]
@@ -337,7 +427,8 @@ def run_backtest(df: pd.DataFrame, cfg: RealChainConfig,
                     continue  # exit handled separately once at entry time (see below)
 
                 day_chain = ticker_chain[ticker_chain["date"] == sim_date]
-                trade, block = evaluate_entry(day_chain, ticker, sim_date, strategy, cfg)
+                spot = spot_lookup.get((ticker, pd.Timestamp(sim_date)))
+                trade, block = evaluate_entry(day_chain, ticker, sim_date, strategy, cfg, spot)
                 if trade:
                     trade = simulate_exit(trade, ticker_chain, cfg)
                     trades.append(trade)
@@ -389,7 +480,8 @@ def pop_calibration(trades: list[Trade], cfg: RealChainConfig) -> pd.DataFrame:
 
 
 def write_summary(out_dir: Path, trades: list[Trade], blocked: list[BlockedEntry],
-                  cfg: RealChainConfig, source_file: str) -> None:
+                  cfg: RealChainConfig, source_file: str,
+                  spy_benchmark: Optional[dict] = None) -> None:
     closed = [t for t in trades if t.exit_reason not in ("open_at_end",)]
 
     ticker_df = per_ticker_summary(trades)
@@ -399,6 +491,16 @@ def write_summary(out_dir: Path, trades: list[Trade], blocked: list[BlockedEntry
     ticker_df.to_csv(out_dir / "ticker_summary.csv", index=False)
     pop_df.to_csv(out_dir / "pop_calibration.csv", index=False)
 
+    real_pop_pct = (sum(1 for t in closed if t.pop_is_real) / len(closed)) if closed else 0.0
+    pop_label = (
+        f"  PoP         : Black-Scholes via pop_spread() using real spot price + real IV\n"
+        f"                ({real_pop_pct:.0%} of trades) where OHLCV data was available;\n"
+        f"                falls back to 1-|short delta| shorthand otherwise."
+        if spy_benchmark is not None else
+        f"  PoP         : 1 - |short delta|  (practitioner approximation — no spot price\n"
+        f"                supplied via --ohlcv, so a true BS PoP isn't computable here)"
+    )
+
     lines = [
         "=" * 70,
         "  REAL-CHAIN BACKTEST — option_chain (DoltHub) market-quoted data",
@@ -406,9 +508,7 @@ def write_summary(out_dir: Path, trades: list[Trade], blocked: list[BlockedEntry
         f"  Source file : {source_file}",
         f"  Tickers     : {', '.join(sorted(set(t.ticker for t in trades))) or 'none'}",
         f"  Credit      : short_bid - long_ask (real bid-ask spread, no synthetic slippage)",
-        f"  PoP         : 1 - |short delta|  (practitioner approximation — no spot price",
-        f"                in this dataset, so a true BS touch-probability isn't computable;",
-        f"                this is the one non-literal number in the backtest, documented)",
+        pop_label,
         f"  Exit cost   : real quote of the SAME contract on later dates — converges to",
         f"                intrinsic value naturally by expiration, no formula needed",
         "=" * 70, "",
@@ -430,6 +530,32 @@ def write_summary(out_dir: Path, trades: list[Trade], blocked: list[BlockedEntry
             f"  Expired             : {sum(1 for t in closed if 'expired' in t.exit_reason)/len(closed):.1%}",
             "",
         ]
+
+        if spy_benchmark is not None:
+            strategy_return_on_equity = sum(pnls) / cfg.equity
+            lines += [
+                "── STRATEGY vs SPY BUY-AND-HOLD (same real data, same period) ──",
+                f"  Period              : {spy_benchmark['start_date']} -> {spy_benchmark['end_date']}",
+                f"  Starting capital    : ${cfg.equity:,.0f}",
+                "",
+                f"  SPY buy-and-hold:",
+                f"    SPY price         : ${spy_benchmark['start_price']} -> ${spy_benchmark['end_price']}",
+                f"    Ending value      : ${spy_benchmark['end_value']:,.2f}",
+                f"    Total return      : {spy_benchmark['total_return']:+.1%}",
+                f"    CAGR              : {spy_benchmark['cagr']:+.1%}",
+                "",
+                f"  This strategy (options P&L only, capital otherwise idle/uninvested):",
+                f"    Total P&L         : ${sum(pnls):,.2f}",
+                f"    Return on capital : {strategy_return_on_equity:+.1%}",
+                "",
+                "  NOTE: not a true apples-to-apples comparison — SPY buy-and-hold puts",
+                "  100% of capital at market risk the whole period; this strategy risks",
+                "  only ~1% of equity per trade and the remainder earns nothing in this",
+                "  simulation (no cash-management/margin modeling). The honest reading:",
+                "  this shows the strategy's raw edge in isolation, not a fund-vs-fund",
+                "  comparison. A fair comparison would add T-bill yield on idle cash.",
+                "",
+            ]
     else:
         lines += ["── NO CLOSED TRADES — check ticker coverage in your CSV export ──", ""]
 
@@ -462,6 +588,9 @@ def write_summary(out_dir: Path, trades: list[Trade], blocked: list[BlockedEntry
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--chain", required=True, help="option_chain CSV export")
+    ap.add_argument("--ohlcv", default=None,
+                    help="optional ohlcv CSV export (post-no-preference/stocks) — "
+                         "enables real Black-Scholes PoP and a real SPY buy-and-hold benchmark")
     ap.add_argument("--strategies", nargs="+",
                     default=["short_put_spread", "short_call_spread"])
     ap.add_argument("--output", default="backtest_real_results")
@@ -477,13 +606,25 @@ def main() -> int:
           f"{df['date'].nunique()} unique dates "
           f"({df['date'].min().date()} -> {df['date'].max().date()})")
 
+    ohlcv = None
+    spy_benchmark = None
+    if args.ohlcv:
+        print(f"\nLoading {args.ohlcv}...")
+        ohlcv = load_ohlcv(args.ohlcv)
+        print(f"  {len(ohlcv):,} rows, {ohlcv['act_symbol'].nunique()} tickers, "
+              f"{ohlcv['date'].nunique()} unique dates")
+        spy_benchmark = spy_buy_and_hold(ohlcv, args.equity)
+        if spy_benchmark is None:
+            print("  WARNING: no SPY rows found in ohlcv export — "
+                  "no benchmark section will be included. Add SPY to your ohlcv query.")
+
     cfg = RealChainConfig(equity=args.equity)
     print(f"\nRunning backtest ({', '.join(args.strategies)})...")
-    trades, blocked = run_backtest(df, cfg, args.strategies)
+    trades, blocked = run_backtest(df, cfg, args.strategies, ohlcv)
     closed = [t for t in trades if t.exit_reason != "open_at_end"]
     print(f"  {len(closed)} closed trades, {len(blocked)} blocked attempts\n")
 
-    write_summary(out_dir, trades, blocked, cfg, args.chain)
+    write_summary(out_dir, trades, blocked, cfg, args.chain, spy_benchmark)
     return 0
 
 
