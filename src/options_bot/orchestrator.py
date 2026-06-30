@@ -43,6 +43,7 @@ import re
 import sqlite3
 import threading
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -636,9 +637,151 @@ class TradeDatabase:
                     )
                 """)
             conn.commit()
+
+            # ----------------------------------------------------------------
+            # pending_intents — "local-first ordering" per Alpaca's official
+            # reconciliation-idempotency guidance: write the intent BEFORE
+            # calling the broker, so a crash/exception between broker.submit()
+            # and save_fill() leaves a traceable record instead of an orphan
+            # only discoverable via a Discord alert (as happened 2026-06-24
+            # with the IWM short call spread — see scripts/reconcile_iwm_orphan.py
+            # for the manual recovery that motivated this table).
+            #
+            # Lifecycle: 'submitting' -> 'resolved' (save_fill succeeded) or
+            # left 'submitting'/'submit_failed' for scripts/heal_orphans.py to
+            # pick up and reconstruct from real order details (not guesswork).
+            # ----------------------------------------------------------------
+            if self._use_pg:
+                self._execute(conn, """
+                    CREATE TABLE IF NOT EXISTS pending_intents (
+                        id            TEXT PRIMARY KEY,
+                        created_at    TEXT NOT NULL,
+                        strategy      TEXT,
+                        underlying    TEXT,
+                        legs_json     TEXT,
+                        net_credit    REAL,
+                        max_loss      REAL,
+                        hard_stop     REAL,
+                        contracts     INTEGER,
+                        status        TEXT DEFAULT 'submitting',
+                        broker_order_id TEXT,
+                        resolved_at   TEXT
+                    )
+                """)
+            else:
+                self._execute(conn, """
+                    CREATE TABLE IF NOT EXISTS pending_intents (
+                        id            TEXT PRIMARY KEY,
+                        created_at    TEXT NOT NULL,
+                        strategy      TEXT,
+                        underlying    TEXT,
+                        legs_json     TEXT,
+                        net_credit    REAL,
+                        max_loss      REAL,
+                        hard_stop     REAL,
+                        contracts     INTEGER,
+                        status        TEXT DEFAULT 'submitting',
+                        broker_order_id TEXT,
+                        resolved_at   TEXT
+                    )
+                """)
+            conn.commit()
         finally:
             conn.close()
         logger.debug("[TradeDB] Schema ready (%s)", "PostgreSQL" if self._use_pg else "SQLite")
+
+    # ------------------------------------------------------------------
+    # pending_intents — local-first ordering helpers
+    # ------------------------------------------------------------------
+
+    def save_pending_intent(self, intent_id: str, order: "ApprovedOrder") -> None:
+        """
+        Write the order intent BEFORE calling the broker. If the process
+        crashes or save_fill() fails after a successful broker submission,
+        this row survives and scripts/heal_orphans.py can use it to
+        reconstruct the exact trade (real legs/credit/stop — not guesswork
+        from a Discord alert).
+        """
+        legs_json = json.dumps([
+            {"symbol": l.symbol, "side": l.side,
+             "strike": l.strike, "qty": l.quantity,
+             "expiry": l.expiry.isoformat() if l.expiry else None}
+            for l in order.legs
+        ])
+        now = datetime.now(tz=timezone.utc).isoformat()
+        sql = """
+            INSERT INTO pending_intents
+            (id, created_at, strategy, underlying, legs_json,
+             net_credit, max_loss, hard_stop, contracts, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """
+        conn = self._get_conn()
+        try:
+            self._execute(conn, sql, (
+                intent_id, now, order.strategy_name, order.underlying,
+                legs_json, order.net_debit_credit, order.max_loss_dollars,
+                order.hard_stop_price, order.position_size_contracts,
+                "submitting",
+            ))
+            conn.commit()
+        except Exception as exc:
+            # Non-fatal: the intent table is a safety net, not the critical
+            # path. If this write fails, fall through and let the order
+            # submission proceed — never block a trade because the safety
+            # net itself had a hiccup.
+            logger.warning("[TradeDB] save_pending_intent failed (non-fatal): %s", exc)
+        finally:
+            conn.close()
+
+    def resolve_pending_intent(self, intent_id: str, broker_order_id: str = "") -> None:
+        """Mark an intent resolved once save_fill() has succeeded."""
+        now = datetime.now(tz=timezone.utc).isoformat()
+        sql = """
+            UPDATE pending_intents
+            SET status = 'resolved', resolved_at = ?, broker_order_id = ?
+            WHERE id = ?
+        """
+        conn = self._get_conn()
+        try:
+            self._execute(conn, sql, (now, broker_order_id, intent_id))
+            conn.commit()
+        except Exception as exc:
+            logger.warning("[TradeDB] resolve_pending_intent failed (non-fatal): %s", exc)
+        finally:
+            conn.close()
+
+    def mark_intent_submit_failed(self, intent_id: str) -> None:
+        """Mark an intent as submit_failed (broker.submit() raised) so the
+        heal job doesn't treat it as a live orphan candidate."""
+        now = datetime.now(tz=timezone.utc).isoformat()
+        sql = "UPDATE pending_intents SET status = 'submit_failed', resolved_at = ? WHERE id = ?"
+        conn = self._get_conn()
+        try:
+            self._execute(conn, sql, (now, intent_id))
+            conn.commit()
+        except Exception as exc:
+            logger.warning("[TradeDB] mark_intent_submit_failed failed (non-fatal): %s", exc)
+        finally:
+            conn.close()
+
+    def get_unresolved_intents(self, max_age_hours: int = 48) -> list[dict]:
+        """
+        Return pending_intents rows still in 'submitting' status — these are
+        candidates for orphan reconciliation: the broker call may have
+        succeeded (filled at Alpaca) even though save_fill() never confirmed.
+        Bounded by max_age_hours so very old abandoned intents (e.g. a scan
+        that hit a risk veto before ever calling the broker) don't linger
+        forever as false positives.
+        """
+        cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+        sql = "SELECT * FROM pending_intents WHERE status = 'submitting' AND created_at >= ?"
+        conn = self._get_conn()
+        try:
+            cur = self._execute(conn, sql, (cutoff,))
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # Generic state persistence (survives container restarts)
@@ -1620,9 +1763,16 @@ class TradingPipeline:
             return None
 
         # --- Step 7: Submit ---
+        # Local-first ordering (Alpaca reconciliation-idempotency guidance):
+        # write the intent BEFORE calling the broker so a crash or a later
+        # save_fill() failure leaves a traceable record — never a fill that's
+        # only discoverable via a Discord alert (2026-06-24 IWM incident).
+        _intent_id = f"intent-{uuid.uuid4()}"
+        self.db.save_pending_intent(_intent_id, order)
         try:
             filled = self.broker.submit(order)
         except (RiskVetoError, PipelineConnectionError) as exc:
+            self.db.mark_intent_submit_failed(_intent_id)
             self.state.record_error(f"{ticker} submit failed: {exc}")
             return None
 
@@ -1633,6 +1783,7 @@ class TradingPipeline:
         self.rm.update_equity_after_fill(order.max_loss_dollars)
         try:
             self.db.save_fill(filled)
+            self.db.resolve_pending_intent(_intent_id, filled.order_id)
         except Exception as _sf_exc:
             # Trade IS filled at the broker — never abort the scan here.
             # Alert loudly so the orphan can be adopted manually (or via
