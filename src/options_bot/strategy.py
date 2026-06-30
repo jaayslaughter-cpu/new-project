@@ -602,7 +602,7 @@ class ShortPutSpread(BaseStrategy):
                 if _trial_max_loss <= risk_budget_dollars:
                     _chosen = _cand
                     break
-            if _chosen is not None and _chosen is not long_put:
+            if _chosen is not None and _chosen.strike != long_put.strike:
                 logger.info(
                     "[%s] Budget-fit: narrowed spread from %.0f-wide (loss=$%.0f) "
                     "to %.0f-wide (loss=$%.0f) to fit risk budget $%.0f",
@@ -1091,7 +1091,7 @@ class ShortCallSpread(BaseStrategy):
                 if _trial_max_loss <= risk_budget_dollars:
                     _chosen = _cand
                     break
-            if _chosen is not None and _chosen is not long_call:
+            if _chosen is not None and _chosen.strike != long_call.strike:
                 logger.info(
                     "[%s] Budget-fit: narrowed spread from %.0f-wide (loss=$%.0f) "
                     "to %.0f-wide (loss=$%.0f) to fit risk budget $%.0f",
