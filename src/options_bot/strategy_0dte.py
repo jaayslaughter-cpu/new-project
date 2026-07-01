@@ -1409,21 +1409,26 @@ class ZeroDTEStrategy:
             logger.warning("[0DTE] Quote fetch failed: %s", exc)
             return None
 
-        def _q(sym: str) -> dict:
+        def _extract_bid_ask(sym: str):
+            # get_option_snapshots -> _parse_one_snapshot returns a flat dict
+            # with 'bid'/'ask' at the TOP level, not nested under 'latest_quote'.
+            # The old _q() helper tried snap.get('latest_quote') which is always
+            # absent in this schema, returning {} every time and making all four
+            # bid/ask values 0.0 -- causing "Incomplete quotes" on every call
+            # even when Alpaca returned valid data.
             snap = quotes.get(sym) or {}
-            q    = snap.get("latest_quote") or snap.get("quote") or {}
-            return q
+            bid = float(snap.get("bid") or 0)
+            ask = float(snap.get("ask") or 0)
+            return bid, ask
 
-        short_q = _q(short_sym)
-        long_q  = _q(long_sym)
-
-        short_bid = float(short_q.get("bid_price") or short_q.get("bp") or 0)
-        short_ask = float(short_q.get("ask_price") or short_q.get("ap") or 0)
-        long_bid  = float(long_q.get("bid_price")  or long_q.get("bp")  or 0)
-        long_ask  = float(long_q.get("ask_price")  or long_q.get("ap")  or 0)
+        short_bid, short_ask = _extract_bid_ask(short_sym)
+        long_bid,  long_ask  = _extract_bid_ask(long_sym)
 
         if not all([short_bid, short_ask, long_bid, long_ask]):
-            logger.warning("[0DTE] Incomplete quotes for %s / %s", short_sym, long_sym)
+            logger.warning(
+                "[0DTE] Incomplete quotes for %s (bid=%.2f ask=%.2f) / %s (bid=%.2f ask=%.2f)",
+                short_sym, short_bid, short_ask, long_sym, long_bid, long_ask,
+            )
             return None
 
         # 7. Spread quality and credit
