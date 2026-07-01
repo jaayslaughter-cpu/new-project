@@ -1547,7 +1547,10 @@ class TradingPipeline:
             elif iv_rank is not None:
                 logger.info("[Pipeline] %s IV rank=%.1f — qualifies", ticker, iv_rank)
 
-        # --- Step 2b: Duplicate prevention — skip if we already have a position on this ticker today ──
+        # --- Step 2b: Duplicate prevention — skip if already open, or stopped out today ──
+        # Also blocks re-entry on the same ticker for the rest of the day after a stop-hit.
+        # Rationale: a stop indicates the thesis was wrong at that price level today;
+        # re-entering immediately risks chasing a deteriorating position.
         open_trades = self.db.get_open_trades()
         already_open = [t for t in open_trades if t.get("underlying") == ticker]
         if already_open:
@@ -1556,6 +1559,26 @@ class TradingPipeline:
                 ticker, len(already_open)
             )
             return None
+
+        try:
+            _today = date.today().isoformat()
+            conn = self.db._get_conn()
+            cur = self.db._execute(
+                conn,
+                "SELECT id FROM trades WHERE underlying=? AND trade_date=? "
+                "AND status='stopped_out' LIMIT 1",
+                (ticker, _today),
+            )
+            _stop_today = cur.fetchone()
+            conn.close()
+            if _stop_today:
+                logger.info(
+                    "[Pipeline] %s: stop-hit already recorded today — skipping re-entry",
+                    ticker,
+                )
+                return None
+        except Exception as _sg_exc:
+            logger.debug("[Pipeline] Same-day stop guard query failed (non-fatal): %s", _sg_exc)
 
         # --- Step 2c: Sentiment gate ---
         # VADER (vaderSentiment, ~1MB, no GPU) runs as the default on Railway.
@@ -2657,13 +2680,40 @@ class Orchestrator:
             if order is None:
                 return
 
-            fill = self.broker.submit(order)
+            # Local-first ordering: write pending_intent BEFORE broker.submit()
+            # so a crash between submit and DB-write leaves a traceable record
+            # that heal_orphans.py can reconcile, matching the main scan path.
+            _0dte_intent_id = f"intent-{uuid.uuid4()}"
+            if self.db:
+                self.db.save_pending_intent(_0dte_intent_id, order)
+
+            try:
+                fill = self.broker.submit(order)
+            except Exception as _submit_exc:
+                if self.db:
+                    self.db.mark_intent_submit_failed(_0dte_intent_id)
+                logger.error("[0DTE scan] Broker submit failed: %s", _submit_exc)
+                return
+
             if fill and self.zero_dte_monitor:
                 self.zero_dte_monitor.register(order, fill)
 
-                # Persist to DB
+                # Persist to DB and resolve the pending intent atomically
                 if self.db:
-                    self.db.record_trade(order, fill)
+                    try:
+                        self.db.record_trade(order, fill)
+                        self.db.resolve_pending_intent(_0dte_intent_id, fill.order_id if hasattr(fill, "order_id") else "")
+                    except Exception as _db_exc:
+                        logger.error(
+                            "[0DTE scan] DB write failed — %s IS FILLED AT BROKER "
+                            "but NOT in database. intent_id=%s error=%s",
+                            getattr(fill, "order_id", "?"), _0dte_intent_id, _db_exc,
+                        )
+                        send_discord(
+                            self.config.discord_webhook_url,
+                            f"🔴 **0DTE DB write failed** — fill IS at broker, NOT in DB.\n"
+                            f"intent_id: `{_0dte_intent_id}`  error: {_db_exc}"
+                        )
 
                 send_discord(
                     self.config.discord_webhook_url,
@@ -3401,30 +3451,75 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("[EOD] 0DTE circuit-breaker record failed (non-fatal): %s", exc)
 
-        # Close any positions expiring today before market close
+        # Close any positions expiring today before market close.
+        # We fetch live quotes first so we can record a real close_price and
+        # realized_pnl — previously these were always written as NULL, causing
+        # expiry closes to be excluded from all win-rate / P&L stats.
         open_trades = self.db.get_open_trades()
         today = date.today().isoformat()
         for trade in open_trades:
             try:
                 legs = json.loads(trade.get("legs_json", "[]"))
                 expiring = [l for l in legs if l.get("expiry", "") == today]
-                if expiring:
-                    logger.warning(
-                        "[EOD] Position %s expires TODAY — closing before market close",
-                        trade["id"]
-                    )
-                    for leg in legs:
-                        try:
-                            self.broker.close_position(leg["symbol"])
-                        except Exception as exc:
-                            logger.error("[EOD] Failed to close expiring leg %s: %s",
-                                        leg["symbol"], exc)
-                    self.db.update_status(trade["id"], status="closed_expiry")
-                    send_discord(
-                        self.config.discord_webhook_url,
-                        f"⏰ **EXPIRY CLOSE — {trade.get('underlying','')} {trade.get('strategy','')}**\n"
-                        f"Order ID: `{trade['id']}` — closed at expiry"
-                    )
+                if not expiring:
+                    continue
+
+                logger.warning(
+                    "[EOD] Position %s expires TODAY — closing before market close",
+                    trade["id"]
+                )
+
+                # Fetch current quotes to compute realized PnL at close.
+                all_syms = [l["symbol"] for l in legs if "symbol" in l]
+                close_price = None
+                realized_pnl = None
+                try:
+                    eod_quotes = self.broker.get_latest_quotes(all_syms)
+                    short_legs = [l for l in legs if "sell" in l.get("side", "")]
+                    long_legs  = [l for l in legs if "buy" in l.get("side", "")]
+                    if short_legs:
+                        sq = eod_quotes.get(short_legs[0]["symbol"], {})
+                        short_ask = sq.get("ask")
+                        if long_legs:
+                            lq = eod_quotes.get(long_legs[0]["symbol"], {})
+                            long_bid = lq.get("bid")
+                            if short_ask is not None and long_bid is not None:
+                                close_price = short_ask - long_bid
+                        elif short_ask is not None:
+                            close_price = short_ask
+                    if close_price is not None:
+                        entry_price = float(trade.get("fill_price") or 0)
+                        contracts   = float(trade.get("contracts") or 1)
+                        realized_pnl = (entry_price - close_price) * contracts * 100
+                except Exception as q_exc:
+                    logger.warning("[EOD] Quote fetch for expiry P&L failed (non-fatal): %s", q_exc)
+
+                for leg in legs:
+                    try:
+                        self.broker.close_position(leg["symbol"])
+                    except Exception as exc:
+                        logger.error("[EOD] Failed to close expiring leg %s: %s",
+                                    leg["symbol"], exc)
+
+                self.db.update_status(
+                    trade["id"],
+                    status="closed_expiry",
+                    close_price=close_price,
+                    realized_pnl=realized_pnl,
+                )
+                if realized_pnl is not None and self.rm is not None:
+                    self.rm.record_pnl(realized=realized_pnl)
+                with self.state._lock:
+                    if realized_pnl is not None:
+                        self.state.daily_realized_pnl += realized_pnl
+
+                send_discord(
+                    self.config.discord_webhook_url,
+                    f"⏰ **EXPIRY CLOSE — {trade.get('underlying','')} {trade.get('strategy','')}**\n"
+                    f"Order ID: `{trade['id']}`\n"
+                    + (f"Close price: ${close_price:.2f}  P&L: ${realized_pnl:+.2f}" if realized_pnl is not None
+                       else "P&L: unavailable (quote fetch failed)")
+                )
             except Exception as exc:
                 logger.error("[EOD] Expiry check failed for %s: %s", trade.get("id"), exc)
 
