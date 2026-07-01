@@ -3217,7 +3217,14 @@ class Orchestrator:
                     len(new_stocks), ", ".join(new_stocks),
                 )
 
-        for ticker in scan_tickers:
+        for _ticker_idx, ticker in enumerate(scan_tickers):
+            # Small inter-ticker jitter to avoid bursting yfinance with
+            # 9+ simultaneous requests that trigger rate-limiting (429).
+            # Skip on the first ticker; from the second onward wait 1–3s.
+            if _ticker_idx > 0:
+                import time as _t, random as _r
+                _t.sleep(_r.uniform(1.0, 3.0))
+
             # Don't exceed max positions mid-scan
             positions = self.broker.get_positions()
             current_count = len([p for p in positions if p.get("asset_class") == "us_option"])
@@ -3350,7 +3357,12 @@ class Orchestrator:
                 extra_cfg = get_strategy(extra_name, None).config                     if hasattr(get_strategy(extra_name, None), "config") else None
                 self.pipeline.strategy = get_strategy(extra_name, extra_cfg)
 
-                for ticker in extra_tickers:
+                for _et_idx, ticker in enumerate(extra_tickers):
+                    # Same inter-ticker jitter as the main scan loop
+                    if _et_idx > 0:
+                        import time as _t, random as _r
+                        _t.sleep(_r.uniform(1.0, 3.0))
+
                     positions = self.broker.get_positions()
                     current_count = len([
                         p for p in positions if p.get("asset_class") == "us_option"
