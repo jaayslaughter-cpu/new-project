@@ -98,12 +98,34 @@ class YFinanceDataLoader:
             If Yahoo Finance cannot be reached or returns no data.
         """
         logger.debug("[YFinanceDataLoader] Fetching expirations for %s", self.ticker_str)
-        try:
-            expirations = self._yf_ticker.options
-        except Exception as exc:
-            raise PipelineConnectionError(
-                f"Failed to fetch expirations for {self.ticker_str}: {exc}"
-            ) from exc
+
+        # yfinance rate-limits aggressively when multiple tickers are fetched
+        # in rapid succession from the same IP (as happens during a scan with
+        # 9+ tickers).  Retry up to 3 times with exponential backoff + jitter
+        # so a transient 429 doesn't abort the entire ticker evaluation.
+        import time as _time
+        import random as _random
+
+        _max_attempts = 3
+        _last_exc: Exception = RuntimeError("unreachable")
+        for _attempt in range(1, _max_attempts + 1):
+            try:
+                expirations = self._yf_ticker.options
+                break
+            except Exception as exc:
+                _last_exc = exc
+                _is_rate_limit = "rate limit" in str(exc).lower() or "too many" in str(exc).lower() or "429" in str(exc)
+                if _attempt < _max_attempts and _is_rate_limit:
+                    _delay = (2 ** _attempt) + _random.uniform(0.5, 2.0)
+                    logger.warning(
+                        "[YFinanceDataLoader] %s rate-limited (attempt %d/%d) — retrying in %.1fs",
+                        self.ticker_str, _attempt, _max_attempts, _delay,
+                    )
+                    _time.sleep(_delay)
+                else:
+                    raise PipelineConnectionError(
+                        f"Failed to fetch expirations for {self.ticker_str}: {exc}"
+                    ) from exc
 
         if not expirations:
             raise PipelineConnectionError(
