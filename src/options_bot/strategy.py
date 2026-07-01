@@ -604,12 +604,11 @@ class ShortPutSpread(BaseStrategy):
                     break
             if _chosen is not None and _chosen.strike != long_put.strike:
                 logger.info(
-                    "[%s] Budget-fit: narrowed spread from %.0f-wide (loss=$%.0f) "
-                    "to %.0f-wide (loss=$%.0f) to fit risk budget $%.0f",
+                    "[%s] Budget-fit: widest-that-fits %s→%s (loss=$%.0f→$%.0f budget=$%.0f)",
                     self.name,
-                    short_put.strike - long_put.strike,
+                    f"{int(short_put.strike - long_put.strike)}-wide",
+                    f"{int(short_put.strike - _chosen.strike)}-wide",
                     (short_put.strike - long_put.strike - (short_put.mid_price - long_put.mid_price)) * 100,
-                    short_put.strike - _chosen.strike,
                     (short_put.strike - _chosen.strike - (short_put.mid_price - _chosen.mid_price)) * 100,
                     risk_budget_dollars,
                 )
@@ -1093,12 +1092,11 @@ class ShortCallSpread(BaseStrategy):
                     break
             if _chosen is not None and _chosen.strike != long_call.strike:
                 logger.info(
-                    "[%s] Budget-fit: narrowed spread from %.0f-wide (loss=$%.0f) "
-                    "to %.0f-wide (loss=$%.0f) to fit risk budget $%.0f",
+                    "[%s] Budget-fit: widest-that-fits %s→%s (loss=$%.0f→$%.0f budget=$%.0f)",
                     self.name,
-                    long_call.strike - short_call.strike,
+                    f"{int(long_call.strike - short_call.strike)}-wide",
+                    f"{int(_chosen.strike - short_call.strike)}-wide",
                     (long_call.strike - short_call.strike - (short_call.mid_price - long_call.mid_price)) * 100,
-                    _chosen.strike - short_call.strike,
                     (_chosen.strike - short_call.strike - (short_call.mid_price - _chosen.mid_price)) * 100,
                     risk_budget_dollars,
                 )
