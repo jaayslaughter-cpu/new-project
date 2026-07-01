@@ -2118,52 +2118,89 @@ class PositionMonitor:
             logger.error("[Monitor] Error checking trade %s: %s", trade.get("id"), exc)
 
     def _close_trade(self, trade: dict, current_price: float, reason: str = "stop_hit") -> None:
-        """Submit closing orders for a stopped-out or profit-target trade."""
+        """Submit closing orders for a stopped-out or profit-target trade.
+
+        Each leg is closed independently so a 'position not found' on one leg
+        (e.g. the order was still PENDING_NEW when this fires) does not abort
+        the remaining legs.  The DB status and realized P&L are always written
+        afterwards so the trade does not remain 'open' and trigger a second
+        close attempt on the next monitor cycle.  If any leg close fails the
+        status is set to 'close_partial' so it is visible as needing manual
+        review without triggering further automated close attempts.
+        """
         try:
             legs = json.loads(trade.get("legs_json", "[]"))
-            for leg in legs:
-                symbol = leg["symbol"]
-                close_side = _reverse_side(leg.get("side", ""))
-                if close_side:
-                    self.broker.close_position(symbol)
-                    logger.info("[Monitor] Closed %s: %s", reason, symbol)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.error("[Monitor] _close_trade: bad legs_json for %s: %s", trade.get("id"), exc)
+            return
 
-            entry_price = float(trade.get("fill_price", 0) or 0)
-            contracts = float(trade.get("contracts", 1) or 1)
+        close_errors: list[str] = []
+        for leg in legs:
+            symbol = leg.get("symbol", "")
+            close_side = _reverse_side(leg.get("side", ""))
+            if not close_side:
+                continue
+            try:
+                self.broker.close_position(symbol)
+                logger.info("[Monitor] Closed %s: %s", reason, symbol)
+            except Exception as leg_exc:
+                close_errors.append(f"{symbol}: {leg_exc}")
+                logger.error(
+                    "[Monitor] Close failed for leg %s (trade %s): %s",
+                    symbol, trade.get("id"), leg_exc,
+                )
 
-            if reason == "profit_target":
-                # We bought back at current_price, kept (entry - current) per contract
-                realized_pnl = (entry_price - current_price) * contracts * 100
-                new_status = "closed_profit_target"
-            else:
-                realized_pnl = (entry_price - current_price) * contracts * 100
-                new_status = "stopped_out"
+        # Always update the DB — even if broker close(s) partially failed.
+        # Leaving status='open' guarantees the monitor re-fires and tries
+        # to close an already-partially-closed spread on the next cycle.
+        entry_price = float(trade.get("fill_price", 0) or 0)
+        contracts = float(trade.get("contracts", 1) or 1)
+        realized_pnl = (entry_price - current_price) * contracts * 100
 
+        if close_errors:
+            new_status = "close_partial"
+        elif reason == "profit_target":
+            new_status = "closed_profit_target"
+        else:
+            new_status = "stopped_out"
+
+        try:
             self.db.update_status(
                 trade["id"],
                 status=new_status,
                 close_price=current_price,
                 realized_pnl=realized_pnl,
             )
-            with self.state._lock:
-                self.state.daily_realized_pnl += realized_pnl
-            # Update RiskManager daily P&L so the daily loss halt can fire
-            if self.rm is not None:
-                self.rm.record_pnl(realized=realized_pnl)
+        except Exception as db_exc:
+            logger.error("[Monitor] DB update_status failed for %s: %s", trade.get("id"), db_exc)
 
-            if reason == "stop_hit":
-                msg = _format_stop_message(trade, current_price)
-            else:
-                msg = (
-                    f"✅ **PROFIT TARGET — {trade.get('underlying','')} {trade.get('strategy','')}**\n"
-                    f"Order ID: `{trade['id']}`\n"
-                    f"Closed at: ${current_price:.2f}  Entry: ${entry_price:.2f}\n"
-                    f"P&L: ${realized_pnl:+.2f}"
-                )
+        with self.state._lock:
+            self.state.daily_realized_pnl += realized_pnl
+        if self.rm is not None:
+            self.rm.record_pnl(realized=realized_pnl)
+
+        if close_errors:
+            err_summary = "; ".join(close_errors)
+            msg = (
+                f"⚠️ **PARTIAL CLOSE — {trade.get('underlying','')} {trade.get('strategy','')}**\n"
+                f"Order ID: `{trade['id']}`\n"
+                f"Reason: {reason}  Status: {new_status}\n"
+                f"P&L (estimated): ${realized_pnl:+.2f}\n"
+                f"Leg errors (manual review required): {err_summary}"
+            )
+        elif reason == "stop_hit":
+            msg = _format_stop_message(trade, current_price)
+        else:
+            msg = (
+                f"✅ **PROFIT TARGET — {trade.get('underlying','')} {trade.get('strategy','')}**\n"
+                f"Order ID: `{trade['id']}`\n"
+                f"Closed at: ${current_price:.2f}  Entry: ${entry_price:.2f}\n"
+                f"P&L: ${realized_pnl:+.2f}"
+            )
+        try:
             send_discord(self.discord_webhook_url, msg)
-
-        except Exception as exc:
-            logger.error("[Monitor] Close failed for %s: %s", trade.get("id"), exc)
+        except Exception as disc_exc:
+            logger.warning("[Monitor] Discord alert failed (non-fatal): %s", disc_exc)
 
 
 def _get_vix() -> Optional[float]:
