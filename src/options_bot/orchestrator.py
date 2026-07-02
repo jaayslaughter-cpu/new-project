@@ -364,10 +364,13 @@ class OrchestratorConfig:
     # --- Orphan adoption (gated — safe only after ?-placeholder fix is confirmed deployed) ---
     # Reads broker positions with no matching DB record and writes them into the
     # trades table so the position monitor can manage them.  Uses the same INSERT
-    # path as save_fill, so it must stay OFF until the 63fc7d8 fix is confirmed
-    # running in the deployed Railway container.  Enable manually after verifying
-    # the deployed container is on the current main.
-    adopt_orphans_enabled: bool = False
+    # path as save_fill.  Prerequisite (the ?→%s placeholder rewrite in _execute,
+    # commit 63fc7d8) is confirmed deployed — container restart 2026-07-01 14:35 UTC
+    # runs current main.  ENABLED 2026-07-01 to auto-heal the IWM 320C/330C orphan
+    # from 2026-06-24 at the next scan's reconcile step.  Adoption only touches
+    # recognized defined-risk premium shapes (1 short put, or 1 short + 1 long of
+    # the same type); everything else is skipped with a Discord alert.
+    adopt_orphans_enabled: bool = True
 
     # --- Catch-up scan (default ON — guards against missed scan on restart) ---
     # On startup, if no scan has run today and the market is open past the
