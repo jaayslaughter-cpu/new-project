@@ -1424,7 +1424,18 @@ class ZeroDTEStrategy:
         short_bid, short_ask = _extract_bid_ask(short_sym)
         long_bid,  long_ask  = _extract_bid_ask(long_sym)
 
-        if not all([short_bid, short_ask, long_bid, long_ask]):
+        # Require only the prices we actually transact at:
+        #   short_bid — we SELL the short leg at its bid (no bid = no credit)
+        #   short_ask — needed for mid-price / slippage math
+        #   long_ask  — we BUY the long leg at its ask (no ask = quote missing)
+        # long_bid may legitimately be 0.00 for a nearly-worthless deep-OTM
+        # protective leg (e.g. SPY 760C with spot at 747 hours before expiry).
+        # A zero bid on the leg we're BUYING is not missing data — requiring
+        # it blocked economically valid entries on 2026-07-01 (three VWAP
+        # passes rejected with "Incomplete quotes" over a $0.00 long bid).
+        # Genuinely missing quotes still fail: an absent snapshot yields
+        # ask=0.0, which the long_ask/short_ask requirements catch.
+        if not all([short_bid, short_ask, long_ask]):
             logger.warning(
                 "[0DTE] Incomplete quotes for %s (bid=%.2f ask=%.2f) / %s (bid=%.2f ask=%.2f)",
                 short_sym, short_bid, short_ask, long_sym, long_bid, long_ask,
